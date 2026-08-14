@@ -449,15 +449,42 @@ private:
   std::uint8_t maximum_step_{1U};
 };
 
+struct RuntimeVisualPublicationState final {
+  std::uint16_t display_x{};
+  std::uint16_t display_y{};
+  std::uint16_t display_width{256U};
+  std::uint16_t display_height{240U};
+  bool display_enabled{true};
+  bool display_rgb24{};
+  bool display_interlaced{};
+  std::uint64_t command_buffer_epoch{};
+
+  friend bool operator==(const RuntimeVisualPublicationState &,
+                         const RuntimeVisualPublicationState &) = default;
+};
+
+class RuntimeVisualPublicationTracker final {
+public:
+  [[nodiscard]] bool observe(RuntimeVisualPublicationState state,
+                             bool has_gpu_commands) noexcept {
+    const auto changed = has_gpu_commands || !previous_ || *previous_ != state;
+    previous_ = state;
+    return changed;
+  }
+
+private:
+  std::optional<RuntimeVisualPublicationState> previous_;
+};
+
 enum class RuntimeHostPresentationMode : std::uint8_t {
   render,
   cached,
 };
 
 [[nodiscard]] inline constexpr RuntimeHostPresentationMode
-runtimeHostPresentationMode(std::size_t guest_steps) noexcept {
-  return guest_steps == 0U ? RuntimeHostPresentationMode::cached
-                           : RuntimeHostPresentationMode::render;
+runtimeHostPresentationMode(bool visual_dirty) noexcept {
+  return visual_dirty ? RuntimeHostPresentationMode::render
+                      : RuntimeHostPresentationMode::cached;
 }
 
 // OpenAL consumes a 44.1 kHz stream in wall-clock time, while an overloaded

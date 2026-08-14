@@ -73,9 +73,9 @@ void configureGraphics(const GraphicsSettings &settings) noexcept {
   g_cfg_renderHeight = std::max(settings.height, 1);
   g_cfg_swapInterval = settings.vsync ? 1 : 0;
   // Presentation is native: no game code samples the displayed framebuffer
-  // through PSX VRAM, and the guest simulation has its own deterministic
-  // 20 Hz clock. Avoid the legacy readback and busy VBlank compatibility
-  // paths, both of which otherwise steal time from display-refresh pacing.
+  // through PSX VRAM. Hardware remains at 60 VBlank/s while MOHU's authored
+  // gameplay, animation and rendering update at 30 Hz. Avoid the legacy
+  // readback and busy VBlank paths, which otherwise steal presentation time.
   g_cfg_framebufferFeedback = 0;
   g_cfg_vblankThread = 0;
 }
@@ -190,8 +190,7 @@ public:
     // DuckStation and fragments mixed precise/raw streams into extra draws.
     g_cfg_pgxpTextureCorrection = gpu_frame_ ? 1 : g_cfg_pgxpTextureCorrection;
     g_cfg_pgxpZBuffer = gpu_frame_ ? 0 : g_cfg_pgxpZBuffer;
-    guest_gpu_.setGeometryOptions(true, true, true, true, false, true,
-                                            true);
+    guest_gpu_.setGeometryOptions(true, true, true, true, false, true, true);
     guest_gpu_.setRuntimeGeometryPolicy(true, false, false);
 
     configureControllerProtocol(graphics_.controller_protocol);
@@ -222,6 +221,7 @@ public:
     const auto runtime_counter_frequency = SDL_GetPerformanceFrequency();
     std::uint64_t guest_projection_epoch{};
     auto runtime_frame_ready = false;
+    RuntimeVisualPublicationTracker runtime_visual_publications;
 
     RuntimePresentationPolicy runtime_presentation;
     const auto prepareRuntimeDisplay =
@@ -248,6 +248,7 @@ public:
                                 frame.display_interlaced);
     };
     for (;;) {
+      auto visual_dirty = false;
       if (frame_) {
         PsyX_UpdateInput();
         const auto runtime_counter = SDL_GetPerformanceCounter();
@@ -283,8 +284,23 @@ public:
             }
             if (gpu_frame_) {
               const auto gpu_frame = gpu_frame_();
+              const auto publication_dirty =
+                  runtime_visual_publications.observe(
+                      RuntimeVisualPublicationState{
+                          .display_x = gpu_frame.display_x,
+                          .display_y = gpu_frame.display_y,
+                          .display_width = gpu_frame.display_width,
+                          .display_height = gpu_frame.display_height,
+                          .display_enabled = gpu_frame.display_enabled,
+                          .display_rgb24 = gpu_frame.display_rgb24,
+                          .display_interlaced = gpu_frame.display_interlaced,
+                          .command_buffer_epoch =
+                              gpu_frame.command_buffer_epoch,
+                      },
+                      !gpu_frame.words.empty());
+              visual_dirty = visual_dirty || publication_dirty;
               prepareRuntimeDisplay(gpu_frame);
-              if (step + 1U == guest_steps) {
+              if (step + 1U == guest_steps && visual_dirty) {
                 presentRuntimeDisplay(gpu_frame);
               }
               GR_BeginGuestProjectionEpoch(
@@ -334,7 +350,7 @@ public:
           runtime_audio->update();
         }
         const auto presentation_mode =
-            runtimeHostPresentationMode(guest_steps);
+            runtimeHostPresentationMode(visual_dirty);
         if (presentation_mode == RuntimeHostPresentationMode::cached &&
             runtime_frame_ready && gpu_frame_ &&
             PsyX_PresentCachedFrame() != 0) {
@@ -1334,12 +1350,13 @@ private:
 };
 
 } // namespace
-std::unique_ptr<Host> createPsyCrossRuntimeHost(
-    std::string title, RuntimeFrameCallback frame,
-    RuntimeGpuFrameCallback gpu_frame, GraphicsSettings graphics,
-    KeyboardMouseBindings input,
-    MohUndergroundRuntimeActionBindings runtime_actions,
-    RuntimeAudioDrainCallback audio) {
+std::unique_ptr<Host>
+createPsyCrossRuntimeHost(std::string title, RuntimeFrameCallback frame,
+                          RuntimeGpuFrameCallback gpu_frame,
+                          GraphicsSettings graphics,
+                          KeyboardMouseBindings input,
+                          MohUndergroundRuntimeActionBindings runtime_actions,
+                          RuntimeAudioDrainCallback audio) {
   return std::make_unique<PsyCrossHost>(
       std::move(title), graphics, std::move(frame), std::move(gpu_frame),
       std::move(input), std::move(runtime_actions), std::move(audio));

@@ -405,15 +405,43 @@ void testRuntimeGuestCadenceIsPresentationIndependent() {
 }
 
 void testRuntimePresentationIsGuestIndependent() {
-  const auto idle = sf::platform::runtimeHostPresentationMode(0U);
+  using sf::platform::RuntimeHostPresentationMode;
+  using sf::platform::RuntimeVisualPublicationState;
+  using sf::platform::RuntimeVisualPublicationTracker;
+
+  RuntimeVisualPublicationTracker publications;
+  const RuntimeVisualPublicationState initial{};
+  require(publications.observe(initial, false),
+          "First visual publication was treated as cached");
+  require(!publications.observe(initial, false),
+          "Unchanged empty guest tick dirtied presentation");
+
+  auto display_flip = initial;
+  display_flip.display_x = 384U;
+  require(publications.observe(display_flip, false) &&
+              !publications.observe(display_flip, false),
+          "Display-page flip was not published exactly once");
+
+  auto reset_epoch = display_flip;
+  ++reset_epoch.command_buffer_epoch;
+  require(publications.observe(reset_epoch, false) &&
+              !publications.observe(reset_epoch, false),
+          "GPU reset epoch was not published exactly once");
+  require(publications.observe(reset_epoch, true),
+          "Non-empty GP0 stream reused a cached presentation");
+
+  auto display_disabled = reset_epoch;
+  display_disabled.display_enabled = false;
+  require(publications.observe(display_disabled, false),
+          "GP1 display-disable did not dirty presentation");
+
+  const auto idle = sf::platform::runtimeHostPresentationMode(false);
   require(idle == sf::platform::RuntimeHostPresentationMode::cached,
           "High-refresh presentation did not reuse an idle guest frame");
 
-  const auto stepped = sf::platform::runtimeHostPresentationMode(1U);
-  const auto catch_up = sf::platform::runtimeHostPresentationMode(4U);
-  require(stepped == sf::platform::RuntimeHostPresentationMode::render &&
-              catch_up == sf::platform::RuntimeHostPresentationMode::render,
-          "A runtime iteration with new guest work suppressed presentation");
+  const auto dirty = sf::platform::runtimeHostPresentationMode(true);
+  require(dirty == RuntimeHostPresentationMode::render,
+          "A new visual publication suppressed presentation");
 
   require(
       sf::platform::runtimeGuestCatchUpStepsForPresentation(0U) == 1U &&
