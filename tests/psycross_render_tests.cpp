@@ -4857,6 +4857,8 @@ int main() {
     projection.screen_x = screen_x;
     projection.screen_y = screen_y;
     projection.screen_h = 320.0F;
+    projection.source_vertex_id = 0x1000U + word;
+    projection.mesh_vertex_id = 0x2000U + word;
     projection.valid = true;
   }
   std::vector<sf::psx::GpuDmaWordSource> capture_dma(capture_words.size());
@@ -4965,6 +4967,8 @@ int main() {
     projection.screen_x = screen_x;
     projection.screen_y = screen_y;
     projection.screen_h = 320.0F;
+    projection.source_vertex_id = 0x3000U + word;
+    projection.mesh_vertex_id = 0x4000U + word;
     projection.valid = true;
   }
   std::vector<sf::psx::GpuDmaWordSource> second_dma(second_capture.size());

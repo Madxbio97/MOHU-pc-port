@@ -859,9 +859,9 @@ replayEventAt(const PresentationReplayDrawPage &page,
 }
 
 [[nodiscard]] bool
-replayOptionalIdentityCompatible(std::uint64_t previous,
-                                 std::uint64_t current) noexcept {
-  return previous == 0U ? current == 0U : current != 0U && previous == current;
+replayOptionalProvenanceClassCompatible(std::uint64_t previous,
+                                        std::uint64_t current) noexcept {
+  return (previous == 0U) == (current == 0U);
 }
 
 [[nodiscard]] bool replayProjectionProvenanceCompatible(
@@ -869,10 +869,10 @@ replayOptionalIdentityCompatible(std::uint64_t previous,
     const psx::GteProjectedVertex &current) noexcept {
   if (previous.exact_transform != current.exact_transform ||
       previous.fractional_transform != current.fractional_transform ||
-      !replayOptionalIdentityCompatible(previous.source_vertex_id,
-                                        current.source_vertex_id) ||
-      !replayOptionalIdentityCompatible(previous.mesh_vertex_id,
-                                        current.mesh_vertex_id)) {
+      !replayOptionalProvenanceClassCompatible(previous.source_vertex_id,
+                                               current.source_vertex_id) ||
+      !replayOptionalProvenanceClassCompatible(previous.mesh_vertex_id,
+                                               current.mesh_vertex_id)) {
     return false;
   }
   const auto previous_lineage_valid = previous.transform_lineage != 0U;
