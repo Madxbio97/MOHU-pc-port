@@ -452,6 +452,52 @@ void testRuntimePresentationIsGuestIndependent() {
       "Presentation FPS changed the 60 Hz guest batching policy");
 }
 
+void testRuntimePresentationInterpolationClock() {
+  const auto verify_cadence = [](std::uint32_t presentation_fps,
+                                 std::span<const double> expected) {
+    sf::platform::RuntimePresentationInterpolationClock clock;
+    require(clock.valid() && clock.alpha() == 1.0,
+            "Presentation interpolation did not start on a complete frame");
+    clock.publishAuthoredFrame();
+    require(clock.alpha() == 0.0,
+            "A new authored frame did not begin a causal interval");
+    for (const auto expected_alpha : expected) {
+      const auto actual =
+          clock.advance(1.0 / static_cast<double>(presentation_fps));
+      require(std::abs(actual - expected_alpha) < 1.0e-9,
+              "Presentation interpolation produced the wrong causal alpha");
+    }
+    require(clock.alpha() == 1.0 && clock.advance(1.0) == 1.0,
+            "Presentation interpolation advanced past the current frame");
+  };
+
+  constexpr std::array cadence_30{1.0};
+  constexpr std::array cadence_60{0.5, 1.0};
+  constexpr std::array cadence_120{0.25, 0.5, 0.75, 1.0};
+  constexpr std::array cadence_240{0.125, 0.25, 0.375, 0.5,
+                                   0.625, 0.75, 0.875, 1.0};
+  verify_cadence(30U, cadence_30);
+  verify_cadence(60U, cadence_60);
+  verify_cadence(120U, cadence_120);
+  verify_cadence(240U, cadence_240);
+
+  sf::platform::RuntimePresentationInterpolationClock hitch;
+  hitch.publishAuthoredFrame();
+  require(hitch.advance(0.2) == 1.0,
+          "Presentation hitch did not clamp to the current authored frame");
+  hitch.publishAuthoredFrame();
+  require(hitch.advance(-1.0) == 0.0 &&
+              hitch.advance(std::numeric_limits<double>::infinity()) == 0.0,
+          "Invalid host delta changed presentation interpolation phase");
+  hitch.reset();
+  require(hitch.alpha() == 1.0,
+          "Presentation interpolation reset exposed an empty history");
+
+  sf::platform::RuntimePresentationInterpolationClock invalid{0.0};
+  require(!invalid.valid() && invalid.advance(1.0 / 60.0) == 1.0,
+          "Invalid authored cadence produced a partial presentation frame");
+}
+
 void testRuntimeAudioPlaybackRateTracksGuestClock() {
   sf::platform::RuntimeAudioPlaybackRatePolicy stable;
   static_cast<void>(stable.advance(0.0, 1U));
@@ -746,6 +792,7 @@ int main() {
     testRetailVolumeMapping();
     testRuntimeGuestCadenceIsPresentationIndependent();
     testRuntimePresentationIsGuestIndependent();
+    testRuntimePresentationInterpolationClock();
     testRuntimeAudioPlaybackRateTracksGuestClock();
     testTempoStretchPreservesPitchAndDuration();
     testSaturatedLateRecoveryDoesNotPermanentlyMuteAudio();

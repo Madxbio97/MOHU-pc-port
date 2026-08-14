@@ -487,6 +487,60 @@ runtimeHostPresentationMode(bool visual_dirty) noexcept {
                       : RuntimeHostPresentationMode::cached;
 }
 
+// Advances presentation between two already published authored frames. The
+// one-frame history keeps the interpolation causal: no future guest state is
+// sampled and a late host frame simply lands on the current authored frame.
+class RuntimePresentationInterpolationClock final {
+public:
+  explicit RuntimePresentationInterpolationClock(
+      double authored_frames_per_second = 30.0) noexcept
+      : authored_frames_per_second_(authored_frames_per_second) {
+    reset();
+  }
+
+  [[nodiscard]] bool valid() const noexcept {
+    return std::isfinite(authored_frames_per_second_) &&
+           authored_frames_per_second_ > 0.0 &&
+           authored_frames_per_second_ <= 1'000.0;
+  }
+
+  void reset() noexcept {
+    elapsed_since_publication_seconds_ = valid() ? frameSeconds() : 0.0;
+  }
+
+  void publishAuthoredFrame() noexcept {
+    elapsed_since_publication_seconds_ = 0.0;
+  }
+
+  [[nodiscard]] double advance(double elapsed_seconds) noexcept {
+    if (!valid()) {
+      return 1.0;
+    }
+    if (!std::isfinite(elapsed_seconds) || elapsed_seconds < 0.0) {
+      return alpha();
+    }
+    elapsed_since_publication_seconds_ =
+        std::min(elapsed_since_publication_seconds_ + elapsed_seconds,
+                 frameSeconds());
+    return alpha();
+  }
+
+  [[nodiscard]] double alpha() const noexcept {
+    return valid() ? std::clamp(elapsed_since_publication_seconds_ /
+                                    frameSeconds(),
+                                0.0, 1.0)
+                   : 1.0;
+  }
+
+private:
+  [[nodiscard]] double frameSeconds() const noexcept {
+    return 1.0 / authored_frames_per_second_;
+  }
+
+  double authored_frames_per_second_{30.0};
+  double elapsed_since_publication_seconds_{};
+};
+
 // OpenAL consumes a 44.1 kHz stream in wall-clock time, while an overloaded
 // interpreter produces one 735-frame SPU quantum per completed guest tick.
 // Follow the measured guest clock so a transient CPU overload stretches the
