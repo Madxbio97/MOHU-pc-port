@@ -753,265 +753,6 @@ void updatePgxpDrawContext(PgxpDrawContext &context, std::uint8_t opcode,
     break;
   }
 }
-constexpr auto complete_native_draw_state_mask = std::uint8_t{0x1fU};
-
-[[nodiscard]] constexpr std::int16_t
-decodeNativeSigned11(std::uint32_t value) noexcept {
-  const auto packed = static_cast<std::int32_t>(value & 0x07ffU);
-  return static_cast<std::int16_t>(packed >= 0x0400 ? packed - 0x0800 : packed);
-}
-
-void updateNativeDrawState(psx::NativeGpuDrawState &state, std::uint8_t opcode,
-                           std::uint32_t command) noexcept {
-  switch (opcode) {
-  case 0xe1U:
-    state.draw_mode = command & 0x00ffffffU;
-    break;
-  case 0xe2U:
-    state.texture_window = command & 0x000fffffU;
-    break;
-  case 0xe3U:
-    state.area_left = static_cast<std::uint16_t>(command & 0x03ffU);
-    state.area_top = static_cast<std::uint16_t>((command >> 10U) & 0x01ffU);
-    break;
-  case 0xe4U:
-    state.area_right = static_cast<std::uint16_t>(command & 0x03ffU);
-    state.area_bottom = static_cast<std::uint16_t>((command >> 10U) & 0x01ffU);
-    break;
-  case 0xe5U:
-    state.offset_x = decodeNativeSigned11(command);
-    state.offset_y = decodeNativeSigned11(command >> 11U);
-    break;
-  case 0xe6U:
-    state.force_mask_bit = (command & 1U) != 0U;
-    state.check_mask_bit = (command & 2U) != 0U;
-    break;
-  default:
-    break;
-  }
-}
-
-[[nodiscard]] bool
-nativeDrawStateCompatible(const psx::NativeGpuDrawState &expected,
-                          const psx::NativeGpuDrawState &actual) noexcept {
-  constexpr auto supported_draw_mode = std::uint32_t{0x07ffU};
-  if (expected != actual || (expected.draw_mode & ~supported_draw_mode) != 0U ||
-      expected.texture_window != 0U || expected.force_mask_bit ||
-      expected.check_mask_bit || expected.area_left > expected.area_right ||
-      expected.area_top > expected.area_bottom || expected.area_right > 1023U ||
-      expected.area_bottom > 511U) {
-    return false;
-  }
-  return true;
-}
-[[nodiscard]] bool nativeMaterialAndStateCompatible(
-    const psx::NativeGpuTriangle &triangle, std::uint8_t command_opcode,
-    const psx::NativeGpuDrawState &draw_state) noexcept {
-  return triangle.material.textured == ((command_opcode & 0x04U) != 0U) &&
-         triangle.material.gouraud == ((command_opcode & 0x10U) != 0U) &&
-         triangle.material.semi_transparent ==
-             ((command_opcode & 0x02U) != 0U) &&
-         triangle.material.raw_texture == ((command_opcode & 0x01U) != 0U) &&
-         !triangle.material.semi_transparent &&
-         nativeDrawStateCompatible(triangle.draw_state, draw_state);
-}
-
-struct NativePreparedTriangle {
-  std::array<std::uint32_t, P_LEN + 9U> packet{};
-  std::array<PGXPVData, 3U> vertices{};
-  u_short pgxp_index{0xffffU};
-};
-
-[[nodiscard]] std::uint32_t packNativeByte(float value) noexcept {
-  return static_cast<std::uint32_t>(
-      std::lround(std::clamp(value, 0.0F, 255.0F)));
-}
-
-[[nodiscard]] std::uint32_t
-packNativeColor(const psx::NativeGpuVertex &vertex) noexcept {
-  return packNativeByte(vertex.red) | (packNativeByte(vertex.green) << 8U) |
-         (packNativeByte(vertex.blue) << 16U);
-}
-
-[[nodiscard]] std::uint32_t packNativeCoordinate(float x, float y) noexcept {
-  const auto clampCoordinate = [](float value) {
-    return static_cast<std::uint16_t>(static_cast<std::int16_t>(
-        std::lround(std::clamp(value, -32768.0F, 32767.0F))));
-  };
-  return static_cast<std::uint32_t>(clampCoordinate(x)) |
-         (static_cast<std::uint32_t>(clampCoordinate(y)) << 16U);
-}
-
-[[nodiscard]] bool
-nativeTriangleCompatible(const psx::NativeGpuTriangle &triangle,
-                         std::span<const psx::NativeGpuPosition> positions,
-                         std::size_t command_length,
-                         std::uint8_t command_opcode) noexcept {
-  if (triangle.source_word_count != command_length ||
-      triangle.source_opcode != command_opcode) {
-    return false;
-  }
-  for (const auto &vertex : triangle.vertices) {
-    if (vertex.position_index >= positions.size() || !std::isfinite(vertex.u) ||
-        !std::isfinite(vertex.v) || !std::isfinite(vertex.red) ||
-        !std::isfinite(vertex.green) || !std::isfinite(vertex.blue)) {
-      return false;
-    }
-    const auto &position = positions[vertex.position_index];
-    if (!std::isfinite(position.view_x) || !std::isfinite(position.view_y) ||
-        !std::isfinite(position.view_z) || !std::isfinite(position.screen_h) ||
-        !std::isfinite(position.screen_offset_x) ||
-        !std::isfinite(position.screen_offset_y) ||
-        position.view_z < minimum_legacy_precise_view_depth ||
-        position.screen_h <= 0.0F) {
-      return false;
-    }
-  }
-  return true;
-}
-
-[[nodiscard]] bool nativePrimitiveBatchComplete(
-    std::span<const psx::NativeGpuTriangle> triangles) noexcept {
-  if (triangles.empty() || triangles.size() > 4U) {
-    return false;
-  }
-  const auto &first = triangles.front();
-  const auto expected_count = first.source_triangle_count;
-  if (expected_count == 0U || expected_count != triangles.size()) {
-    return false;
-  }
-
-  auto ordinals = std::uint32_t{};
-  for (const auto &triangle : triangles) {
-    if (triangle.source_triangle_count != expected_count ||
-        triangle.source_primitive != first.source_primitive ||
-        triangle.source_word_offset != first.source_word_offset ||
-        triangle.source_triangle_ordinal >= expected_count) {
-      return false;
-    }
-    const auto ordinal_bit = std::uint32_t{1U}
-                             << triangle.source_triangle_ordinal;
-    if ((ordinals & ordinal_bit) != 0U) {
-      return false;
-    }
-    ordinals |= ordinal_bit;
-  }
-  const auto expected_ordinals =
-      (std::uint32_t{1U} << expected_count) - std::uint32_t{1U};
-  return ordinals == expected_ordinals;
-}
-
-[[nodiscard]] bool
-prepareNativeTriangle(const psx::NativeGpuTriangle &triangle,
-                      std::span<const psx::NativeGpuPosition> positions,
-                      NativePreparedTriangle &prepared) noexcept {
-  const auto opcode =
-      static_cast<std::uint8_t>(triangle.source_opcode & ~0x08U);
-  const auto word_count = sf::psx::gp0FixedCommandLength(opcode);
-  if (word_count == 0U || word_count > 9U) {
-    return false;
-  }
-
-  std::array<std::uint32_t, 9U> command{};
-  command[0U] = (static_cast<std::uint32_t>(opcode) << 24U) |
-                packNativeColor(triangle.vertices[0U]);
-  const auto coordinate_words = sf::psx::gp0PolygonCoordinateWords(opcode);
-  for (std::size_t vertex{}; vertex < triangle.vertices.size(); ++vertex) {
-    const auto &source = triangle.vertices[vertex];
-    const auto &position = positions[source.position_index];
-    const auto screen_x = position.screen_offset_x +
-                          position.view_x * position.screen_h / position.view_z;
-    const auto screen_y = position.screen_offset_y +
-                          position.view_y * position.screen_h / position.view_z;
-    if (!std::isfinite(screen_x) || !std::isfinite(screen_y)) {
-      return false;
-    }
-
-    const auto coordinate_word = coordinate_words[vertex];
-    if (triangle.material.gouraud && vertex != 0U) {
-      command[coordinate_word - 1U] = packNativeColor(source);
-    }
-    command[coordinate_word] = packNativeCoordinate(screen_x, screen_y);
-    if (triangle.material.textured) {
-      auto texture_word =
-          packNativeByte(source.u) | (packNativeByte(source.v) << 8U);
-      if (vertex == 0U) {
-        texture_word |=
-            static_cast<std::uint32_t>(triangle.material.clut & 0x7fffU) << 16U;
-      } else if (vertex == 1U) {
-        texture_word |=
-            static_cast<std::uint32_t>(triangle.material.texture_page & 0x03ffU)
-            << 16U;
-      }
-      command[coordinate_word + 1U] = texture_word;
-    }
-
-    auto &destination = prepared.vertices[vertex];
-    destination.px = position.view_x / 128.0F;
-    destination.py = position.view_y / 128.0F;
-    destination.pz = position.view_z / 128.0F;
-    destination.sx = screen_x;
-    destination.sy = screen_y;
-    destination.scr_h = position.screen_h;
-    destination.ofx = position.screen_offset_x;
-    destination.ofy = position.screen_offset_y;
-    destination.precise_u = source.u;
-    destination.precise_v = source.v;
-    destination.texture_bounds = triangle.texture_bounds;
-    destination.precise_texcoord = triangle.material.textured ? 1U : 0U;
-    destination.exact_projection = 1U;
-    destination.precise_screen_position = 1U;
-  }
-
-  auto *tag = reinterpret_cast<P_TAG *>(prepared.packet.data());
-  setlen(tag, word_count);
-  std::memcpy(prepared.packet.data() + P_LEN, command.data(),
-              word_count * sizeof(std::uint32_t));
-  const auto command_words =
-      std::span<const std::uint32_t>{command}.first(word_count);
-  convertPrimitiveCoordinates(opcode, command_words, prepared.packet.data());
-  for (std::size_t vertex{}; vertex < prepared.vertices.size(); ++vertex) {
-    prepared.vertices[vertex].lookup =
-        prepared.packet[P_LEN + coordinate_words[vertex]];
-  }
-  return true;
-}
-
-[[nodiscard]] bool emitNativeTriangles(
-    std::span<const psx::NativeGpuTriangle> triangles,
-    std::span<const psx::NativeGpuPosition> positions) noexcept {
-  if (triangles.empty() || triangles.size() > 4U) {
-    return false;
-  }
-  std::array<NativePreparedTriangle, 4U> prepared{};
-  for (std::size_t triangle{}; triangle < triangles.size(); ++triangle) {
-    if (!prepareNativeTriangle(triangles[triangle], positions,
-                               prepared[triangle])) {
-      return false;
-    }
-  }
-
-  constexpr auto no_pgxp = static_cast<u_short>(0xffffU);
-  const auto cache_mark = PGXP_MarkCache();
-  for (std::size_t triangle{}; triangle < triangles.size(); ++triangle) {
-    for (auto &vertex : prepared[triangle].vertices) {
-      if (PGXP_EmitCacheData(&vertex) == no_pgxp) {
-        PGXP_RewindCache(cache_mark);
-        return false;
-      }
-    }
-    prepared[triangle].pgxp_index = PGXP_GetIndex(1);
-    if (prepared[triangle].pgxp_index == no_pgxp) {
-      PGXP_RewindCache(cache_mark);
-      return false;
-    }
-  }
-  for (std::size_t triangle{}; triangle < triangles.size(); ++triangle) {
-    DrawPrimPGXP(reinterpret_cast<P_TAG *>(prepared[triangle].packet.data()),
-                 prepared[triangle].pgxp_index);
-  }
-  return true;
-}
 
 } // namespace
 void PsyCrossGuestGpu::presentDisplay(std::uint16_t source_x,
@@ -1019,40 +760,6 @@ void PsyCrossGuestGpu::presentDisplay(std::uint16_t source_x,
                                       std::uint16_t width, std::uint16_t height,
                                       bool enabled, bool rgb24,
                                       bool interlaced) {
-  static bool diagnostic_vram_captured{};
-  static std::uint32_t diagnostic_frame_count{};
-  static const std::uint32_t diagnostic_frame_target = [] {
-    const auto *value = SDL_getenv("MOHU_VRAM_CAPTURE_FRAME");
-    const auto parsed = value != nullptr ? SDL_atoi(value) : 300;
-    return parsed > 0 ? static_cast<std::uint32_t>(parsed) : 300U;
-  }();
-  ++diagnostic_frame_count;
-  const auto *diagnostic_vram_path = SDL_getenv("MOHU_VRAM_CAPTURE");
-  if (!diagnostic_vram_captured && diagnostic_vram_path != nullptr &&
-      *diagnostic_vram_path != '\0' &&
-      diagnostic_frame_count >= diagnostic_frame_target) {
-    DrawSync(0);
-    SDL_Log("MOHU GPU capture: frame=%u submitted=%llu unsupported=%llu "
-            "pending=%zu display=%u,%u %ux%u",
-            diagnostic_frame_count,
-            static_cast<unsigned long long>(submitted_commands_),
-            static_cast<unsigned long long>(unsupported_commands_),
-            pending_.size(), source_x, source_y, width, height);
-    DRAWENV diagnostic_draw{};
-    GetDrawEnv(&diagnostic_draw);
-    SDL_Log("MOHU draw state: clip=%d,%d %dx%d ofs=%d,%d dfe=%u",
-            diagnostic_draw.clip.x, diagnostic_draw.clip.y,
-            diagnostic_draw.clip.w, diagnostic_draw.clip.h,
-            diagnostic_draw.ofs[0], diagnostic_draw.ofs[1],
-            diagnostic_draw.dfe);
-    GR_SaveVRAM(diagnostic_vram_path, 0, 0, vram_width, vram_height, 0);
-    const auto *diagnostic_gpu_vram_path = SDL_getenv("MOHU_GPU_VRAM_CAPTURE");
-    if (diagnostic_gpu_vram_path != nullptr &&
-        *diagnostic_gpu_vram_path != '\0') {
-      GR_SaveVRAM(diagnostic_gpu_vram_path, 0, 0, vram_width, vram_height, 1);
-    }
-    diagnostic_vram_captured = true;
-  }
 
   const auto scanout_width = std::min(static_cast<unsigned int>(width),
                                       static_cast<unsigned int>(vram_width));
@@ -2010,7 +1717,7 @@ void PsyCrossGuestGpu::submit(
   // packed witness index only when such a hole is actually present. Unique
   // witnesses recover one canonical PsyCross vertex; collisions fail closed.
   const auto catalog_recovery_demanded =
-      coherence_edge_snapping_enabled_ && diagnostic_quad_recovery_enabled_ &&
+      coherence_edge_snapping_enabled_ && quad_recovery_enabled_ &&
       [&] {
         if (!catalog_handle_active)
           return false;
@@ -2480,7 +2187,7 @@ void PsyCrossGuestGpu::submit(
             mesh_projections[word] = *projection;
           }
         }
-        if (diagnostic_quad_recovery_enabled_ && missing_count == 1U &&
+        if (quad_recovery_enabled_ && missing_count == 1U &&
             vertex_count == 4U) {
           const auto quad_words = std::array<std::size_t, 4U>{
               coordinate_words[0U], coordinate_words[1U], coordinate_words[2U],
@@ -2559,14 +2266,6 @@ void PsyCrossGuestGpu::submit(
     prepareCoherenceEdgePolicy(false, 0U, false, false);
   }
 
-  auto native_triangle_index = std::size_t{};
-  const auto nativeWordOffset = [&](std::size_t triangle) noexcept {
-    const auto offset = native_triangles_[triangle].source_word_offset;
-    return offset <= std::numeric_limits<std::size_t>::max() -
-                         pending_words_before_append
-               ? pending_words_before_append + offset
-               : std::numeric_limits<std::size_t>::max();
-  };
   auto shared_mesh_context = currentPgxpDrawContext();
   auto consumed = std::size_t{};
   while (consumed < pending_.size()) {
@@ -2625,7 +2324,7 @@ void PsyCrossGuestGpu::submit(
         resolved_storage[word] = *resolved;
         ++recovered_vertices;
       }
-      if (diagnostic_quad_recovery_enabled_ && missing_count == 1U &&
+      if (quad_recovery_enabled_ && missing_count == 1U &&
           vertex_count == 4U) {
         const auto quad_words = std::array<std::size_t, 4U>{
             coordinate_words[0U], coordinate_words[1U], coordinate_words[2U],
@@ -2704,7 +2403,7 @@ void PsyCrossGuestGpu::submit(
       ++missing_projection_vertex_buckets_[std::min(
           directly_missing_count,
           missing_projection_vertex_buckets_.size() - 1U)];
-      if (diagnostic_quad_recovery_enabled_ && packed_catalog_active &&
+      if (quad_recovery_enabled_ && packed_catalog_active &&
           missing_count == 1U && vertex_count == 4U) {
         const auto quad_words = std::array<std::size_t, 4U>{
             coordinate_words[0U], coordinate_words[1U], coordinate_words[2U],
@@ -2793,7 +2492,7 @@ void PsyCrossGuestGpu::submit(
           !catalog_resolution_failed &&
           probePrecisePrimitive(opcode, command, resolved_projections,
                                 &reject_reason,
-                                diagnostic_projective_depth_enabled_);
+                                projective_depth_enabled_);
     }
 
     if (precise_candidate && shared_mesh_policy_active_) {
@@ -2915,7 +2614,7 @@ void PsyCrossGuestGpu::submit(
       auto enhanced_rotation = true;
       auto enhanced_translation = true;
       auto enhanced_vector = true;
-      auto exact_view_depth = !diagnostic_projective_depth_enabled_;
+      auto exact_view_depth = !projective_depth_enabled_;
       for (std::size_t vertex{}; vertex < vertex_count; ++vertex) {
         const auto word = coordinate_words[vertex];
         if (word >= resolved_projections.size()) {
@@ -3013,69 +2712,19 @@ void PsyCrossGuestGpu::submit(
         hard_geometry_reject ||
                 (polygon && catalog_handle_active &&
                  !coherence_edge_snapping_enabled_ &&
-                 !diagnostic_atomic_fallback_enabled_ && !precise_candidate)
+                 !atomic_fallback_enabled_ && !precise_candidate)
             ? std::span<const psx::GteProjectedVertex>{}
             : resolved_projections;
-    const auto allow_perspective = diagnostic_master_enabled_ &&
-                                   diagnostic_perspective_enabled_ &&
+    const auto allow_perspective = geometry_enabled_ &&
+                                   perspective_correction_enabled_ &&
                                    precise_candidate;
     const auto allow_precise_screen =
-        diagnostic_master_enabled_ && diagnostic_precise_screen_enabled_;
-    while (native_triangle_index < native_triangles_.size() &&
-           nativeWordOffset(native_triangle_index) < consumed) {
-      ++native_triangle_index;
-    }
-    const auto native_begin = native_triangle_index;
-    while (native_triangle_index < native_triangles_.size() &&
-           nativeWordOffset(native_triangle_index) == consumed) {
-      ++native_triangle_index;
-    }
-    const auto native_count = native_triangle_index - native_begin;
-    auto native_replaced = false;
-    if (polygon && native_count != 0U && !hard_geometry_reject &&
-        diagnostic_master_enabled_ && diagnostic_perspective_enabled_ &&
-        diagnostic_precise_screen_enabled_) {
-      const auto native_group =
-          native_triangles_.subspan(native_begin, native_count);
-      const auto state_material_compatible =
-          native_draw_state_valid_mask_ == complete_native_draw_state_mask &&
-          std::ranges::all_of(native_group, [&](const auto &triangle) {
-            return nativeMaterialAndStateCompatible(triangle, opcode,
-                                                    native_draw_state_);
-          });
-      if (!state_material_compatible) {
-        ++native_scene_state_fallbacks_;
-      } else {
-        const auto geometry_compatible =
-            nativePrimitiveBatchComplete(native_group) &&
-            std::ranges::all_of(native_group, [&](const auto &triangle) {
-              return nativeTriangleCompatible(triangle, native_positions_,
-                                              length, opcode);
-            });
-        if (geometry_compatible) {
-          native_replaced =
-              emitNativeTriangles(native_group, native_positions_);
-        }
-      }
-    }
-    if (native_replaced) {
-      ++polygon_primitives_;
-      ++precise_primitives_;
-      ++native_scene_primitives_;
-      native_scene_triangles_ += native_count;
-    } else {
-      native_scene_fallbacks_ += native_count != 0U ? 1U : 0U;
-      dispatch(command, dispatch_projections, precise_candidate,
-               allow_perspective, allow_precise_screen,
-               diagnostic_projective_depth_enabled_);
-    }
+        geometry_enabled_ && precise_screen_position_enabled_;
+    dispatch(command, dispatch_projections, precise_candidate,
+             allow_perspective, allow_precise_screen,
+             projective_depth_enabled_);
     ++submitted_commands_;
     updatePgxpDrawContext(shared_mesh_context, opcode, command.front());
-    updateNativeDrawState(native_draw_state_, opcode, command.front());
-    if (opcode >= 0xe1U && opcode <= 0xe5U) {
-      native_draw_state_valid_mask_ |=
-          static_cast<std::uint8_t>(1U << (opcode - 0xe1U));
-    }
     consumed += length;
   }
   if (consumed != 0U) {
@@ -3099,8 +2748,6 @@ void PsyCrossGuestGpu::submit(
     pending_projections_.clear();
     pending_projection_identities_.clear();
   }
-  native_positions_ = {};
-  native_triangles_ = {};
 }
 
 } // namespace sf::platform::detail

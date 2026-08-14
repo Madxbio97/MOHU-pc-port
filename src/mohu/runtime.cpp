@@ -136,33 +136,6 @@ Runtime::Runtime(sf::game::GameDisc disc,
   machine_.setCdRomMedia(&media_);
 }
 
-bool Runtime::configureProjectionDiagnostics(
-    bool transform_tracking, bool exact_transform, bool exact_capture,
-    bool compact_catalog, bool identity_sidecar,
-    bool preserve_projection_precision) noexcept {
-  // Hotkey changes are provenance boundaries. Disable consumers first so a
-  // carrier produced by the previous diagnostic mode cannot survive it.
-  // Every diagnostic mode change is also a direct-shadow provenance boundary.
-  static_cast<void>(cpu_.setGpuProjectionCatalogTracking(false));
-  gpu_.setProjectionIdentityTracking(false);
-  if (!transform_tracking) {
-    static_cast<void>(cpu_.setGpuProjectionCatalogTracking(false));
-    cpu_.setPgxpExactTransformCaptureEnabled(false);
-    cpu_.setPgxpExactTransformTracking(false);
-    static_cast<void>(cpu_.setPgxpTransformTracking(false));
-    cpu_.setPgxpPreserveProjectionPrecision(false);
-    return true;
-  }
-  if (!cpu_.setPgxpTransformTracking(true))
-    return false;
-  cpu_.setPgxpPreserveProjectionPrecision(preserve_projection_precision);
-  cpu_.setPgxpExactTransformTracking(exact_transform);
-  cpu_.setPgxpExactTransformCaptureEnabled(exact_capture);
-  if (!cpu_.setGpuProjectionCatalogTracking(compact_catalog))
-    return false;
-  gpu_.setProjectionIdentityTracking(identity_sidecar);
-  return true;
-}
 
 void Runtime::configureAdaptiveWorldFrustum(std::uint32_t output_width,
                                             std::uint32_t output_height,

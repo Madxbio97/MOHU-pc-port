@@ -429,55 +429,6 @@ void R3000Runtime::setPgxpExactTransformCaptureEnabled(bool enabled) noexcept {
   }
 }
 
-void R3000Runtime::configureStoreDiagnostics(std::uint32_t begin,
-                                             std::uint32_t end) noexcept {
-  store_diagnostic_begin_ = begin & 0x001fffffU;
-  store_diagnostic_end_ = end & 0x001fffffU;
-  store_diagnostics_.fill({});
-  store_diagnostic_overflow_ = 0U;
-}
-
-void R3000Runtime::recordStoreDiagnostic(std::uint32_t pc,
-                                         std::uint32_t address,
-                                         std::uint8_t opcode,
-                                         bool projected) noexcept {
-  static_assert(
-      (store_diagnostic_capacity & (store_diagnostic_capacity - 1U)) == 0U);
-  constexpr auto maximum_probes = std::size_t{8U};
-  constexpr auto index_mask = store_diagnostic_capacity - 1U;
-
-  if (store_diagnostic_end_ <= store_diagnostic_begin_)
-    return;
-  address &= 0x001fffffU;
-  if (address < store_diagnostic_begin_ || address >= store_diagnostic_end_)
-    return;
-
-  const auto hash =
-      static_cast<std::size_t>((pc >> 2U) * 0x9e3779b1U) & index_mask;
-  R3000StoreSiteDiagnostic *site{};
-  for (std::size_t probe{}; probe < maximum_probes; ++probe) {
-    auto &candidate = store_diagnostics_[(hash + probe) & index_mask];
-    if (candidate.pc == pc && candidate.writes != 0U) {
-      site = &candidate;
-      break;
-    }
-    if (candidate.writes == 0U) {
-      candidate.pc = pc;
-      site = &candidate;
-      break;
-    }
-  }
-  if (site == nullptr) {
-    ++store_diagnostic_overflow_;
-    return;
-  }
-
-  ++site->writes;
-  site->projected_writes += projected ? 1U : 0U;
-  site->halfword_writes += opcode == 0x29U ? 1U : 0U;
-  site->unaligned_writes += opcode == 0x2aU || opcode == 0x2eU ? 1U : 0U;
-  site->cop2_writes += opcode == 0x3aU ? 1U : 0U;
-}
 
 void R3000Runtime::setPgxpVertexIdentityTracking(bool enabled) noexcept {
   if (enabled == pgxp_vertex_identity_tracking_)
@@ -4287,9 +4238,6 @@ R3000RunResult R3000Runtime::step() noexcept {
     if (!write8(address, static_cast<std::uint8_t>(right))) {
       stop = R3000StopReason::memory_fault;
     } else {
-      if (store_diagnostic_end_ > store_diagnostic_begin_) {
-        recordStoreDiagnostic(instruction_pc, address, opcode, false);
-      }
     }
     break;
   }
@@ -4311,10 +4259,6 @@ R3000RunResult R3000Runtime::step() noexcept {
                                  pgxpRegister(rt, right))) {
       stop = R3000StopReason::memory_fault;
     } else {
-      if (store_diagnostic_end_ > store_diagnostic_begin_) {
-        recordStoreDiagnostic(instruction_pc, address, opcode,
-                              projected_half_ptr != nullptr);
-      }
     }
     break;
   }
@@ -4425,10 +4369,6 @@ R3000RunResult R3000Runtime::step() noexcept {
           compact_projection->packed_sxy == value) {
         storeProjectedVertex(aligned_address, *compact_projection);
       }
-      if (store_diagnostic_end_ > store_diagnostic_begin_) {
-        recordStoreDiagnostic(instruction_pc, aligned_address, opcode,
-                              compact_projection != nullptr);
-      }
     }
     break;
   }
@@ -4455,10 +4395,6 @@ R3000RunResult R3000Runtime::step() noexcept {
         storeExactWord(address, right, exact);
       if (projected == nullptr)
         storePgxpWord(address, right, pgxpRegister(rt, right));
-      if (store_diagnostic_end_ > store_diagnostic_begin_) {
-        recordStoreDiagnostic(instruction_pc, address, opcode,
-                              projected != nullptr);
-      }
     }
     break;
   }
@@ -4490,10 +4426,6 @@ R3000RunResult R3000Runtime::step() noexcept {
         const auto exact =
             GteRuntime::exactData(state_.gte, exact_tracking_->gte, rt);
         storeExactWord(address, value, exact.raw == value ? &exact : nullptr);
-      }
-      if (store_diagnostic_end_ > store_diagnostic_begin_) {
-        recordStoreDiagnostic(instruction_pc, address, opcode,
-                              projected != nullptr);
       }
     }
     break;

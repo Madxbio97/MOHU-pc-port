@@ -1,5 +1,4 @@
 #include "launcher.hpp"
-#include "render_diagnostics.hpp"
 
 #include "mohu/display_presentation.hpp"
 #include "mohu/runtime.hpp"
@@ -408,8 +407,6 @@ int main(int argc, char **argv) {
       throw sf::core::Error{sf::core::ErrorCode::io,
                             "Cannot resolve the Memory Card save path"};
     }
-    const auto renderer_log_path =
-        mohu::app::configureRendererDiagnosticLog(memory_card_path);
     mohu::StableGuestDisplayGeometry stable_display_geometry;
     auto runtime =
         std::make_unique<mohu::Runtime>(std::move(disc), memory_card_path);
@@ -422,24 +419,10 @@ int main(int argc, char **argv) {
     runtime->setGteProjectionCommandBackend(
         sf::platform::psycrossGteProjectionCommandBackend());
     std::optional<mohu::RuntimeFrameResult> runtime_failure;
-    mohu::app::RendererDiagnostics renderer_diagnostics{runtime->stats()};
-    struct ProjectionDiagnosticState {
-      bool master{true};
-      bool exact_transform{true};
-      bool exact_capture{true};
-      bool catalog{true};
-      bool identity{true};
-      bool preserve{};
-    } projection_diagnostics;
     auto host = sf::platform::createPsyCrossRuntimeHost(
         "Medal of Honor: Underground PC",
         [&](const sf::platform::RuntimePadInput &pad) {
-          const auto diagnostic_start = renderer_diagnostics.beginFrame();
           auto frame = runtime->runFrame(pad.active_low_buttons, pad.analog);
-          renderer_diagnostics.finishFrame(
-              runtime->stats(), mohu::NativeRenderFrameStats{},
-              runtime->cpu().storeDiagnostics(),
-              runtime->cpu().storeDiagnosticOverflow(), diagnostic_start);
           if (frame.running()) {
             return true;
           }
@@ -467,64 +450,12 @@ int main(int argc, char **argv) {
               display.enabled,
               geometry.rgb24,
               geometry.interlaced,
-              runtime->gpuCommandBufferEpoch(),
-              {},
-              {}};
+              runtime->gpuCommandBufferEpoch()};
         },
         graphics, input, runtime_actions,
         [&runtime](std::span<sf::psx::SpuPcmFrame> destination) noexcept {
           return runtime->takePcm(destination);
-        },
-        [&runtime, &projection_diagnostics](
-            sf::platform::RuntimeGraphicsDiagnosticFeature feature,
-            bool enabled) noexcept {
-          switch (feature) {
-          case sf::platform::RuntimeGraphicsDiagnosticFeature::exact_transform:
-            projection_diagnostics.exact_transform = enabled;
-            break;
-          case sf::platform::RuntimeGraphicsDiagnosticFeature::exact_capture:
-            projection_diagnostics.exact_capture = enabled;
-            break;
-          case sf::platform::RuntimeGraphicsDiagnosticFeature::compact_catalog:
-            projection_diagnostics.catalog = enabled;
-            break;
-          case sf::platform::RuntimeGraphicsDiagnosticFeature::identity_sidecar:
-            projection_diagnostics.identity = enabled;
-            break;
-          case sf::platform::RuntimeGraphicsDiagnosticFeature::
-              preserve_projection_precision:
-            projection_diagnostics.preserve = enabled;
-            break;
-          case sf::platform::RuntimeGraphicsDiagnosticFeature::master:
-            projection_diagnostics.master = enabled;
-            break;
-          case sf::platform::RuntimeGraphicsDiagnosticFeature::
-              perspective_correction:
-          case sf::platform::RuntimeGraphicsDiagnosticFeature::
-              precise_screen_position:
-          case sf::platform::RuntimeGraphicsDiagnosticFeature::
-              projective_depth_clamp:
-          case sf::platform::RuntimeGraphicsDiagnosticFeature::quad_recovery:
-          case sf::platform::RuntimeGraphicsDiagnosticFeature::
-              coherence_recovery:
-          case sf::platform::RuntimeGraphicsDiagnosticFeature::
-              atomic_primitive_fallback:
-          case sf::platform::RuntimeGraphicsDiagnosticFeature::count:
-            break;
-          }
-          return runtime->configureProjectionDiagnostics(
-              projection_diagnostics.master,
-              projection_diagnostics.master &&
-                  projection_diagnostics.exact_transform,
-              projection_diagnostics.master &&
-                  projection_diagnostics.exact_transform &&
-                  projection_diagnostics.exact_capture,
-              projection_diagnostics.master && projection_diagnostics.catalog,
-              projection_diagnostics.master && projection_diagnostics.catalog &&
-                  projection_diagnostics.identity,
-              projection_diagnostics.master && projection_diagnostics.preserve);
         });
-    mohu::app::RendererDiagnostics::announce(renderer_log_path);
     host->run();
 
     if (runtime_failure) {

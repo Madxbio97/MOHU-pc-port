@@ -89,21 +89,11 @@ struct ProjectedVertexProvenance {
   std::uint64_t identity{};
 };
 
-struct R3000StoreSiteDiagnostic {
-  std::uint32_t pc{};
-  std::uint64_t writes{};
-  std::uint64_t projected_writes{};
-  std::uint64_t halfword_writes{};
-  std::uint64_t unaligned_writes{};
-  std::uint64_t cop2_writes{};
-};
-
 // Deterministic interpreter for the user-code portion of the original R3000A.
 // Hardware effects are supplied by an optional width-aware machine bus. Any
 // unclaimed MMIO byte remains available through the compatibility shadow.
 class R3000Runtime final {
 public:
-  static constexpr std::size_t store_diagnostic_capacity = 256U;
   static constexpr std::size_t ram_size = 2U * 1024U * 1024U;
   static constexpr std::size_t scratchpad_size = 1024U;
   static constexpr std::size_t mmio_size = 4U * 1024U;
@@ -140,15 +130,6 @@ public:
   void setPgxpExactTransformTracking(bool enabled) noexcept;
   void setPgxpExactTransformCaptureEnabled(bool enabled) noexcept;
   void setPgxpVertexIdentityTracking(bool enabled) noexcept;
-  void configureStoreDiagnostics(std::uint32_t begin,
-                                 std::uint32_t end) noexcept;
-  [[nodiscard]] std::span<const R3000StoreSiteDiagnostic>
-  storeDiagnostics() const noexcept {
-    return store_diagnostics_;
-  }
-  [[nodiscard]] std::uint64_t storeDiagnosticOverflow() const noexcept {
-    return store_diagnostic_overflow_;
-  }
   void setPgxpPreserveProjectionPrecision(bool enabled) noexcept {
     pgxp_preserve_projection_precision_ = enabled;
   }
@@ -490,8 +471,6 @@ private:
   void setTrackedWordMarked(std::uint32_t key, bool marked) noexcept;
   void clearPgxpCarriers(bool clear_full_projected = true) noexcept;
   [[nodiscard]] bool exactTransformCarrierTracking() const noexcept;
-  void recordStoreDiagnostic(std::uint32_t pc, std::uint32_t address,
-                             std::uint8_t opcode, bool projected) noexcept;
   void recordGpuProjection(GteProjectedVertex &projection) noexcept;
   [[nodiscard]] std::uint16_t
   ensureGpuProjectionHandle(GteProjectedVertex &projection) noexcept;
@@ -542,12 +521,7 @@ private:
   bool pgxp_cpu_tracking_{true};
   bool pgxp_exact_transform_tracking_{};
   bool pgxp_exact_transform_capture_enabled_{true};
-  std::array<R3000StoreSiteDiagnostic, store_diagnostic_capacity>
-      store_diagnostics_{};
-  std::uint32_t store_diagnostic_begin_{};
-  std::uint32_t store_diagnostic_end_{};
   bool pgxp_vertex_identity_tracking_{true};
-  std::uint64_t store_diagnostic_overflow_{};
   bool pgxp_preserve_projection_precision_{};
   bool pgxp_memory_overflow_{};
   bool exact_memory_overflow_{};

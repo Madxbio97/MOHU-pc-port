@@ -45,17 +45,11 @@ if(SF_BUILD_TESTS)
         LIBRARIES sf::psx)
     sf_add_unit_test(sf_memory_card_image_tests
         tests/memory_card_image_tests.cpp LIBRARIES sf::psx)
-    sf_add_unit_test(mohu_native_world_level_tests
-        tests/mohu_native_world_level_tests.cpp LIBRARIES mohu::runtime)
     if(MSVC)
         target_link_options(sf_memory_card_image_tests PRIVATE /STACK:4194304)
     endif()
     sf_add_unit_test(mohu_gpu_command_stream_tests
         tests/mohu_gpu_command_stream_tests.cpp LIBRARIES mohu::runtime)
-    sf_add_unit_test(mohu_tsp_scene_tests
-        tests/mohu_tsp_scene_tests.cpp LIBRARIES mohu::runtime)
-    sf_add_unit_test(mohu_native_world_mesh_tests
-        tests/mohu_native_world_mesh_tests.cpp LIBRARIES mohu::runtime)
     sf_add_unit_test(sf_legacy_presentation_bridge_tests
         tests/legacy_presentation_bridge_tests.cpp LIBRARIES sf::game)
     sf_add_unit_test(sf_raw_sector_source_tests
@@ -95,7 +89,6 @@ if(SF_BUILD_TESTS)
             LABELS "rom;mohu;gameplay;integration"
             TIMEOUT 900)
     endif()
-    sf_register_supported_rom_tests()
 
     if(SF_ENABLE_PSYCROSS)
         sf_add_unit_test(sf_aspect_ratio_tests tests/aspect_ratio_tests.cpp
@@ -115,13 +108,6 @@ if(SF_BUILD_TESTS)
         if(MSVC)
             target_link_options(sf_psycross_render_tests
                 PRIVATE /STACK:4194304)
-        endif()
-        if(SF_SUPPORTED_ROM_CUE)
-            add_test(NAME sf_g4_fmv_rom
-                COMMAND sf_movie_probe "${SF_SUPPORTED_ROM_CUE}")
-            set_tests_properties(sf_g4_fmv_rom PROPERTIES
-                LABELS "rom;g4;g4.3;fmv"
-                TIMEOUT 300)
         endif()
     endif()
 endif()

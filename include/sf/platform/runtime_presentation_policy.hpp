@@ -11,7 +11,6 @@ struct RuntimePresentationSample {
   std::uint16_t display_height{240U};
   bool rgb24{};
   bool interlaced{};
-  bool has_scene_geometry{};
 };
 
 class RuntimePresentationPolicy final {
@@ -23,7 +22,7 @@ public:
       ambiguous_frames_ = 0U;
       return content_;
     }
-    if (isGameplayMode(sample) || sample.has_scene_geometry) {
+    if (isGameplayMode(sample)) {
       content_ = PresentationContent::gameplay;
       ambiguous_frames_ = 0U;
       return content_;

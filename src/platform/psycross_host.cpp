@@ -165,13 +165,11 @@ public:
                KeyboardMouseBindings input = defaultKeyboardMouseBindings(),
                MohUndergroundRuntimeActionBindings runtime_actions =
                    defaultMohUndergroundRuntimeActionBindings(),
-               RuntimeAudioDrainCallback audio = {},
-               RuntimeGraphicsDiagnosticCallback graphics_diagnostics = {})
+               RuntimeAudioDrainCallback audio = {})
       : title_(title.begin(), title.end()), graphics_(graphics),
         frame_(std::move(frame)), gpu_frame_(std::move(gpu_frame)),
         input_(std::move(input)), runtime_actions_(std::move(runtime_actions)),
-        audio_(std::move(audio)),
-        graphics_diagnostics_(std::move(graphics_diagnostics)) {
+        audio_(std::move(audio)) {
     title_.push_back('\0');
   }
 
@@ -191,23 +189,7 @@ public:
     // perspective W, but keep their shared depth policy in GP0 painter order.
     g_cfg_pgxpTextureCorrection = gpu_frame_ ? 1 : g_cfg_pgxpTextureCorrection;
     g_cfg_pgxpZBuffer = gpu_frame_ ? 1 : g_cfg_pgxpZBuffer;
-    struct RuntimeGraphicsDiagnosticState {
-      bool master{true};
-      bool perspective{true};
-      bool precise_screen{true};
-      bool exact_transform{true};
-      bool exact_capture{true};
-      bool catalog{true};
-      bool identity{true};
-      bool preserve{};
-      bool projective_depth{true};
-      // Ray/plane recovery cannot prove guest vertex provenance.
-      // Keep it opt-in for diagnostics, never production.
-      bool quad_recovery{};
-      bool coherence{true};
-      bool atomic_fallback{true};
-    } diagnostic_state;
-    guest_gpu_.setDiagnosticGeometryOptions(true, true, true, true, false, true,
+    guest_gpu_.setGeometryOptions(true, true, true, true, false, true,
                                             true);
     guest_gpu_.setRuntimeGeometryPolicy(true, false, false);
 
@@ -228,8 +210,6 @@ public:
       // after platform initialization has completed.
       runtime_audio =
           std::make_unique<detail::PsyCrossAudioOutput>(2U, "retail-spu");
-      // One guest quantum plus one device request bounds startup latency while
-      // preserving enough phase cushion for the callback sink.
     }
     detail::RelativeMouseCapture runtime_mouse_capture;
     const auto maximum_guest_steps =
@@ -240,379 +220,6 @@ public:
     auto runtime_previous_counter = SDL_GetPerformanceCounter();
     const auto runtime_counter_frequency = SDL_GetPerformanceFrequency();
     std::uint64_t guest_projection_epoch{};
-    struct GraphicsDiagnosticSnapshot {
-      std::uint64_t polygons{};
-      std::uint64_t precise{};
-      std::uint64_t exact{};
-      std::uint64_t enhanced{};
-      std::uint64_t enhanced_rotation{};
-      std::uint64_t enhanced_translation{};
-      std::uint64_t enhanced_vector{};
-      std::uint64_t exact_view_depth{};
-      std::uint64_t integer{};
-      std::uint64_t missing_handles_0{};
-      std::uint64_t missing_handles_1{};
-      std::uint64_t missing_handles_2{};
-      std::uint64_t missing_handles_3{};
-      std::uint64_t missing_handles_4{};
-      std::uint64_t partial{};
-      std::uint64_t missing{};
-      std::uint64_t hazard{};
-      std::uint64_t ir_saturation{};
-      std::uint64_t depth_saturation{};
-      std::uint64_t divide_overflow{};
-      std::uint64_t screen_saturation{};
-      std::uint64_t screen{};
-      std::uint64_t reprojection{};
-      std::uint64_t camera{};
-      std::uint64_t near_plane{};
-      std::uint64_t catalog_builds{};
-      std::uint64_t catalog_primitives{};
-      std::uint64_t catalog_ambiguities{};
-      std::uint64_t recovered_vertices{};
-      std::uint64_t conflicts{};
-      std::uint64_t fractional{};
-      std::uint64_t snapped{};
-      std::uint64_t unique{};
-      std::uint64_t reused{};
-      std::uint64_t synthetic{};
-      std::uint64_t packet_fallback{};
-      std::uint64_t plane_recovered{};
-      std::uint64_t plane_rejected{};
-      std::uint64_t native_primitives{};
-      std::uint64_t native_triangles{};
-      std::uint64_t native_fallbacks{};
-      std::uint64_t native_state_fallbacks{};
-      std::uint64_t synchronous_readbacks{};
-    };
-    const auto graphicsSnapshot = [this] {
-      return GraphicsDiagnosticSnapshot{
-          guest_gpu_.polygonPrimitives(),
-          guest_gpu_.precisePrimitives(),
-          guest_gpu_.exactPrecisePrimitives(),
-          guest_gpu_.enhancedPrecisePrimitives(),
-          guest_gpu_.enhancedRotationPrimitives(),
-          guest_gpu_.enhancedTranslationPrimitives(),
-          guest_gpu_.enhancedVectorPrimitives(),
-          guest_gpu_.exactViewDepthPrimitives(),
-          guest_gpu_.integerPrecisePrimitives(),
-          guest_gpu_.missingProjectionVertexBucket(0U),
-          guest_gpu_.missingProjectionVertexBucket(1U),
-          guest_gpu_.missingProjectionVertexBucket(2U),
-          guest_gpu_.missingProjectionVertexBucket(3U),
-          guest_gpu_.missingProjectionVertexBucket(4U),
-          guest_gpu_.partialProjectionPrimitives(),
-          guest_gpu_.missingProjectionPrimitives(),
-          guest_gpu_.projectionHazardPrimitives(),
-          guest_gpu_.irSaturationPrimitives(),
-          guest_gpu_.depthSaturationPrimitives(),
-          guest_gpu_.divideOverflowPrimitives(),
-          guest_gpu_.screenSaturationPrimitives(),
-          guest_gpu_.screenMismatchPrimitives(),
-          guest_gpu_.reprojectionMismatchPrimitives(),
-          guest_gpu_.cameraMismatchPrimitives(),
-          guest_gpu_.nearPlanePrimitives(),
-          guest_gpu_.projectionCatalogBuilds(),
-          guest_gpu_.projectionCatalogPrimitives(),
-          guest_gpu_.projectionCatalogAmbiguities(),
-          guest_gpu_.identityRecoveredVertices(),
-          guest_gpu_.sharedMeshConflicts(),
-          guest_gpu_.sharedMeshFractionalVertices(),
-          guest_gpu_.sharedMeshSnappedVertices(),
-          guest_gpu_.sharedMeshUniqueVertices(),
-          guest_gpu_.sharedMeshReusedVertices(),
-          guest_gpu_.sharedMeshSyntheticVertices(),
-          guest_gpu_.sharedMeshPacketFallbackVertices(),
-          guest_gpu_.planeRecoveredPrimitives(),
-          guest_gpu_.planeRecoveryRejectedPrimitives(),
-          guest_gpu_.nativeScenePrimitives(),
-          guest_gpu_.nativeSceneTriangles(),
-          guest_gpu_.nativeSceneFallbacks(),
-          guest_gpu_.nativeSceneStateFallbacks(),
-          GR_GetSynchronousVRAMReadbackCount()};
-    };
-    auto graphics_diagnostic_previous = graphicsSnapshot();
-    auto graphics_diagnostic_counter = SDL_GetPerformanceCounter();
-    std::uint64_t graphics_diagnostic_guest_steps{};
-    std::uint64_t graphics_diagnostic_render_frames{};
-    std::uint64_t graphics_diagnostic_submit_ticks{};
-    std::uint64_t graphics_diagnostic_submit_max_ticks{};
-    std::uint64_t graphics_diagnostic_render_ticks{};
-    std::uint64_t graphics_diagnostic_render_max_ticks{};
-    const auto logGraphicsDiagnostics = [&](const char *context) {
-      const auto current_counter = SDL_GetPerformanceCounter();
-      const auto current = graphicsSnapshot();
-      const auto delta = [](std::uint64_t value, std::uint64_t previous) {
-        return value - previous;
-      };
-      const auto elapsed =
-          runtime_counter_frequency == 0U
-              ? 0.0
-              : static_cast<double>(current_counter -
-                                    graphics_diagnostic_counter) /
-                    static_cast<double>(runtime_counter_frequency);
-      const auto polygons =
-          delta(current.polygons, graphics_diagnostic_previous.polygons);
-      const auto precise =
-          delta(current.precise, graphics_diagnostic_previous.precise);
-      const auto unique =
-          delta(current.unique, graphics_diagnostic_previous.unique);
-      const auto reused =
-          delta(current.reused, graphics_diagnostic_previous.reused);
-      const auto milliseconds =
-          [runtime_counter_frequency](std::uint64_t ticks) {
-            return runtime_counter_frequency == 0U
-                       ? 0.0
-                       : static_cast<double>(ticks) * 1'000.0 /
-                             static_cast<double>(runtime_counter_frequency);
-          };
-      PsyX_Log_Info(
-          "[GraphicsDiag][%s] guest_steps=%llu guest_hz=%.2f render_frames="
-          "%llu submit_avg=%.3fms submit_max=%.3fms render_avg=%.3fms "
-          "render_max=%.3fms sync_reads=%llu\n",
-          context,
-          static_cast<unsigned long long>(graphics_diagnostic_guest_steps),
-          elapsed > 0.0
-              ? static_cast<double>(graphics_diagnostic_guest_steps) / elapsed
-              : 0.0,
-          static_cast<unsigned long long>(graphics_diagnostic_render_frames),
-          graphics_diagnostic_guest_steps == 0U
-              ? 0.0
-              : milliseconds(graphics_diagnostic_submit_ticks) /
-                    static_cast<double>(graphics_diagnostic_guest_steps),
-          milliseconds(graphics_diagnostic_submit_max_ticks),
-          graphics_diagnostic_render_frames == 0U
-              ? 0.0
-              : milliseconds(graphics_diagnostic_render_ticks) /
-                    static_cast<double>(graphics_diagnostic_render_frames),
-          milliseconds(graphics_diagnostic_render_max_ticks),
-          static_cast<unsigned long long>(
-              delta(current.synchronous_readbacks,
-                    graphics_diagnostic_previous.synchronous_readbacks)));
-      PsyX_Log_Info(
-          "[GraphicsDiag][coverage] polygons=%llu precise=%llu(%.1f%%) "
-          "exact=%llu enhanced=%llu(r=%llu t=%llu v=%llu vieww=%llu) "
-          "integer=%llu handles_missing=%llu/%llu/"
-          "%llu/%llu/%llu partial=%llu missing=%llu hazard=%llu(ir=%llu "
-          "depth=%llu "
-          "divide=%llu screen_sat=%llu) near=%llu screen=%llu reproject=%llu "
-          "camera=%llu catalog=%llu/%llu ambiguous=%llu recovered=%llu\n",
-          static_cast<unsigned long long>(polygons),
-          static_cast<unsigned long long>(precise),
-          polygons == 0U ? 0.0
-                         : 100.0 * static_cast<double>(precise) /
-                               static_cast<double>(polygons),
-          static_cast<unsigned long long>(
-              delta(current.exact, graphics_diagnostic_previous.exact)),
-          static_cast<unsigned long long>(
-              delta(current.enhanced, graphics_diagnostic_previous.enhanced)),
-          static_cast<unsigned long long>(
-              delta(current.enhanced_rotation,
-                    graphics_diagnostic_previous.enhanced_rotation)),
-          static_cast<unsigned long long>(
-              delta(current.enhanced_translation,
-                    graphics_diagnostic_previous.enhanced_translation)),
-          static_cast<unsigned long long>(
-              delta(current.enhanced_vector,
-                    graphics_diagnostic_previous.enhanced_vector)),
-          static_cast<unsigned long long>(
-              delta(current.exact_view_depth,
-                    graphics_diagnostic_previous.exact_view_depth)),
-          static_cast<unsigned long long>(
-              delta(current.integer, graphics_diagnostic_previous.integer)),
-          static_cast<unsigned long long>(
-              delta(current.missing_handles_0,
-                    graphics_diagnostic_previous.missing_handles_0)),
-          static_cast<unsigned long long>(
-              delta(current.missing_handles_1,
-                    graphics_diagnostic_previous.missing_handles_1)),
-          static_cast<unsigned long long>(
-              delta(current.missing_handles_2,
-                    graphics_diagnostic_previous.missing_handles_2)),
-          static_cast<unsigned long long>(
-              delta(current.missing_handles_3,
-                    graphics_diagnostic_previous.missing_handles_3)),
-          static_cast<unsigned long long>(
-              delta(current.missing_handles_4,
-                    graphics_diagnostic_previous.missing_handles_4)),
-          static_cast<unsigned long long>(
-              delta(current.partial, graphics_diagnostic_previous.partial)),
-          static_cast<unsigned long long>(
-              delta(current.missing, graphics_diagnostic_previous.missing)),
-          static_cast<unsigned long long>(
-              delta(current.hazard, graphics_diagnostic_previous.hazard)),
-          static_cast<unsigned long long>(
-              delta(current.ir_saturation,
-                    graphics_diagnostic_previous.ir_saturation)),
-          static_cast<unsigned long long>(
-              delta(current.depth_saturation,
-                    graphics_diagnostic_previous.depth_saturation)),
-          static_cast<unsigned long long>(
-              delta(current.divide_overflow,
-                    graphics_diagnostic_previous.divide_overflow)),
-          static_cast<unsigned long long>(
-              delta(current.screen_saturation,
-                    graphics_diagnostic_previous.screen_saturation)),
-          static_cast<unsigned long long>(delta(
-              current.near_plane, graphics_diagnostic_previous.near_plane)),
-          static_cast<unsigned long long>(
-              delta(current.screen, graphics_diagnostic_previous.screen)),
-          static_cast<unsigned long long>(delta(
-              current.reprojection, graphics_diagnostic_previous.reprojection)),
-          static_cast<unsigned long long>(
-              delta(current.camera, graphics_diagnostic_previous.camera)),
-          static_cast<unsigned long long>(
-              delta(current.catalog_primitives,
-                    graphics_diagnostic_previous.catalog_primitives)),
-          static_cast<unsigned long long>(
-              delta(current.catalog_builds,
-                    graphics_diagnostic_previous.catalog_builds)),
-          static_cast<unsigned long long>(
-              delta(current.catalog_ambiguities,
-                    graphics_diagnostic_previous.catalog_ambiguities)),
-          static_cast<unsigned long long>(
-              delta(current.recovered_vertices,
-                    graphics_diagnostic_previous.recovered_vertices)));
-      PsyX_Log_Info("[GraphicsDiag][native] primitives=%llu triangles=%llu "
-                    "fallback=%llu state_material=%llu\n",
-                    static_cast<unsigned long long>(
-                        delta(current.native_primitives,
-                              graphics_diagnostic_previous.native_primitives)),
-                    static_cast<unsigned long long>(
-                        delta(current.native_triangles,
-                              graphics_diagnostic_previous.native_triangles)),
-                    static_cast<unsigned long long>(
-                        delta(current.native_fallbacks,
-                              graphics_diagnostic_previous.native_fallbacks)),
-                    static_cast<unsigned long long>(delta(
-                        current.native_state_fallbacks,
-                        graphics_diagnostic_previous.native_state_fallbacks)));
-      PsyX_Log_Info(
-          "[GraphicsDiag][mesh] unique=%llu reused=%llu(%.1f%%) conflicts="
-          "%llu fractional=%llu snapped=%llu synthetic=%llu raw=%llu "
-          "plane_recovered=%llu plane_rejected=%llu\n",
-          static_cast<unsigned long long>(unique),
-          static_cast<unsigned long long>(reused),
-          unique + reused == 0U ? 0.0
-                                : 100.0 * static_cast<double>(reused) /
-                                      static_cast<double>(unique + reused),
-          static_cast<unsigned long long>(
-              delta(current.conflicts, graphics_diagnostic_previous.conflicts)),
-          static_cast<unsigned long long>(delta(
-              current.fractional, graphics_diagnostic_previous.fractional)),
-          static_cast<unsigned long long>(
-              delta(current.snapped, graphics_diagnostic_previous.snapped)),
-          static_cast<unsigned long long>(
-              delta(current.synthetic, graphics_diagnostic_previous.synthetic)),
-          static_cast<unsigned long long>(
-              delta(current.packet_fallback,
-                    graphics_diagnostic_previous.packet_fallback)),
-          static_cast<unsigned long long>(
-              delta(current.plane_recovered,
-                    graphics_diagnostic_previous.plane_recovered)),
-          static_cast<unsigned long long>(
-              delta(current.plane_rejected,
-                    graphics_diagnostic_previous.plane_rejected)));
-      PsyX_Log_Info(
-          "[GraphicsDiag][modes] master=%u perspective=%u precise_xy=%u "
-          "exact_transform=%u exact_capture=%u catalog=%u identity=%u "
-          "preserve=%u projective_depth=%u quad_recovery=%u coherence=%u "
-          "atomic_fallback=%u zbuffer=%u\n",
-          diagnostic_state.master, diagnostic_state.perspective,
-          diagnostic_state.precise_screen, diagnostic_state.exact_transform,
-          diagnostic_state.exact_capture, diagnostic_state.catalog,
-          diagnostic_state.identity, diagnostic_state.preserve,
-          diagnostic_state.projective_depth, diagnostic_state.quad_recovery,
-          diagnostic_state.coherence, diagnostic_state.atomic_fallback,
-          g_cfg_pgxpZBuffer != 0);
-      if (runtime_audio) {
-        runtime_audio->logDiagnostics(context);
-      }
-      graphics_diagnostic_previous = current;
-      graphics_diagnostic_counter = current_counter;
-      graphics_diagnostic_guest_steps = 0U;
-      graphics_diagnostic_render_frames = 0U;
-      graphics_diagnostic_submit_ticks = 0U;
-      graphics_diagnostic_submit_max_ticks = 0U;
-      graphics_diagnostic_render_ticks = 0U;
-      graphics_diagnostic_render_max_ticks = 0U;
-    };
-    const auto applyDiagnosticState = [&] {
-      guest_gpu_.setDiagnosticGeometryOptions(
-          diagnostic_state.master, diagnostic_state.perspective,
-          diagnostic_state.precise_screen, diagnostic_state.projective_depth,
-          diagnostic_state.quad_recovery, diagnostic_state.coherence,
-          diagnostic_state.atomic_fallback);
-      g_cfg_pgxpTextureCorrection =
-          diagnostic_state.master && diagnostic_state.perspective ? 1 : 0;
-    };
-    const auto featureName = [](RuntimeGraphicsDiagnosticFeature feature) {
-      constexpr std::array names{
-          "perspective",   "precise-xy", "exact-transform", "exact-capture",
-          "catalog",       "identity",   "preserve",        "projective-depth",
-          "quad-recovery", "coherence",  "atomic-fallback", "master"};
-      return names[static_cast<std::size_t>(feature)];
-    };
-    PsyX_Log_Info(
-        "[GeometryToggle] F1=perspective F2=precise-xy F3=exact-transform "
-        "F4=exact-capture F5=catalog F6=identity F7=preserve "
-        "F8=projective-depth "
-        "F9=quad-recovery F10=coherence F11=atomic-fallback F12=master "
-        "Shift+F11=fullscreen\n");
-    const auto toggleDiagnosticFeature = [&](std::size_t index) {
-      const auto feature = static_cast<RuntimeGraphicsDiagnosticFeature>(index);
-      bool *value{};
-      switch (feature) {
-      case RuntimeGraphicsDiagnosticFeature::perspective_correction:
-        value = &diagnostic_state.perspective;
-        break;
-      case RuntimeGraphicsDiagnosticFeature::precise_screen_position:
-        value = &diagnostic_state.precise_screen;
-        break;
-      case RuntimeGraphicsDiagnosticFeature::exact_transform:
-        value = &diagnostic_state.exact_transform;
-        break;
-      case RuntimeGraphicsDiagnosticFeature::exact_capture:
-        value = &diagnostic_state.exact_capture;
-        break;
-      case RuntimeGraphicsDiagnosticFeature::compact_catalog:
-        value = &diagnostic_state.catalog;
-        break;
-      case RuntimeGraphicsDiagnosticFeature::identity_sidecar:
-        value = &diagnostic_state.identity;
-        break;
-      case RuntimeGraphicsDiagnosticFeature::preserve_projection_precision:
-        value = &diagnostic_state.preserve;
-        break;
-      case RuntimeGraphicsDiagnosticFeature::projective_depth_clamp:
-        value = &diagnostic_state.projective_depth;
-        break;
-      case RuntimeGraphicsDiagnosticFeature::quad_recovery:
-        value = &diagnostic_state.quad_recovery;
-        break;
-      case RuntimeGraphicsDiagnosticFeature::coherence_recovery:
-        value = &diagnostic_state.coherence;
-        break;
-      case RuntimeGraphicsDiagnosticFeature::atomic_primitive_fallback:
-        value = &diagnostic_state.atomic_fallback;
-        break;
-      case RuntimeGraphicsDiagnosticFeature::master:
-        value = &diagnostic_state.master;
-        break;
-      case RuntimeGraphicsDiagnosticFeature::count:
-        return;
-      }
-      *value = !*value;
-      const auto accepted =
-          !graphics_diagnostics_ || graphics_diagnostics_(feature, *value);
-      if (!accepted)
-        *value = !*value;
-      applyDiagnosticState();
-      PsyX_Log_Info("[GeometryToggle] F%zu %s=%s accepted=%s\n", index + 1U,
-                    featureName(feature), *value ? "ON" : "OFF",
-                    accepted ? "yes" : "no");
-      logGraphicsDiagnostics("toggle");
-    };
 
     RuntimePresentationPolicy runtime_presentation;
     const auto prepareRuntimeDisplay =
@@ -622,7 +229,6 @@ public:
               frame.display_height,
               frame.display_rgb24,
               frame.display_interlaced,
-              !frame.native_scene_triangles.empty(),
           });
           const auto aspect =
               presentationAspectRatio(graphics_.aspect_ratio, content);
@@ -642,19 +248,6 @@ public:
     for (;;) {
       if (frame_) {
         PsyX_UpdateInput();
-        if (graphics_diagnostics_) {
-          const auto *keys = SDL_GetKeyboardState(nullptr);
-          for (std::size_t index{}; index < 12U; ++index) {
-            const auto scancode =
-                static_cast<SDL_Scancode>(SDL_SCANCODE_F1 + index);
-            const auto down = keys[scancode] != 0;
-            const auto fullscreen_shortcut =
-                index == 10U && (SDL_GetModState() & KMOD_SHIFT) != 0;
-            if (down && !diagnostic_key_down_[index] && !fullscreen_shortcut)
-              toggleDiagnosticFeature(index);
-            diagnostic_key_down_[index] = down;
-          }
-        }
         const auto runtime_counter = SDL_GetPerformanceCounter();
         const auto elapsed_seconds =
             runtime_counter_frequency != 0U
@@ -699,19 +292,10 @@ public:
                   gpu_frame.display_rgb24 ? 1 : 0,
                   gpu_frame.display_interlaced ? 1 : 0);
               GR_BeginGuestSubmit();
-              const auto submit_started = SDL_GetPerformanceCounter();
-              guest_gpu_.setNativeScene(gpu_frame.native_scene_positions,
-                                        gpu_frame.native_scene_triangles);
               guest_gpu_.submit(gpu_frame.words, gpu_frame.projections,
                                 gpu_frame.projection_identities,
                                 gpu_frame.command_buffer_epoch,
                                 gpu_frame.projection_catalog);
-              const auto submit_ticks =
-                  SDL_GetPerformanceCounter() - submit_started;
-              graphics_diagnostic_submit_ticks += submit_ticks;
-              graphics_diagnostic_submit_max_ticks =
-                  std::max(graphics_diagnostic_submit_max_ticks, submit_ticks);
-              ++graphics_diagnostic_guest_steps;
             }
           }
           if (!runtime_running) {
@@ -724,7 +308,6 @@ public:
                 runtime_cadence.backlogSeconds() * 1'000.0,
                 static_cast<unsigned long long>(
                     runtime_cadence.lateRecoveryCount()));
-            logGraphicsDiagnostics("final");
             break;
           }
         }
@@ -755,18 +338,9 @@ public:
           presentRuntimeDisplay(gpu_frame);
         }
       }
-      const auto render_started = SDL_GetPerformanceCounter();
       static_cast<void>(PsyX_BeginScene());
       DrawSync(0);
       PsyX_EndScene();
-      const auto render_ticks = SDL_GetPerformanceCounter() - render_started;
-      graphics_diagnostic_render_ticks += render_ticks;
-      graphics_diagnostic_render_max_ticks =
-          std::max(graphics_diagnostic_render_max_ticks, render_ticks);
-      ++graphics_diagnostic_render_frames;
-      if (graphics_diagnostic_guest_steps >= 300U) {
-        logGraphicsDiagnostics("periodic");
-      }
     }
   }
 
@@ -778,8 +352,6 @@ private:
   KeyboardMouseBindings input_;
   MohUndergroundRuntimeActionBindings runtime_actions_;
   RuntimeAudioDrainCallback audio_;
-  RuntimeGraphicsDiagnosticCallback graphics_diagnostics_;
-  std::array<bool, 12U> diagnostic_key_down_{};
   detail::PsyCrossGuestGpu guest_gpu_;
 };
 
@@ -1761,12 +1333,10 @@ std::unique_ptr<Host> createPsyCrossRuntimeHost(
     RuntimeGpuFrameCallback gpu_frame, GraphicsSettings graphics,
     KeyboardMouseBindings input,
     MohUndergroundRuntimeActionBindings runtime_actions,
-    RuntimeAudioDrainCallback audio,
-    RuntimeGraphicsDiagnosticCallback graphics_diagnostics) {
+    RuntimeAudioDrainCallback audio) {
   return std::make_unique<PsyCrossHost>(
       std::move(title), graphics, std::move(frame), std::move(gpu_frame),
-      std::move(input), std::move(runtime_actions), std::move(audio),
-      std::move(graphics_diagnostics));
+      std::move(input), std::move(runtime_actions), std::move(audio));
 }
 
 std::unique_ptr<Host> createPsyCrossHost(std::string title,
