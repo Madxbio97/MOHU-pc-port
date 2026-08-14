@@ -7,8 +7,6 @@ void GpuCommandStream::beginFrame() noexcept {
   frame_source_addresses_.clear();
   frame_projections_.clear();
   frame_projection_identities_.clear();
-  native_render_frame_dirty_ = true;
-  native_scene_pipeline_dirty_ = true;
 }
 
 bool GpuCommandStream::appendGp0(std::uint32_t value,
@@ -49,8 +47,6 @@ bool GpuCommandStream::appendGp0(std::uint32_t value,
     ++first_word_count_;
   }
   ++total_gp0_words_;
-  native_render_frame_dirty_ = true;
-  native_scene_pipeline_dirty_ = true;
   return true;
 }
 
@@ -83,8 +79,6 @@ void GpuCommandStream::writeGp1(std::uint32_t value) noexcept {
     frame_source_addresses_.clear();
     frame_projections_.clear();
     frame_projection_identities_.clear();
-    native_render_frame_dirty_ = true;
-    native_scene_pipeline_dirty_ = true;
     break;
   case 0x01U:
     ++command_buffer_epoch_;
@@ -92,8 +86,6 @@ void GpuCommandStream::writeGp1(std::uint32_t value) noexcept {
     frame_source_addresses_.clear();
     frame_projections_.clear();
     frame_projection_identities_.clear();
-    native_render_frame_dirty_ = true;
-    native_scene_pipeline_dirty_ = true;
     break;
   case 0x02U:
     status_ &= ~(1U << 24U);
@@ -142,47 +134,4 @@ bool GpuCommandStream::readGp0(std::uint32_t &value) noexcept {
 }
 
 std::uint32_t GpuCommandStream::readStatus() const noexcept { return status_; }
-
-const NativeRenderFrame &GpuCommandStream::nativeRenderFrame() const noexcept {
-  if (native_render_frame_dirty_) {
-    rebuildNativeRenderFrame(frame_words_, frame_projections_,
-                             frame_projection_identities_, {},
-                             native_render_frame_);
-    native_render_frame_dirty_ = false;
-  }
-  return native_render_frame_;
-}
-
-const NativeScenePipelineFrame &
-GpuCommandStream::nativeScenePipeline() const noexcept {
-  if (native_scene_pipeline_dirty_) {
-    rebuildNativeScenePipeline(nativeRenderFrame(), native_scene_near_plane,
-                               native_scene_pipeline_);
-    native_scene_pipeline_dirty_ = false;
-  }
-  return native_scene_pipeline_;
-}
-
-const NativeRenderFrame &GpuCommandStream::nativeRenderFrame(
-    std::span<const sf::psx::GteProjectedVertex> projection_catalog)
-    const noexcept {
-  if (native_render_frame_dirty_) {
-    rebuildNativeRenderFrame(frame_words_, frame_projections_,
-                             frame_projection_identities_, projection_catalog,
-                             native_render_frame_);
-    native_render_frame_dirty_ = false;
-  }
-  return native_render_frame_;
-}
-
-const NativeScenePipelineFrame &GpuCommandStream::nativeScenePipeline(
-    std::span<const sf::psx::GteProjectedVertex> projection_catalog)
-    const noexcept {
-  if (native_scene_pipeline_dirty_) {
-    rebuildNativeScenePipeline(nativeRenderFrame(projection_catalog),
-                               native_scene_near_plane, native_scene_pipeline_);
-    native_scene_pipeline_dirty_ = false;
-  }
-  return native_scene_pipeline_;
-}
 } // namespace mohu

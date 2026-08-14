@@ -1,7 +1,6 @@
 #pragma once
 
 #include "sf/psx/gte_runtime.hpp"
-#include "sf/psx/native_gpu_scene.hpp"
 
 #include <array>
 #include <cstddef>
@@ -31,12 +30,6 @@ public:
               std::span<const std::uint64_t> projection_identities = {},
               std::uint64_t command_buffer_epoch = 0U,
               std::span<const psx::GteProjectedVertex> projection_catalog = {});
-  void
-  setNativeScene(std::span<const psx::NativeGpuPosition> positions,
-                 std::span<const psx::NativeGpuTriangle> triangles) noexcept {
-    native_positions_ = positions;
-    native_triangles_ = triangles;
-  }
 
   void setCoherenceEdgeSnapping(bool enabled) noexcept {
     coherence_edge_snapping_enabled_ = enabled;
@@ -50,18 +43,18 @@ public:
     shared_mesh_prepass_enabled_ = shared_mesh_prepass;
   }
 
-  void setDiagnosticGeometryOptions(bool master, bool perspective_correction,
+  void setGeometryOptions(bool master, bool perspective_correction,
                                     bool precise_screen_position,
                                     bool projective_depth_clamp,
                                     bool quad_recovery, bool coherence_recovery,
                                     bool atomic_primitive_fallback) noexcept {
-    diagnostic_master_enabled_ = master;
-    diagnostic_perspective_enabled_ = perspective_correction;
-    diagnostic_precise_screen_enabled_ = precise_screen_position;
-    diagnostic_projective_depth_enabled_ = projective_depth_clamp;
-    diagnostic_quad_recovery_enabled_ = quad_recovery;
+    geometry_enabled_ = master;
+    perspective_correction_enabled_ = perspective_correction;
+    precise_screen_position_enabled_ = precise_screen_position;
+    projective_depth_enabled_ = projective_depth_clamp;
+    quad_recovery_enabled_ = quad_recovery;
     coherence_edge_snapping_enabled_ = coherence_recovery;
-    diagnostic_atomic_fallback_enabled_ = atomic_primitive_fallback;
+    atomic_fallback_enabled_ = atomic_primitive_fallback;
   }
 
   [[nodiscard]] std::uint64_t submittedCommands() const noexcept {
@@ -72,18 +65,6 @@ public:
   }
   [[nodiscard]] std::uint64_t precisePrimitives() const noexcept {
     return precise_primitives_;
-  }
-  [[nodiscard]] std::uint64_t nativeScenePrimitives() const noexcept {
-    return native_scene_primitives_;
-  }
-  [[nodiscard]] std::uint64_t nativeSceneTriangles() const noexcept {
-    return native_scene_triangles_;
-  }
-  [[nodiscard]] std::uint64_t nativeSceneFallbacks() const noexcept {
-    return native_scene_fallbacks_;
-  }
-  [[nodiscard]] std::uint64_t nativeSceneStateFallbacks() const noexcept {
-    return native_scene_state_fallbacks_;
   }
   [[nodiscard]] std::uint64_t polygonPrimitives() const noexcept {
     return polygon_primitives_;
@@ -358,25 +339,17 @@ private:
   bool coherence_near_only_enabled_{};
   bool shared_mesh_canonicalization_enabled_{true};
   bool shared_mesh_prepass_enabled_{true};
-  bool diagnostic_master_enabled_{true};
-  bool diagnostic_perspective_enabled_{true};
-  bool diagnostic_precise_screen_enabled_{true};
-  bool diagnostic_projective_depth_enabled_{true};
-  bool diagnostic_quad_recovery_enabled_{};
-  bool diagnostic_atomic_fallback_enabled_{true};
+  bool geometry_enabled_{true};
+  bool perspective_correction_enabled_{true};
+  bool precise_screen_position_enabled_{true};
+  bool projective_depth_enabled_{true};
+  bool quad_recovery_enabled_{};
+  bool atomic_fallback_enabled_{true};
   std::uint64_t command_buffer_epoch_{};
   std::uint64_t submitted_commands_{};
   std::vector<std::uint16_t> transfer_words_;
   std::uint64_t unsupported_commands_{};
-  std::span<const psx::NativeGpuPosition> native_positions_;
-  std::span<const psx::NativeGpuTriangle> native_triangles_;
-  psx::NativeGpuDrawState native_draw_state_{};
   std::uint64_t precise_primitives_{};
-  std::uint8_t native_draw_state_valid_mask_{};
-  std::uint64_t native_scene_primitives_{};
-  std::uint64_t native_scene_triangles_{};
-  std::uint64_t native_scene_fallbacks_{};
-  std::uint64_t native_scene_state_fallbacks_{};
   std::uint64_t polygon_primitives_{};
   std::uint64_t exact_precise_primitives_{};
   std::uint64_t enhanced_precise_primitives_{};

@@ -11454,48 +11454,6 @@ void benchmarkR3000ExactTransformOnly() {
             << (pgxp_geometry_seconds / baseline_geometry_seconds) << '\n';
 }
 
-void testStoreDiagnosticsAreBoundedAndExact() {
-  sf::psx::R3000Runtime runtime;
-  constexpr auto destination = 0x80018000U;
-  std::array<std::uint32_t,
-             sf::psx::R3000Runtime::store_diagnostic_capacity + 2U>
-      program{};
-  for (auto &instruction : program)
-    instruction = encodeI(0x2bU, 8U, 0U, 0U);
-  loadCode(runtime, program);
-  runtime.reset(code_address);
-  runtime.configureStoreDiagnostics(destination, destination + 4U);
-  runtime.setRegister(8U, destination);
-  for (std::size_t index{}; index < program.size(); ++index) {
-    require(runtime.step().reason == sf::psx::R3000StopReason::running,
-            "Store diagnostics fixture stopped early");
-  }
-  std::uint64_t represented_writes{};
-  std::size_t occupied{};
-  for (const auto &site : runtime.storeDiagnostics()) {
-    if (site.writes == 0U)
-      continue;
-    ++occupied;
-    represented_writes += site.writes;
-    require(site.pc >= code_address &&
-                site.pc < code_address + program.size() * 4U &&
-                ((site.pc - code_address) & 3U) == 0U && site.writes == 1U &&
-                site.projected_writes == 0U && site.halfword_writes == 0U &&
-                site.unaligned_writes == 0U && site.cop2_writes == 0U,
-            "Store diagnostics merged a different writer under an old PC");
-  }
-  require(occupied <= sf::psx::R3000Runtime::store_diagnostic_capacity &&
-              represented_writes + runtime.storeDiagnosticOverflow() ==
-                  program.size() &&
-              runtime.storeDiagnosticOverflow() != 0U,
-          "Store diagnostics did not account for bounded-table overflow");
-  runtime.configureStoreDiagnostics(destination, destination + 4U);
-  require(runtime.storeDiagnosticOverflow() == 0U &&
-              std::ranges::none_of(
-                  runtime.storeDiagnostics(),
-                  [](const auto &site) { return site.writes != 0U; }),
-          "Store diagnostics reset retained old table state");
-}
 void testLevelGt3ScratchProjectionCarrier() {
   sf::psx::R3000Runtime runtime;
   runtime.setPgxpCpuTracking(false);
@@ -11581,7 +11539,6 @@ int main(int argc, char **argv) {
     testExactProjectionBypassesLegacyBackend();
     testLightweightGteProjectionCatalog();
     testExactProjectionCpuCarrierProvenance();
-    testStoreDiagnosticsAreBoundedAndExact();
     testLevelGt3ScratchProjectionCarrier();
     testCompactProjectionHandleFrameAliasing();
     testHostCallArgumentsInvalidateProjectionCarriers();

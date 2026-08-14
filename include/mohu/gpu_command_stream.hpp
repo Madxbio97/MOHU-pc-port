@@ -1,6 +1,5 @@
 #pragma once
 
-#include "mohu/native_scene_pipeline.hpp"
 #include "sf/psx/machine.hpp"
 
 #include <array>
@@ -29,8 +28,6 @@ public:
     if (projection_tracking_ != enabled) {
       projection_tracking_ = enabled;
       frame_projections_.clear();
-      native_render_frame_dirty_ = true;
-      native_scene_pipeline_dirty_ = true;
     }
   }
   [[nodiscard]] bool projectionTracking() const noexcept {
@@ -41,8 +38,6 @@ public:
     if (projection_identity_tracking_ != enabled) {
       projection_identity_tracking_ = enabled;
       frame_projection_identities_.clear();
-      native_render_frame_dirty_ = true;
-      native_scene_pipeline_dirty_ = true;
     }
   }
   [[nodiscard]] bool projectionIdentityTracking() const noexcept {
@@ -91,25 +86,12 @@ public:
     for (std::size_t index{}; index < word_indices.size(); ++index) {
       frame_projection_identities_[word_indices[index]] = identities[index];
     }
-    native_render_frame_dirty_ = true;
-    native_scene_pipeline_dirty_ = true;
     return true;
   }
   [[nodiscard]] std::span<sf::psx::GteProjectedVertex>
   mutableFrameProjections() noexcept {
-    native_render_frame_dirty_ = true;
-    native_scene_pipeline_dirty_ = true;
     return frame_projections_;
   }
-  [[nodiscard]] const NativeRenderFrame &nativeRenderFrame() const noexcept;
-  [[nodiscard]] const NativeScenePipelineFrame &
-  nativeScenePipeline() const noexcept;
-  [[nodiscard]] const NativeRenderFrame &nativeRenderFrame(
-      std::span<const sf::psx::GteProjectedVertex> projection_catalog)
-      const noexcept;
-  [[nodiscard]] const NativeScenePipelineFrame &nativeScenePipeline(
-      std::span<const sf::psx::GteProjectedVertex> projection_catalog)
-      const noexcept;
   [[nodiscard]] std::span<const std::uint32_t> firstWords() const noexcept {
     return std::span{first_words_}.first(first_word_count_);
   }
@@ -136,10 +118,6 @@ private:
   std::vector<std::uint32_t> frame_source_addresses_;
   std::vector<sf::psx::GteProjectedVertex> frame_projections_;
   std::vector<std::uint64_t> frame_projection_identities_;
-  mutable NativeRenderFrame native_render_frame_;
-  mutable NativeScenePipelineFrame native_scene_pipeline_;
-  mutable bool native_render_frame_dirty_{true};
-  mutable bool native_scene_pipeline_dirty_{true};
   bool projection_tracking_{true};
   bool projection_identity_tracking_{true};
   std::array<std::uint32_t, 16U> first_words_{};

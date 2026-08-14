@@ -114,13 +114,6 @@ public:
                                      bool adaptive) noexcept;
 
   [[nodiscard]] const RuntimeStats &stats() const noexcept { return stats_; }
-  [[nodiscard]] const NativeRenderFrame &nativeRenderFrame() const noexcept {
-    return gpu_.nativeRenderFrame(cpu_.gpuProjectionCatalog());
-  }
-  [[nodiscard]] const NativeScenePipelineFrame &
-  nativeScenePipeline() const noexcept {
-    return gpu_.nativeScenePipeline(cpu_.gpuProjectionCatalog());
-  }
   [[nodiscard]] const sf::psx::R3000Runtime &cpu() const noexcept {
     return cpu_;
   }
@@ -155,15 +148,6 @@ public:
   }
   [[nodiscard]] bool gpuProjectionIdentityTracking() const noexcept {
     return gpu_.projectionIdentityTracking();
-  }
-  [[nodiscard]] bool
-  configureProjectionDiagnostics(bool transform_tracking, bool exact_transform,
-                                 bool exact_capture, bool compact_catalog,
-                                 bool identity_sidecar,
-                                 bool preserve_projection_precision) noexcept;
-  void configureStoreDiagnostics(std::uint32_t begin,
-                                 std::uint32_t end) noexcept {
-    cpu_.configureStoreDiagnostics(begin, end);
   }
   [[nodiscard]] std::uint64_t gpuCommandBufferEpoch() const noexcept {
     return gpu_.commandBufferEpoch();

@@ -4,7 +4,6 @@
 #include "sf/game/retail_cheats.hpp"
 #include "sf/platform/player_input.hpp"
 #include "sf/psx/gte_runtime.hpp"
-#include "sf/psx/native_gpu_scene.hpp"
 
 #include <array>
 #include <cstddef>
@@ -209,30 +208,11 @@ struct RuntimeGpuFrame {
   bool display_rgb24{};
   bool display_interlaced{};
   std::uint64_t command_buffer_epoch{};
-  std::span<const psx::NativeGpuPosition> native_scene_positions;
-  std::span<const psx::NativeGpuTriangle> native_scene_triangles;
 };
 
 using RuntimeGpuFrameCallback = std::function<RuntimeGpuFrame()>;
 
-enum class RuntimeGraphicsDiagnosticFeature : std::uint8_t {
-  perspective_correction,
-  precise_screen_position,
-  exact_transform,
-  exact_capture,
-  compact_catalog,
-  identity_sidecar,
-  preserve_projection_precision,
-  projective_depth_clamp,
-  quad_recovery,
-  coherence_recovery,
-  atomic_primitive_fallback,
-  master,
-  count,
-};
 
-using RuntimeGraphicsDiagnosticCallback =
-    std::function<bool(RuntimeGraphicsDiagnosticFeature, bool)>;
 
 class Host {
 public:
@@ -258,8 +238,7 @@ createPsyCrossHost(std::string title, GraphicsSettings graphics = {});
     KeyboardMouseBindings input = defaultKeyboardMouseBindings(),
     MohUndergroundRuntimeActionBindings runtime_actions =
         defaultMohUndergroundRuntimeActionBindings(),
-    RuntimeAudioDrainCallback audio = {},
-    RuntimeGraphicsDiagnosticCallback graphics_diagnostics = {});
+    RuntimeAudioDrainCallback audio = {});
 
 [[nodiscard]] std::unique_ptr<Host> createPsyCrossTitleHost(
     std::string title, game::TitleAssets assets, game::TitleMovies movies,

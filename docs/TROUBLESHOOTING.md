@@ -1,67 +1,39 @@
 # Troubleshooting
 
-## Does the game require the original image?
+## The image is rejected
 
-Yes. A legal BIN/CUE image of the USA v1.1 release (`SCUS-94240`) is required at
-runtime. The repository and release archive contain no game data.
-
-## The launcher rejects my image
-
-Confirm that the CUE references the correct BIN filenames and that all files are
-present. Other regions or revisions have different executables/overlays and are
-not supported. The expected PS-X executable SHA-256 is:
+Only the USA/NTSC-U `SLUS-01270` release is supported. Confirm that the CUE uses
+the correct BIN filenames and that every track is present. The expected PS-X
+EXE SHA-256 is:
 
 ```text
-bac292061ad5bc718ce137ef5b43d3d7e9b1b65248fb0d52229f328ccfe4ab4e
+5c4566b7264a29554abb9d868f23cc40e99ebf3b58b9776dfe2f4ae465bbd641
 ```
 
-## Failed to create native PSX framebuffer
+## The program does not start
 
-If the log contains `PsyX_EnsureNativeFramebuffer`, choose a smaller internal
-resolution, disable MSAA, update the GPU driver and retry. Very large resolutions
-and high MSAA multiply color/depth allocation requirements. Also confirm the GPU
-supports the required OpenGL 3.x feature set.
+Build or extract the complete application directory. Keep the PsyCross runtime
+DLLs beside the executable. Update the GPU driver and install the current Visual
+C++ runtime when using a packaged build.
 
-## Missing DLL or immediate startup failure
+## Settings do not persist
 
-Extract the complete ZIP. Do not move only `syphon_filter.exe`; its SDL2, OpenAL,
-FFmpeg, fmt and Visual C++ runtime DLLs are packaged beside it. Antivirus
-quarantine should be checked before replacing files from the verified archive.
-
-## The DOSSIERS window is empty
-
-Keep `assets/dossiers/screens/dossier_01.png` through `dossier_04.png` in the
-packaged directory structure. Re-extract the verified archive if they are missing.
-
-## Mission selection is locked
-
-This is expected on a clean profile. Missions unlock sequentially from campaign
-progress. A save on mission N unlocks missions 1 through N. The original stage
-select code is entered inside **Pause > Options > Select Mission**. A manually
-created `syphon_filter_cheats` marker beside the executable enables the complete
-in-game list and all persistent retail cheats. Their state appears under
-**Pause > Options > Cheats**. The launcher never exposes mission selection or
-cheat controls.
-
-## I need a clean profile
-
-Close the game and back up, then remove or rename:
+Check write access to:
 
 ```text
-%LOCALAPPDATA%\SyphonFilterPC
+%LOCALAPPDATA%\MedalOfHonorUndergroundPC
 ```
 
-This resets saves and launcher settings. It does not affect the selected game
-image itself.
+Delete only `launcher.ini` to reset launcher settings. Do not delete the `Saves`
+directory unless the virtual memory card is backed up.
 
-## Build configuration cannot find vcpkg
+## Performance is unexpectedly low
 
-Set `VCPKG_ROOT` before running the PsyCross preset:
+- Use a Release build.
+- Disable VSync and select Unlimited while measuring throughput.
+- Compare at the same resolution, filtering and antialiasing settings.
+- Disable overlays and external capture software for the comparison run.
+- Reproduce the same scene and camera path.
 
-```powershell
-$env:VCPKG_ROOT = 'D:/Tools/vcpkg'
-cmake --preset windows-psycross
-```
-
-If the build directory was configured with a different path, remove only
-`build/windows-psycross` and configure it again.
+Long gameplay and visual checks are manual. Automated tests validate the CPU,
+GPU command path, SPU and platform policies but do not replace a gameplay pass.

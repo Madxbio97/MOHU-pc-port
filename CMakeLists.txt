@@ -28,17 +28,8 @@ if(SF_ENABLE_RELEASE_IPO)
 endif()
 set(SF_PSYCROSS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/external/PsyCross" CACHE PATH
     "Path to a PsyCross checkout")
-set(SF_SUPPORTED_ROM_CUE "" CACHE FILEPATH
-    "Optional Syphon Filter USA BIN/CUE used by legacy ROM CTest gates")
 set(MOHU_SUPPORTED_ROM_CUE "" CACHE FILEPATH
     "Optional Medal of Honor: Underground USA BIN/CUE used by ROM CTest gates")
-set(_sf_rom_probes_default OFF)
-if(SF_SUPPORTED_ROM_CUE)
-    set(_sf_rom_probes_default ON)
-endif()
-option(SF_BUILD_ROM_PROBES "Build supported-ROM diagnostic probes"
-    ${_sf_rom_probes_default})
-unset(_sf_rom_probes_default)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(SfWarnings)
@@ -157,12 +148,7 @@ sf_set_project_warnings(sf_game)
 
 add_library(mohu_runtime
     src/mohu/gpu_command_stream.cpp
-    src/mohu/native_world_level.cpp
-    src/mohu/native_render_frame.cpp
-    src/mohu/native_scene_pipeline.cpp
-    src/mohu/native_world_mesh.cpp
     src/mohu/runtime.cpp
-    src/mohu/tsp_scene.cpp
 )
 add_library(mohu::runtime ALIAS mohu_runtime)
 target_include_directories(mohu_runtime PUBLIC include)
@@ -185,10 +171,6 @@ add_executable(mohu_runtime_probe apps/mohu_runtime_probe.cpp)
 target_link_libraries(mohu_runtime_probe PRIVATE mohu::runtime)
 target_compile_features(mohu_runtime_probe PRIVATE cxx_std_20)
 sf_set_project_warnings(mohu_runtime_probe)
-add_executable(mohu_scene_probe apps/mohu_scene_probe.cpp)
-target_link_libraries(mohu_scene_probe PRIVATE mohu::runtime)
-target_compile_features(mohu_scene_probe PRIVATE cxx_std_20)
-sf_set_project_warnings(mohu_scene_probe)
 add_executable(mohu_pad_probe apps/mohu_pad_probe.cpp)
 target_link_libraries(mohu_pad_probe PRIVATE mohu::runtime)
 target_compile_features(mohu_pad_probe PRIVATE cxx_std_20)
@@ -201,9 +183,6 @@ add_executable(mohu_gameplay_probe apps/mohu_gameplay_probe.cpp)
 target_link_libraries(mohu_gameplay_probe PRIVATE mohu::runtime)
 target_compile_features(mohu_gameplay_probe PRIVATE cxx_std_20)
 sf_set_project_warnings(mohu_gameplay_probe)
-
-
-include(SfRomProbes)
 
 if(SF_ENABLE_PSYCROSS)
     if(NOT EXISTS "${SF_PSYCROSS_ROOT}/CMakeLists.txt")
@@ -315,10 +294,6 @@ if(SF_ENABLE_PSYCROSS)
     endif()
     sf_set_project_warnings(medal_of_honor_underground)
 
-
-    add_executable(sf_movie_probe apps/sf_movie_probe/main.cpp)
-    target_link_libraries(sf_movie_probe PRIVATE sf::game sf::media)
-    sf_set_project_warnings(sf_movie_probe)
 endif()
 
 include(SfTests)

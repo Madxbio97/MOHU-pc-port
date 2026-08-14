@@ -57,33 +57,21 @@ void testRuntimePresentationPolicy() {
   RuntimePresentationPolicy policy;
   require(policy.content() == PresentationContent::authored_4_3,
           "Runtime presentation did not start in safe authored mode");
-  require(policy.update({512U, 240U, false, false, false}) ==
+  require(policy.update({512U, 240U, false, false}) ==
               PresentationContent::authored_4_3,
           "Ambiguous frontend mode became widescreen");
-  require(policy.update({368U, 240U, false, false, false}) ==
+  require(policy.update({368U, 240U, false, false}) ==
               PresentationContent::gameplay,
           "Stable gameplay display mode did not become adaptive");
-  require(policy.update({512U, 240U, false, false, true}) ==
-              PresentationContent::gameplay,
-          "Wide gameplay frame lost adaptive presentation");
-  require(policy.update({512U, 240U, false, false, false}) ==
+  require(policy.update({512U, 240U, false, false}) ==
               PresentationContent::gameplay,
           "One ambiguous frame changed gameplay presentation");
-  require(policy.update({512U, 240U, false, false, false}) ==
+  require(policy.update({512U, 240U, false, false}) ==
               PresentationContent::authored_4_3,
           "Stable frontend transition remained adaptive");
-  require(policy.update({384U, 240U, false, false, false}) ==
+  require(policy.update({384U, 240U, false, false}) ==
               PresentationContent::gameplay,
           "384-wide gameplay mode did not become adaptive");
-  require(policy.update({320U, 240U, false, false, true}) ==
-              PresentationContent::authored_4_3,
-          "Authored 320-wide content was overridden by scene geometry");
-  require(policy.update({512U, 240U, true, false, true}) ==
-              PresentationContent::authored_4_3,
-          "RGB24 movie frame was not forced to 4:3");
-  require(policy.update({512U, 480U, false, true, true}) ==
-              PresentationContent::authored_4_3,
-          "Interlaced movie frame was not forced to 4:3");
 }
 
 } // namespace
