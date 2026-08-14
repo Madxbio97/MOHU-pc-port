@@ -1013,6 +1013,9 @@ void pushProjectedVertex(
   const auto view_z = exact_view != nullptr           ? (*exact_view)[2]
                       : preserve_projection_precision ? mac_view_z
                                                       : hardware_depth;
+  const auto exact_transform = exact_view != nullptr &&
+                               transform_lineage != 0U &&
+                               projection_epoch != 0U;
   if (exact_view == nullptr && view_z <= 0.0) {
     return;
   }
@@ -1026,12 +1029,17 @@ void pushProjectedVertex(
     const auto candidate_x = offset_x + view_x * screen_h / view_z;
     const auto candidate_y = offset_y + view_y * screen_h / view_z;
     if (std::isfinite(candidate_x) && std::isfinite(candidate_y)) {
-      constexpr auto minimum_screen_coordinate = -1024.0;
-      constexpr auto maximum_screen_coordinate = 1023.0;
-      screen_x = std::clamp(candidate_x, minimum_screen_coordinate,
-                            maximum_screen_coordinate);
-      screen_y = std::clamp(candidate_y, minimum_screen_coordinate,
-                            maximum_screen_coordinate);
+      if (exact_transform) {
+        screen_x = candidate_x;
+        screen_y = candidate_y;
+      } else {
+        constexpr auto minimum_screen_coordinate = -1024.0;
+        constexpr auto maximum_screen_coordinate = 1023.0;
+        screen_x = std::clamp(candidate_x, minimum_screen_coordinate,
+                              maximum_screen_coordinate);
+        screen_y = std::clamp(candidate_y, minimum_screen_coordinate,
+                              maximum_screen_coordinate);
+      }
     } else if (exact_view == nullptr) {
       return;
     }
@@ -1050,8 +1058,7 @@ void pushProjectedVertex(
   projected.screen_offset_x = static_cast<float>(offset_x);
   projected.screen_offset_y = static_cast<float>(offset_y);
   projected.valid = true;
-  projected.exact_transform = exact_view != nullptr &&
-                              transform_lineage != 0U && projection_epoch != 0U;
+  projected.exact_transform = exact_transform;
   projected.fractional_transform = fractional_transform;
   projected.enhanced_sources = enhanced_sources;
   projected.source_vertex_id = source_vertex_id;

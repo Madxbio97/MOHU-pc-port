@@ -2153,6 +2153,34 @@ void testGteExactTransformTwin() {
               std::abs(close_vertex.view_z - 80.125F) < 0.001F,
           "Exact view tuple fell back at the hardware reciprocal limit");
 
+  const auto saturated_xy_raw =
+      10'000U |
+      (static_cast<std::uint32_t>(static_cast<std::uint16_t>(-50)) << 16U);
+  auto saturated_xy = packed_word(projection_exact, saturated_xy_raw,
+                                  10'000.25, -50.5, 0x304U);
+  auto saturated_z =
+      scalar_word(projection_exact, 1000U, 1000.125, 0x306U);
+  sf::psx::GteRuntime::writeData(exact_projection, 0U, saturated_xy_raw,
+                                 nullptr, &projection_exact, &saturated_xy);
+  sf::psx::GteRuntime::writeData(exact_projection, 1U, 1000U, nullptr,
+                                 &projection_exact, &saturated_z);
+  require(sf::psx::GteRuntime::executeCommand(exact_projection, rtps,
+                                              &projection_exact),
+          "Screen-saturated exact RTPS was rejected");
+  const auto saturated_vertex =
+      *sf::psx::GteRuntime::projectedVertex(exact_projection, 14U);
+  const auto saturated_reprojection =
+      saturated_vertex.screen_offset_x +
+      saturated_vertex.view_x * saturated_vertex.screen_h /
+          saturated_vertex.view_z;
+  require(saturated_vertex.exact_transform &&
+              saturated_vertex.screen_saturated &&
+              saturated_vertex.pgxpEligible() &&
+              saturated_vertex.screen_x > 1023.0F &&
+              std::abs(saturated_vertex.screen_x - saturated_reprojection) <
+                  0.001F,
+          "Exact RTPS re-applied the hardware screen clamp");
+
   auto near_zero = scalar_word(projection_exact, 0U, 0.0, 0x301U);
   sf::psx::GteRuntime::writeData(exact_projection, 0U, xy_raw, nullptr,
                                  &projection_exact, &xy_exact);

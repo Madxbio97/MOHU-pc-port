@@ -2406,6 +2406,32 @@ int main() {
     return 81;
   }
 
+  auto saturated_screen_catalog = trusted_screen_catalog;
+  auto &saturated_screen = saturated_screen_catalog[0U];
+  saturated_screen.screen_saturated = true;
+  saturated_screen.screen_x = 2048.25F;
+  saturated_screen.view_x =
+      (saturated_screen.screen_x - saturated_screen.screen_offset_x) *
+      saturated_screen.view_z / saturated_screen.screen_h;
+  PGXP_ClearCache();
+  sf::platform::detail::PsyCrossGuestGpu saturated_screen_gpu;
+  saturated_screen_gpu.submit(adjacent_f4_words, {}, handle_words, 7011U,
+                              saturated_screen_catalog);
+  PGXPVData saturated_screen_vertex{};
+  if (saturated_screen_gpu.precisePrimitives() != 2U ||
+      saturated_screen_gpu.screenSaturationPrimitives() != 0U ||
+      saturated_screen_gpu.reprojectionMismatchPrimitives() != 0U ||
+      PGXP_GetCacheDataExact(&saturated_screen_vertex, 0U) == 0 ||
+      saturated_screen_vertex.exact_projection == 0U ||
+      saturated_screen_vertex.sx != saturated_screen.screen_x ||
+      saturated_screen_vertex.pz != saturated_screen.view_z / 128.0F ||
+      PGXP_GetIndex(0) != 8U) {
+    std::cerr << "Coherent exact projection was rejected at the PS1 screen "
+                 "clamp\n";
+    PsyX_Shutdown();
+    return 189;
+  }
+
   auto untoleranced_screen_catalog = trusted_screen_catalog;
   for (auto &projection : untoleranced_screen_catalog)
     projection.exact_transform = false;

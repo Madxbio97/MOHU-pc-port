@@ -440,7 +440,7 @@ preparePrecisePrimitive(std::uint8_t opcode,
     if (!source.exact_transform && source.divide_overflow) {
       return reject(PreciseRejectReason::divide_overflow);
     }
-    if (source.screen_saturated) {
+    if (!source.exact_transform && source.screen_saturated) {
       return reject(PreciseRejectReason::screen_saturation);
     }
     if (!source.pgxpEligible()) {
