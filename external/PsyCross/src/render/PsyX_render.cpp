@@ -318,7 +318,7 @@ int g_dbg_wireframeMode = 0;
 int g_dbg_texturelessMode = 0;
 
 int g_cfg_pgxpTextureCorrection = 1;
-int g_cfg_pgxpZBuffer = 1;
+int g_cfg_pgxpZBuffer = 0;
 int g_cfg_bilinearFiltering = 0;
 int g_cfg_trilinearFiltering = 0;
 int g_cfg_anisotropicFiltering = 0;

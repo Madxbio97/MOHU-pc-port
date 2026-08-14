@@ -123,10 +123,6 @@ public:
   [[nodiscard]] std::span<const std::uint32_t> gpuCommands() const noexcept {
     return gpu_.frameWords();
   }
-  [[nodiscard]] std::span<const std::uint32_t>
-  gpuCommandSourceAddresses() const noexcept {
-    return gpu_.frameSourceAddresses();
-  }
   [[nodiscard]] std::span<const sf::psx::GteProjectedVertex>
   gpuProjections() const noexcept {
     return gpu_.frameProjections();

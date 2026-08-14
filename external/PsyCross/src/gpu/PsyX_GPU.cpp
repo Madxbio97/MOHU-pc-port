@@ -1094,7 +1094,8 @@ void DrawSplit(const GPUDrawSplit &split, WorldDepthEpoch &depthEpoch) {
   auto &rawSinceDepth = target.rawSinceDepth;
   GR_SetPolygonOffset(0.0f, 0.0f);
 
-  const bool depthRequested = g_RequestedDepthMode != 0;
+  const bool depthRequested =
+      g_RequestedDepthMode != 0 && g_cfg_pgxpZBuffer != 0;
   const bool depthWrite = split.blendMode == BM_NONE;
   int runStart = split.startVertex;
   int runVertices = 0;

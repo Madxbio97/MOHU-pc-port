@@ -221,7 +221,6 @@ if(SF_ENABLE_PSYCROSS)
         src/platform/psycross_audio_output.cpp
         src/platform/psycross_font_texture.cpp
         src/platform/psycross_guest_gpu.cpp
-        src/platform/psycross_gte_backend.cpp
         src/platform/psycross_host.cpp
         src/platform/psycross_mission_start.cpp
         src/platform/psycross_movie_player.cpp

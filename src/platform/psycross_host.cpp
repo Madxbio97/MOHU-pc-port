@@ -186,9 +186,10 @@ public:
       g_cfg_fxaaFinalFrame = graphics_.fxaa ? 1 : 0;
     }
     // Raw guest pages mix exact and fallback packets in one target. Preserve
-    // perspective W, but keep their shared depth policy in GP0 painter order.
+    // perspective W and PS1 painter order. PGXP depth is optional in
+    // DuckStation and fragments mixed precise/raw streams into extra draws.
     g_cfg_pgxpTextureCorrection = gpu_frame_ ? 1 : g_cfg_pgxpTextureCorrection;
-    g_cfg_pgxpZBuffer = gpu_frame_ ? 1 : g_cfg_pgxpZBuffer;
+    g_cfg_pgxpZBuffer = gpu_frame_ ? 0 : g_cfg_pgxpZBuffer;
     guest_gpu_.setGeometryOptions(true, true, true, true, false, true,
                                             true);
     guest_gpu_.setRuntimeGeometryPolicy(true, false, false);
@@ -200,8 +201,8 @@ public:
         graphics_.fullscreen};
     detail::configurePsyCrossVideoMode(detail::gameplay_video_mode, true);
     if (gpu_frame_) {
-      GR_EnableDepth(1);
-      GR_SetDepthState(1, 1);
+      GR_EnableDepth(0);
+      GR_SetDepthState(0, 0);
     }
     std::unique_ptr<detail::PsyCrossAudioOutput> runtime_audio;
     std::array<psx::SpuPcmFrame, 4'096U> runtime_audio_scratch{};

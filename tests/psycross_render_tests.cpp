@@ -98,6 +98,17 @@ bool validatesTPageExclusiveEdges() {
 
 int main() {
   SDL_SetMainReady();
+  if (PsyX_ResolveSwapInterval(1, 60, 30) != 2 ||
+      PsyX_ResolveSwapInterval(1, 60, 60) != 1 ||
+      PsyX_ResolveSwapInterval(1, 120, 120) != 1 ||
+      PsyX_ResolveSwapInterval(1, 240, 120) != 2 ||
+      PsyX_ResolveSwapInterval(1, 240, 240) != 1 ||
+      PsyX_ResolveSwapInterval(1, 60, 120) != 0 ||
+      PsyX_ResolveSwapInterval(1, 144, 60) != 0 ||
+      PsyX_ResolveSwapInterval(0, 240, 240) != 0) {
+    std::cerr << "Presentation cadence resolution is unstable\n";
+    return 202;
+  }
   g_cfg_framebufferFeedback = 0;
   g_cfg_vblankThread = 0;
   g_cfg_composedGuestScanout = 0;
@@ -335,6 +346,8 @@ int main() {
 
   // Reversed depth rejects farther geometry while equal-depth polygons retain
   // GP0 painter order.
+  const auto default_zbuffer = g_cfg_pgxpZBuffer;
+  g_cfg_pgxpZBuffer = 1;
   const auto render_depth_sample =
       [&](float first_depth, std::array<unsigned char, 3U> first_color,
           float second_depth, std::array<unsigned char, 3U> second_color) {
@@ -502,6 +515,7 @@ int main() {
     PsyX_Shutdown();
     return 92;
   }
+  g_cfg_pgxpZBuffer = default_zbuffer;
 
   const auto previous_zbuffer = g_cfg_pgxpZBuffer;
   g_cfg_pgxpZBuffer = 1;

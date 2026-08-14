@@ -22,10 +22,9 @@ constexpr std::uint32_t ram_address_mask =
 constexpr std::uint64_t maximum_dma_words = 16U * 1024U * 1024U;
 constexpr std::uint64_t maximum_linked_list_nodes = 65'536U;
 constexpr std::size_t spu_control_register_index = 0x1aaU / 2U;
-// DuckStation also accumulates CPU work and runs timing events in slices.
-// Scheduled deadlines and MMIO still flush exactly; this fallback only bounds
-// device advancement when no event is pending and remains below one scanline.
-constexpr std::uint64_t maximum_cpu_slice_ticks = 1'024U;
+// Scheduled deadlines and MMIO flush exactly. This fallback only bounds
+// free-running device advancement when no earlier event is pending.
+constexpr std::uint64_t maximum_cpu_slice_ticks = 4'096U;
 // Standard SIO0 settings (MODE=000d, BAUD=0088) clock one eight-bit
 // controller byte in 1,088 CPU clocks. The pad then holds /ACK low briefly.
 constexpr std::uint64_t controller_transfer_ticks = 1'088U;

@@ -196,7 +196,6 @@ runtimeMouseDeltaForGuestStep(std::int32_t total_delta, std::size_t step_index,
 
 struct RuntimeGpuFrame {
   std::span<const std::uint32_t> words;
-  std::span<const std::uint32_t> source_addresses;
   std::span<const psx::GteProjectedVertex> projections;
   std::span<const std::uint64_t> projection_identities;
   std::span<const psx::GteProjectedVertex> projection_catalog;
@@ -225,9 +224,6 @@ public:
 protected:
   Host() = default;
 };
-
-[[nodiscard]] psx::GteProjectionCommandBackend
-psycrossGteProjectionCommandBackend() noexcept;
 
 [[nodiscard]] std::unique_ptr<Host>
 createPsyCrossHost(std::string title, GraphicsSettings graphics = {});

@@ -204,6 +204,10 @@ extern void PsyX_EnableSwapInterval(int enable);
 /* Changes the OpenGL swap interval used when synchronization is enabled. */
 extern void PsyX_SetSwapInterval(int interval);
 
+/* Resolves exact presentation cadence against the active display refresh. */
+extern int PsyX_ResolveSwapInterval(int requestedInterval,
+                                   int displayRefreshRate, int frameLimit);
+
 /* Caps completed presents. Zero disables the software frame limiter. */
 extern void PsyX_SetFrameLimit(int framesPerSecond);
 

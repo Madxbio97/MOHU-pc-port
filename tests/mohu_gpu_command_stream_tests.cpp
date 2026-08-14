@@ -16,8 +16,7 @@ void require(bool condition, const char *message) {
 }
 
 [[nodiscard]] bool aligned(const mohu::GpuCommandStream &stream) noexcept {
-  return stream.frameWords().size() == stream.frameSourceAddresses().size() &&
-         stream.frameWords().size() == stream.frameProjections().size() &&
+  return stream.frameWords().size() == stream.frameProjections().size() &&
          stream.frameWords().size() ==
              stream.frameProjectionIdentities().size();
 }
@@ -30,14 +29,11 @@ void testCommandCapture() {
   require(gpu.totalGp0Words() == 2U && gpu.frameWords().size() == 2U &&
               gpu.firstWords().size() == 2U && aligned(gpu),
           "GP0 command vectors diverged");
-  require(gpu.frameSourceAddresses()[0U] ==
-                  mohu::GpuCommandStream::direct_source_address &&
-              gpu.frameProjectionIdentities()[0U] == 0U,
+  require(gpu.frameProjectionIdentities()[0U] == 0U,
           "Direct GP0 provenance mismatch");
 
   gpu.beginFrame();
-  require(gpu.frameWords().empty() && gpu.frameSourceAddresses().empty() &&
-              gpu.frameProjections().empty() &&
+  require(gpu.frameWords().empty() && gpu.frameProjections().empty() &&
               gpu.frameProjectionIdentities().empty() && aligned(gpu),
           "Frame boundary retained command data");
   require(gpu.firstWords().size() == 2U,
@@ -58,8 +54,7 @@ void testProjectionSidecars() {
               gpu.writeGp0FromRam(projected.packed_sxy, 0x1234U, &projected,
                                   source_identity),
           "Projected GP0 capture failed");
-  require(gpu.frameSourceAddresses()[1U] == 0x1234U &&
-              !gpu.frameProjections()[0U].valid &&
+  require(!gpu.frameProjections()[0U].valid &&
               gpu.frameProjections()[1U] == projected &&
               gpu.frameProjectionIdentities()[0U] == 0U &&
               gpu.frameProjectionIdentities()[1U] == source_identity &&

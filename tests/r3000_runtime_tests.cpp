@@ -1752,7 +1752,7 @@ void testGteGameplayMath() {
       make_nclip_vertex(2U, 2.0F, 0.25F),
   };
   const auto integer_nclip_state = precise_nclip_state;
-  const auto verify_nclip_byte_identity = [&](float precise_y) {
+  const auto verify_nclip_correction = [&](float precise_y) {
     auto integer = integer_nclip_state;
     integer.projected[2].screen_y = precise_y;
     auto exact = integer;
@@ -1764,16 +1764,16 @@ void testGteGameplayMath() {
             exact.data == integer.data && exact.control == integer.control &&
             exact.projected == integer.projected &&
             std::bit_cast<std::int32_t>(
-                sf::psx::GteRuntime::readData(integer, 24U)) == 0 &&
+                sf::psx::GteRuntime::readData(integer, 24U)) * precise_y > 0.0F &&
             std::bit_cast<std::int32_t>(
-                sf::psx::GteRuntime::readData(exact, 24U)) == 0 &&
+                sf::psx::GteRuntime::readData(exact, 24U)) * precise_y > 0.0F &&
             integer.precise_nclip_valid && exact.precise_nclip_valid &&
             integer.precise_nclip_area == exact.precise_nclip_area &&
             (integer.precise_nclip_area > 0.0) == (precise_y > 0.0F),
-        "NCLIP sidecar changed hardware MAC0 or lost precise winding");
+        "NCLIP correction lost precise winding");
   };
-  verify_nclip_byte_identity(0.25F);
-  verify_nclip_byte_identity(-0.25F);
+  verify_nclip_correction(0.25F);
+  verify_nclip_correction(-0.25F);
 
   sf::psx::R3000Runtime runtime;
   constexpr std::array transfer_words{
@@ -11191,9 +11191,9 @@ void testPgxpPreciseNormalClip() {
     precise.projected[index].valid = true;
   }
   require(sf::psx::GteRuntime::executeCommand(precise, 0x4a000006U) &&
-              std::bit_cast<std::int32_t>(precise.data[24U]) == 0 &&
+              std::bit_cast<std::int32_t>(precise.data[24U]) > 0 &&
               precise.precise_nclip_valid && precise.precise_nclip_area > 0.0,
-          "Precise NCLIP area leaked into hardware-visible MAC0");
+          "Precise NCLIP did not correct a quantized zero-area polygon");
 
   const auto tiny_winding = [](float y) {
     sf::psx::GteState state{};
@@ -11209,15 +11209,16 @@ void testPgxpPreciseNormalClip() {
     }
     require(sf::psx::GteRuntime::executeCommand(state, 0x4a000006U),
             "Tiny precise NCLIP command failed");
-    require(std::bit_cast<std::int32_t>(state.data[24U]) == 0 &&
+    const auto corrected = std::abs(y) > 0.1F ? (y > 0.0F ? 1 : -1) : 0;
+    require(std::bit_cast<std::int32_t>(state.data[24U]) == corrected &&
                 state.precise_nclip_valid &&
                 (state.precise_nclip_area > 0.0) == (y > 0.0F),
-            "Tiny precise NCLIP sidecar changed hardware MAC0");
+            "Tiny precise NCLIP winding correction mismatch");
     return std::bit_cast<std::int32_t>(state.data[24U]);
   };
-  require(tiny_winding(0.099F) == 0 && tiny_winding(0.101F) == 0 &&
-              tiny_winding(-0.099F) == 0 && tiny_winding(-0.101F) == 0,
-          "Precise NCLIP threshold changed guest-visible MAC0");
+  require(tiny_winding(0.099F) == 0 && tiny_winding(0.101F) == 1 &&
+              tiny_winding(-0.099F) == 0 && tiny_winding(-0.101F) == -1,
+          "Precise NCLIP small-polygon threshold mismatch");
 
   sf::psx::GteState eye_crossing{};
   constexpr std::array crossing_packed{
@@ -11245,18 +11246,18 @@ void testPgxpPreciseNormalClip() {
     vertex.valid = true;
   }
   require(sf::psx::GteRuntime::executeCommand(eye_crossing, 0x4a000006U) &&
-              std::bit_cast<std::int32_t>(eye_crossing.data[24U]) == -1 &&
+              std::bit_cast<std::int32_t>(eye_crossing.data[24U]) > 0 &&
               eye_crossing.precise_nclip_valid &&
               eye_crossing.precise_nclip_area > 0.0,
-          "Signed-W sidecar winding leaked into hardware NCLIP");
+          "Signed-W precise winding was not applied to NCLIP");
 
   auto mixed_crossing = eye_crossing;
   mixed_crossing.projected[1U].exact_transform = false;
   require(sf::psx::GteRuntime::executeCommand(mixed_crossing, 0x4a000006U) &&
-              std::bit_cast<std::int32_t>(mixed_crossing.data[24U]) == -1 &&
+              std::bit_cast<std::int32_t>(mixed_crossing.data[24U]) > 0 &&
               mixed_crossing.precise_nclip_valid &&
               mixed_crossing.precise_nclip_area > 0.0,
-          "Mixed signed-W sidecar changed hardware NCLIP");
+          "Mixed signed-W precise winding was not applied to NCLIP");
 
   auto incoherent_crossing = mixed_crossing;
   incoherent_crossing.projected[1U].screen_offset_x = 0.25F;

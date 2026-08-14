@@ -21,8 +21,6 @@ struct GpuDisplayState {
 
 class GpuCommandStream final : public sf::psx::GpuPort {
 public:
-  static constexpr std::uint32_t direct_source_address = 0xffffffffU;
-
   void beginFrame() noexcept;
   void setProjectionTracking(bool enabled) noexcept {
     if (projection_tracking_ != enabled) {
@@ -57,10 +55,6 @@ public:
   [[nodiscard]] std::uint32_t readStatus() const noexcept override;
   [[nodiscard]] std::span<const std::uint32_t> frameWords() const noexcept {
     return frame_words_;
-  }
-  [[nodiscard]] std::span<const std::uint32_t>
-  frameSourceAddresses() const noexcept {
-    return frame_source_addresses_;
   }
   [[nodiscard]] std::span<const sf::psx::GteProjectedVertex>
   frameProjections() const noexcept {
@@ -110,12 +104,10 @@ public:
 
 private:
   [[nodiscard]] bool appendGp0(std::uint32_t value,
-                               std::uint32_t source_address,
                                const sf::psx::GteProjectedVertex *projected,
                                std::uint64_t source_identity) noexcept;
   static constexpr std::uint32_t reset_status = 0x14802000U;
   std::vector<std::uint32_t> frame_words_;
-  std::vector<std::uint32_t> frame_source_addresses_;
   std::vector<sf::psx::GteProjectedVertex> frame_projections_;
   std::vector<std::uint64_t> frame_projection_identities_;
   bool projection_tracking_{true};

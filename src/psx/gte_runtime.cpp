@@ -1548,16 +1548,35 @@ void executeNormalClip(GteState &state, const GteExactState *) noexcept {
       state.precise_nclip_valid = true;
     }
   }
-  const auto sx0 = static_cast<std::int64_t>(packedHalf(state.data[12], false));
-  const auto sy0 = static_cast<std::int64_t>(packedHalf(state.data[12], true));
-  const auto sx1 = static_cast<std::int64_t>(packedHalf(state.data[13], false));
-  const auto sy1 = static_cast<std::int64_t>(packedHalf(state.data[13], true));
-  const auto sx2 = static_cast<std::int64_t>(packedHalf(state.data[14], false));
-  const auto sy2 = static_cast<std::int64_t>(packedHalf(state.data[14], true));
-  const auto area =
-      sx0 * sy1 + sx1 * sy2 + sx2 * sy0 - sx0 * sy2 - sx1 * sy0 - sx2 * sy1;
-  checkMac0Overflow(state, area);
-  state.data[24] = std::bit_cast<std::uint32_t>(lowSignedWord(area));
+  if (state.precise_nclip_valid) {
+    auto area = state.precise_nclip_area;
+    const auto magnitude = std::abs(area);
+    if (magnitude > 0.1 && magnitude < 1.0) {
+      area += std::copysign(1.0, area);
+    }
+    area = std::clamp(
+        area, static_cast<double>(std::numeric_limits<std::int32_t>::min()),
+        static_cast<double>(std::numeric_limits<std::int32_t>::max()));
+    state.data[24] =
+        std::bit_cast<std::uint32_t>(static_cast<std::int32_t>(area));
+  } else {
+    const auto sx0 =
+        static_cast<std::int64_t>(packedHalf(state.data[12], false));
+    const auto sy0 =
+        static_cast<std::int64_t>(packedHalf(state.data[12], true));
+    const auto sx1 =
+        static_cast<std::int64_t>(packedHalf(state.data[13], false));
+    const auto sy1 =
+        static_cast<std::int64_t>(packedHalf(state.data[13], true));
+    const auto sx2 =
+        static_cast<std::int64_t>(packedHalf(state.data[14], false));
+    const auto sy2 =
+        static_cast<std::int64_t>(packedHalf(state.data[14], true));
+    const auto area =
+        sx0 * sy1 + sx1 * sy2 + sx2 * sy0 - sx0 * sy2 - sx1 * sy0 - sx2 * sy1;
+    checkMac0Overflow(state, area);
+    state.data[24] = std::bit_cast<std::uint32_t>(lowSignedWord(area));
+  }
   updateErrorFlag(state);
 }
 

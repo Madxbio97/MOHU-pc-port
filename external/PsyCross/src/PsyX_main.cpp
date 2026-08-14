@@ -933,25 +933,11 @@ char PsyX_BeginScene()
 				? g_swapInterval
 				: 0;
 
-		// Maximum is (ScreenRefreshRate / 2).
-		// If our screen refresh rate is lower than our PSX vmode refresh rate,
-		// we reducing swap interval to maintain the framerate.
-		// Example:
-		//		target 60fps, 50hz screen = no interval (tearing)
-		//		target 30fps, 50hz screen = 60hz interval (less tearing)
-		//		target 30fps, 60hz screen = 30hz interval (no tearing)
 		SDL_DisplayMode curMode;
-		if (g_cfg_vblankThread &&
+		if (swapInterval > 0 &&
 			SDL_GetWindowDisplayMode(g_window, &curMode) == 0)
-		{
-			const int mode_frequency =
-				g_vmode == MODE_NTSC ? VBLANK_FREQUENCY_NTSC : VBLANK_FREQUENCY_PAL;
-			if (curMode.refresh_rate < mode_frequency)
-				swapInterval--;
-		}
-
-		if (swapInterval < 0)
-			swapInterval = 0;
+			swapInterval = PsyX_ResolveSwapInterval(
+				swapInterval, curMode.refresh_rate, g_frameLimit);
 
 		GR_UpdateSwapIntervalState(swapInterval);
 	}
@@ -1143,6 +1129,23 @@ void PsyX_EnableSwapInterval(int enable)
 {
 	g_enableSwapInterval = enable;
 	PsyX_ResetFrameLimiter();
+}
+
+int PsyX_ResolveSwapInterval(int requestedInterval, int displayRefreshRate,
+	int frameLimit)
+{
+	if (requestedInterval <= 0)
+		return 0;
+	if (frameLimit <= 0 || displayRefreshRate <= 0)
+		return requestedInterval;
+	if (displayRefreshRate < frameLimit ||
+		displayRefreshRate % frameLimit != 0)
+	{
+		return 0;
+	}
+
+	const int interval = displayRefreshRate / frameLimit;
+	return interval > 0 ? interval : 0;
 }
 
 void PsyX_SetFrameLimit(int framesPerSecond)

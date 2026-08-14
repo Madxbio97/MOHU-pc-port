@@ -416,8 +416,6 @@ int main(int argc, char **argv) {
         static_cast<std::uint32_t>(std::max(graphics.width, 1)),
         static_cast<std::uint32_t>(std::max(graphics.height, 1)),
         gameplay_aspect == sf::platform::AspectRatioMode::adaptive);
-    runtime->setGteProjectionCommandBackend(
-        sf::platform::psycrossGteProjectionCommandBackend());
     std::optional<mohu::RuntimeFrameResult> runtime_failure;
     auto host = sf::platform::createPsyCrossRuntimeHost(
         "Medal of Honor: Underground PC",
@@ -439,7 +437,6 @@ int main(int argc, char **argv) {
           // reshape the entire host frame for one presentation.
           return sf::platform::RuntimeGpuFrame{
               runtime->gpuCommands(),
-              runtime->gpuCommandSourceAddresses(),
               runtime->gpuProjections(),
               runtime->gpuProjectionIdentities(),
               runtime->gpuProjectionCatalog(),
