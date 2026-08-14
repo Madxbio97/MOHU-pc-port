@@ -4816,6 +4816,133 @@ int main() {
     return 78;
   }
 
+  // Presentation replay owns a fresh native-resolution scratch target. Four
+  // repeats of the same semitransparent primitive must be pixel-identical and
+  // must not touch any authoritative guest storage or retained-page counters.
+  constexpr int replay_size = 8;
+  RECT16 replay_rect{64, 448, replay_size, replay_size};
+  std::array<std::uint16_t, replay_size * replay_size> replay_seed{};
+  for (std::size_t pixel{}; pixel < replay_seed.size(); ++pixel) {
+    replay_seed[pixel] = static_cast<std::uint16_t>((1U + pixel % 31U) |
+                                                    ((pixel * 3U % 31U) << 5U));
+  }
+  LoadImage(&replay_rect, reinterpret_cast<u_long *>(replay_seed.data()));
+  GR_UpdateVRAM();
+  std::array<std::uint16_t, replay_size * replay_size> replay_vram_before{};
+  GR_ReadVRAM(replay_vram_before.data(), replay_rect.x, replay_rect.y,
+              replay_rect.w, replay_rect.h);
+  const auto replay_write_sequence = GR_GetVRAMWriteSequence();
+  const auto replay_pack_count = GR_GetGuestVRAMPackCount();
+  const auto replay_seed_count = GR_GetGuestSeedCount();
+  const auto replay_capture_count = GR_GetGuestCaptureCount();
+  const auto replay_readback_count = GR_GetSynchronousVRAMReadbackCount();
+
+  g_cfg_renderWidth = replay_size;
+  g_cfg_renderHeight = replay_size;
+  g_cfg_aspectMode = PSYX_ASPECT_ADAPTIVE;
+  g_cfg_bilinearFiltering = 0;
+  GR_SetGuestDisplayGeometry(replay_size, replay_size);
+  DISPENV replay_display{};
+  SetDefDispEnv(&replay_display, 0, 0, replay_size, replay_size);
+  PutDispEnv(&replay_display);
+
+  using ReplayFrame = std::array<unsigned char, replay_size * replay_size * 4U>;
+  std::array<ReplayFrame, 4U> replay_frames{};
+  auto replay_ok = true;
+  for (std::size_t repeat{}; repeat < replay_frames.size(); ++repeat) {
+    static_cast<void>(PsyX_BeginScene());
+    replay_ok = replay_ok && GR_BeginGuestPresentationReplay(&replay_rect) != 0;
+    DRAWENV replay_draw{};
+    SetDefDrawEnv(&replay_draw, replay_rect.x, replay_rect.y, replay_rect.w,
+                  replay_rect.h);
+    replay_draw.dtd = 0;
+    replay_draw.dfe = 0;
+    replay_draw.isbg = 0;
+    PutDrawEnv(&replay_draw);
+    replay_ok = replay_ok && GR_ClearGuestPresentationReplay(0U, 0U, 0U) != 0;
+    TILE replay_tile{};
+    SetTile(&replay_tile);
+    setSemiTrans(&replay_tile, 1);
+    setRGB0(&replay_tile, 248, 0, 0);
+    setXY0(&replay_tile, 0, 0);
+    setWH(&replay_tile, replay_size, replay_size);
+    DrawPrim(&replay_tile);
+    replay_ok = replay_ok && GR_EndGuestPresentationReplay() != 0;
+    replay_ok = replay_ok && GR_PresentGuestPresentationReplay(
+                                 replay_rect.x, replay_rect.y, replay_rect.w,
+                                 replay_rect.h) != 0;
+    glReadPixels(0, 0, replay_size, replay_size, GL_RGBA, GL_UNSIGNED_BYTE,
+                 replay_frames[repeat].data());
+    PsyX_EndScene();
+  }
+
+  std::array<std::uint16_t, replay_size * replay_size> replay_vram_after{};
+  GR_ReadVRAM(replay_vram_after.data(), replay_rect.x, replay_rect.y,
+              replay_rect.w, replay_rect.h);
+  const auto replay_pixels_stable =
+      std::ranges::all_of(replay_frames, [&](const auto &frame) {
+        return frame == replay_frames[0];
+      });
+  const auto replay_nonempty = replay_frames[0][0] != 0U ||
+                               replay_frames[0][1] != 0U ||
+                               replay_frames[0][2] != 0U;
+  const auto replay_gl_error = glGetError();
+  if (!replay_ok || !replay_pixels_stable || !replay_nonempty ||
+      replay_vram_after != replay_vram_before ||
+      GR_GetVRAMWriteSequence() != replay_write_sequence ||
+      GR_GetGuestVRAMPackCount() != replay_pack_count ||
+      GR_GetGuestSeedCount() != replay_seed_count ||
+      GR_GetGuestCaptureCount() != replay_capture_count ||
+      GR_GetSynchronousVRAMReadbackCount() != replay_readback_count ||
+      replay_gl_error != GL_NO_ERROR) {
+    std::cerr << "Presentation replay mutated guest state or accumulated "
+                 "semitransparency; write="
+              << GR_GetVRAMWriteSequence() - replay_write_sequence
+              << " pack=" << GR_GetGuestVRAMPackCount() - replay_pack_count
+              << " seed=" << GR_GetGuestSeedCount() - replay_seed_count
+              << " capture=" << GR_GetGuestCaptureCount() - replay_capture_count
+              << " readback="
+              << GR_GetSynchronousVRAMReadbackCount() - replay_readback_count
+              << " rgba=" << static_cast<unsigned int>(replay_frames[0][0])
+              << ',' << static_cast<unsigned int>(replay_frames[0][1]) << ','
+              << static_cast<unsigned int>(replay_frames[0][2]) << " gl=0x"
+              << std::hex << replay_gl_error << std::dec << '\n';
+    PsyX_Shutdown();
+    return 204;
+  }
+
+  // A draw-area switch during replay stays inside scratch but poisons the
+  // completed image. It must never be presentable or fall through to VRAM.
+  static_cast<void>(PsyX_BeginScene());
+  const auto fail_closed_begin =
+      GR_BeginGuestPresentationReplay(&replay_rect) != 0;
+  DRAWENV mismatched_replay_draw{};
+  SetDefDrawEnv(&mismatched_replay_draw, replay_rect.x + 1, replay_rect.y,
+                replay_rect.w - 1, replay_rect.h);
+  mismatched_replay_draw.dtd = 0;
+  mismatched_replay_draw.dfe = 0;
+  mismatched_replay_draw.isbg = 0;
+  PutDrawEnv(&mismatched_replay_draw);
+  TILE mismatched_replay_tile{};
+  SetTile(&mismatched_replay_tile);
+  setRGB0(&mismatched_replay_tile, 0, 248, 0);
+  setXY0(&mismatched_replay_tile, 0, 0);
+  setWH(&mismatched_replay_tile, replay_size, replay_size);
+  DrawPrim(&mismatched_replay_tile);
+  const auto fail_closed_end = GR_EndGuestPresentationReplay();
+  const auto fail_closed_present = GR_PresentGuestPresentationReplay(
+      replay_rect.x, replay_rect.y, replay_rect.w, replay_rect.h);
+  PsyX_EndScene();
+  if (!fail_closed_begin || fail_closed_end != 0 || fail_closed_present != 0 ||
+      GR_GetVRAMWriteSequence() != replay_write_sequence ||
+      GR_GetGuestVRAMPackCount() != replay_pack_count ||
+      GR_GetGuestCaptureCount() != replay_capture_count ||
+      glGetError() != GL_NO_ERROR) {
+    std::cerr << "Presentation replay target switch did not fail closed\n";
+    PsyX_Shutdown();
+    return 205;
+  }
+
   PsyX_EndScene();
 
   PsyX_Shutdown();

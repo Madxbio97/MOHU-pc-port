@@ -354,6 +354,21 @@ extern unsigned long long GR_GetWorldDepthBandAdvanceCount(int offscreen);
 extern unsigned long long GR_GetWorldDepthPainterFallbackCount(int offscreen);
 extern void GR_SetScissorState(int enable);
 extern void GR_SetOffscreenState(const RECT16 *offscreenRect, int enable);
+/* Opens an isolated guest-sized color/depth target for presentation-only
+ * drawing. The target starts black and can never be packed into PS1 VRAM or
+ * retained as an authoritative guest page. Returns zero unless the regular
+ * guest offscreen target is idle and the complete rectangle is valid. */
+extern int GR_BeginGuestPresentationReplay(const RECT16 *target);
+/* Flushes queued replay primitives, then clears only the isolated target. */
+extern int GR_ClearGuestPresentationReplay(unsigned char r, unsigned char g,
+                                           unsigned char b);
+/* Flushes and closes the isolated target without any guest VRAM side effect.
+ * A failed target switch makes the completed replay unavailable. */
+extern int GR_EndGuestPresentationReplay(void);
+/* Blits a successfully completed replay into the native presentation target.
+ * The requested rectangle must be contained by the replay target. */
+extern int GR_PresentGuestPresentationReplay(int x, int y, int width,
+                                             int height);
 /* Returns non-zero when the requested 16-bit non-interlaced display rectangle
  * is available in a retained high-resolution guest draw page. */
 extern int GR_HasHighResolutionVRAM(int x, int y, int width, int height);

@@ -638,6 +638,20 @@ static int g_offscreenTextureWidth{};
 static int g_offscreenTextureHeight{};
 static int g_offscreenTextureCapacityWidth{};
 static int g_offscreenTextureCapacityHeight{};
+#if defined(RENDERER_OGL)
+static GLuint g_guestPresentationReplayTexture{};
+static GLuint g_glGuestPresentationReplayFramebuffer{};
+static GLuint g_guestPresentationReplayDepthStencilRenderbuffer{};
+static RECT16 g_guestPresentationReplayRect{};
+static int g_guestPresentationReplayPixelWidth{};
+static int g_guestPresentationReplayPixelHeight{};
+static int g_guestPresentationReplayCapacityWidth{};
+static int g_guestPresentationReplayCapacityHeight{};
+static int g_guestPresentationReplayActive{};
+static int g_guestPresentationReplayClosing{};
+static int g_guestPresentationReplayFailed{};
+static int g_guestPresentationReplayValid{};
+#endif
 
 static constexpr std::size_t high_resolution_vram_cache_capacity = 2U;
 
@@ -1144,10 +1158,25 @@ void GR_Shutdown() {
   glDeleteTextures(1, &g_glNativeDepthTexture);
   glDeleteTextures(1, &g_guestScanoutTexture);
   glDeleteTextures(1, &g_guestColorTexture);
+  glDeleteTextures(1, &g_guestPresentationReplayTexture);
+  glDeleteFramebuffers(1, &g_glGuestPresentationReplayFramebuffer);
+  glDeleteRenderbuffers(1, &g_guestPresentationReplayDepthStencilRenderbuffer);
   g_guestScanoutTexture = 0U;
   g_guestColorTexture = 0U;
   g_glGuestColorFramebuffer = 0U;
   g_glGuestScanoutFramebuffer = 0U;
+  g_guestPresentationReplayTexture = 0U;
+  g_glGuestPresentationReplayFramebuffer = 0U;
+  g_guestPresentationReplayDepthStencilRenderbuffer = 0U;
+  g_guestPresentationReplayRect = {};
+  g_guestPresentationReplayPixelWidth = 0;
+  g_guestPresentationReplayPixelHeight = 0;
+  g_guestPresentationReplayCapacityWidth = 0;
+  g_guestPresentationReplayCapacityHeight = 0;
+  g_guestPresentationReplayActive = 0;
+  g_guestPresentationReplayClosing = 0;
+  g_guestPresentationReplayFailed = 0;
+  g_guestPresentationReplayValid = 0;
 #endif
 
   GR_DestroyTexture(g_vramTexturesDouble[0]);
@@ -1238,6 +1267,12 @@ void GR_BeginScene() {
 void GR_EndScene() {
   // Finish a pending VRAM/offscreen pass before the native display image is
   // stored or presented. This also restores the native framebuffer binding.
+#if defined(RENDERER_OGL)
+  if (g_guestPresentationReplayActive) {
+    g_guestPresentationReplayFailed = 1;
+    static_cast<void>(GR_EndGuestPresentationReplay());
+  }
+#endif
   if (g_PreviousOffscreenState)
     GR_SetOffscreenState(&g_PreviousOffscreen, 0);
 
@@ -3387,17 +3422,271 @@ int GR_PresentHighResolutionVRAM(int x, int y, int width, int height) {
   return 0;
 #endif
 }
+
+#if defined(RENDERER_OGL)
+static bool GR_GuestPresentationReplayRectEquals(const RECT16 &left,
+                                                 const RECT16 &right) {
+  return left.x == right.x && left.y == right.y && left.w == right.w &&
+         left.h == right.h;
+}
+
+static bool GR_EnsureGuestPresentationReplayTarget(int width, int height) {
+  if (width <= 0 || height <= 0)
+    return false;
+
+  GLint maximum_texture_size{};
+  glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maximum_texture_size);
+  if (width > maximum_texture_size || height > maximum_texture_size)
+    return false;
+
+  if (g_guestPresentationReplayTexture == 0U) {
+    glGenTextures(1, &g_guestPresentationReplayTexture);
+    glBindTexture(GL_TEXTURE_2D, g_guestPresentationReplayTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  }
+  if (g_glGuestPresentationReplayFramebuffer == 0U)
+    glGenFramebuffers(1, &g_glGuestPresentationReplayFramebuffer);
+  if (g_guestPresentationReplayDepthStencilRenderbuffer == 0U) {
+    glGenRenderbuffers(1, &g_guestPresentationReplayDepthStencilRenderbuffer);
+  }
+
+  const bool resize = width != g_guestPresentationReplayCapacityWidth ||
+                      height != g_guestPresentationReplayCapacityHeight;
+  if (resize) {
+    glBindTexture(GL_TEXTURE_2D, g_guestPresentationReplayTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, g_rgbaRenderTargetInternalFormat, width,
+                 height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindRenderbuffer(GL_RENDERBUFFER,
+                       g_guestPresentationReplayDepthStencilRenderbuffer);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+  }
+
+  glBindFramebuffer(GL_FRAMEBUFFER, g_glGuestPresentationReplayFramebuffer);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                         g_guestPresentationReplayTexture, 0);
+  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                            GL_RENDERBUFFER,
+                            g_guestPresentationReplayDepthStencilRenderbuffer);
+  const bool complete =
+      glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+  glBindTexture(GL_TEXTURE_2D, g_lastBoundTexture);
+  if (!complete) {
+    glBindFramebuffer(GL_FRAMEBUFFER, PsyX_GetNativeDrawFramebuffer());
+    return false;
+  }
+
+  g_guestPresentationReplayCapacityWidth = width;
+  g_guestPresentationReplayCapacityHeight = height;
+  return true;
+}
+
+static void GR_ClearGuestPresentationReplayTarget(unsigned char r,
+                                                  unsigned char g,
+                                                  unsigned char b) {
+  GLboolean color_mask[4]{};
+  GLboolean depth_mask{};
+  GLint stencil_mask{};
+  GLfloat clear_color[4]{};
+  GLint scissor_box[4]{};
+  glGetBooleanv(GL_COLOR_WRITEMASK, color_mask);
+  glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask);
+  glGetIntegerv(GL_STENCIL_WRITEMASK, &stencil_mask);
+  glGetFloatv(GL_COLOR_CLEAR_VALUE, clear_color);
+  glGetIntegerv(GL_SCISSOR_BOX, scissor_box);
+  const GLboolean scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
+
+  glBindFramebuffer(GL_FRAMEBUFFER, g_glGuestPresentationReplayFramebuffer);
+  glDisable(GL_SCISSOR_TEST);
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  glDepthMask(GL_TRUE);
+  glStencilMask(0xffU);
+  glClearColor(r / 255.0F, g / 255.0F, b / 255.0F, 1.0F);
+  glClearDepth(0.0);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+  ++g_offscreenDepthClearSerial;
+
+  glClearColor(clear_color[0], clear_color[1], clear_color[2], clear_color[3]);
+  glColorMask(color_mask[0], color_mask[1], color_mask[2], color_mask[3]);
+  glDepthMask(depth_mask);
+  glStencilMask(static_cast<GLuint>(stencil_mask));
+  if (scissor_enabled)
+    glEnable(GL_SCISSOR_TEST);
+  glScissor(scissor_box[0], scissor_box[1], scissor_box[2], scissor_box[3]);
+  g_PreviousDepthWrite = -1;
+  g_PreviousStencilMode = -1;
+}
+#endif
+
+int GR_BeginGuestPresentationReplay(const RECT16 *target) {
+#if defined(RENDERER_OGL)
+  DrawSync(0);
+  if (target == nullptr || target->x < 0 || target->y < 0 || target->w <= 0 ||
+      target->h <= 0 || target->x + target->w > VRAM_WIDTH ||
+      target->y + target->h > VRAM_HEIGHT || g_guestPresentationReplayActive ||
+      g_PreviousOffscreenState) {
+    return 0;
+  }
+
+  const PsyXPresentationViewport output = PsyX_GetRenderTargetExtent();
+  const PsyXPresentationViewport extent = PsyX_CalculateGuestRenderExtent(
+      output.w, output.h, g_cfg_aspectMode, target->w, target->h,
+      std::max(g_pendingGuestDisplayWidth, 1),
+      std::max(g_pendingGuestDisplayHeight, 1), 1);
+  if (!GR_EnsureGuestPresentationReplayTarget(extent.w, extent.h))
+    return 0;
+
+  g_guestPresentationReplayRect = *target;
+  g_guestPresentationReplayPixelWidth = extent.w;
+  g_guestPresentationReplayPixelHeight = extent.h;
+  g_guestPresentationReplayFailed = 0;
+  g_guestPresentationReplayValid = 0;
+  g_guestPresentationReplayClosing = 0;
+  g_guestPresentationReplayActive = 1;
+  g_appliedOffscreenProjectionValid = 0;
+  GR_SetOffscreenState(target, 1);
+  if (!g_PreviousOffscreenState || g_guestPresentationReplayFailed) {
+    g_guestPresentationReplayClosing = 1;
+    if (g_PreviousOffscreenState) {
+      RECT16 completed{};
+      GR_SetOffscreenState(&completed, 0);
+    }
+    g_guestPresentationReplayClosing = 0;
+    g_guestPresentationReplayActive = 0;
+    g_guestPresentationReplayValid = 0;
+    return 0;
+  }
+  return 1;
+#else
+  (void)target;
+  return 0;
+#endif
+}
+
+int GR_ClearGuestPresentationReplay(unsigned char r, unsigned char g,
+                                    unsigned char b) {
+#if defined(RENDERER_OGL)
+  if (!g_guestPresentationReplayActive || !g_PreviousOffscreenState)
+    return 0;
+  DrawSync(0);
+  if (g_guestPresentationReplayFailed || !g_PreviousOffscreenState)
+    return 0;
+  GR_ClearGuestPresentationReplayTarget(r, g, b);
+  return 1;
+#else
+  (void)r;
+  (void)g;
+  (void)b;
+  return 0;
+#endif
+}
+
+int GR_EndGuestPresentationReplay(void) {
+#if defined(RENDERER_OGL)
+  if (!g_guestPresentationReplayActive)
+    return 0;
+  DrawSync(0);
+  g_guestPresentationReplayClosing = 1;
+  if (g_PreviousOffscreenState) {
+    RECT16 completed{};
+    GR_SetOffscreenState(&completed, 0);
+  } else {
+    glBindFramebuffer(GL_FRAMEBUFFER, PsyX_GetNativeDrawFramebuffer());
+  }
+  const int success = g_guestPresentationReplayFailed == 0;
+  g_guestPresentationReplayClosing = 0;
+  g_guestPresentationReplayActive = 0;
+  g_guestPresentationReplayValid = success;
+  g_appliedOffscreenProjectionValid = 0;
+  return success;
+#else
+  return 0;
+#endif
+}
+
+int GR_PresentGuestPresentationReplay(int x, int y, int width, int height) {
+#if defined(RENDERER_OGL)
+  const bool contained = x >= g_guestPresentationReplayRect.x &&
+                         y >= g_guestPresentationReplayRect.y && width > 0 &&
+                         height > 0 &&
+                         x + width <= g_guestPresentationReplayRect.x +
+                                          g_guestPresentationReplayRect.w &&
+                         y + height <= g_guestPresentationReplayRect.y +
+                                           g_guestPresentationReplayRect.h;
+  if (g_guestPresentationReplayActive || !g_guestPresentationReplayValid ||
+      !contained || g_nativeFramebufferWidth <= 0 ||
+      g_nativeFramebufferHeight <= 0) {
+    return 0;
+  }
+
+  const int source_x0 = GR_MapGuestEdge(x - g_guestPresentationReplayRect.x,
+                                        g_guestPresentationReplayRect.w,
+                                        g_guestPresentationReplayPixelWidth);
+  const int source_x1 = GR_MapGuestEdge(
+      x + width - g_guestPresentationReplayRect.x,
+      g_guestPresentationReplayRect.w, g_guestPresentationReplayPixelWidth);
+  const int source_y0 = GR_MapGuestEdge(
+      g_guestPresentationReplayRect.y + g_guestPresentationReplayRect.h -
+          (y + height),
+      g_guestPresentationReplayRect.h, g_guestPresentationReplayPixelHeight);
+  const int source_y1 = GR_MapGuestEdge(
+      g_guestPresentationReplayRect.y + g_guestPresentationReplayRect.h - y,
+      g_guestPresentationReplayRect.h, g_guestPresentationReplayPixelHeight);
+  const PsyXPresentationViewport destination = PsyX_GetRenderViewport();
+  const GLboolean scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
+  glDisable(GL_SCISSOR_TEST);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                    g_glGuestPresentationReplayFramebuffer);
+  glReadBuffer(GL_COLOR_ATTACHMENT0);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_glNativeFramebuffer);
+  glBlitFramebuffer(source_x0, source_y0, source_x1, source_y1, destination.x,
+                    destination.y, destination.x + destination.w,
+                    destination.y + destination.h, GL_COLOR_BUFFER_BIT,
+                    (g_cfg_bilinearFiltering || g_cfg_trilinearFiltering ||
+                     g_cfg_anisotropicFiltering)
+                        ? GL_LINEAR
+                        : GL_NEAREST);
+  g_nativeFramePostprocessed = 1;
+  glBindFramebuffer(GL_FRAMEBUFFER, g_glNativeFramebuffer);
+  if (scissor_enabled)
+    glEnable(GL_SCISSOR_TEST);
+  return 1;
+#else
+  (void)x;
+  (void)y;
+  (void)width;
+  (void)height;
+  return 0;
+#endif
+}
+
 void GR_SetOffscreenState(const RECT16 *offscreenRect, int enable) {
 #if defined(RENDERER_OGL)
+  const bool presentation_replay = g_guestPresentationReplayActive != 0;
+  if (presentation_replay) {
+    if (enable && !GR_GuestPresentationReplayRectEquals(
+                      *offscreenRect, g_guestPresentationReplayRect)) {
+      g_guestPresentationReplayFailed = 1;
+      return;
+    }
+    if (!enable && !g_guestPresentationReplayClosing) {
+      g_guestPresentationReplayFailed = 1;
+      return;
+    }
+  }
   const PsyXPresentationViewport pending_target = PsyX_GetRenderTargetExtent();
   const bool guest_geometry_changed =
-      g_pendingGuestDisplayWidth != g_guestDisplayWidth ||
-      g_pendingGuestDisplayHeight != g_guestDisplayHeight;
+      !presentation_replay &&
+      (g_pendingGuestDisplayWidth != g_guestDisplayWidth ||
+       g_pendingGuestDisplayHeight != g_guestDisplayHeight);
   const bool guest_configuration_changed =
-      g_guestRenderConfigWidth != pending_target.w ||
-      g_guestRenderConfigHeight != pending_target.h ||
-      g_guestRenderConfigAspect != g_cfg_aspectMode;
+      !presentation_replay && (g_guestRenderConfigWidth != pending_target.w ||
+                               g_guestRenderConfigHeight != pending_target.h ||
+                               g_guestRenderConfigAspect != g_cfg_aspectMode);
 #else
+  constexpr bool presentation_replay = false;
   constexpr bool guest_geometry_changed = false;
   constexpr bool guest_configuration_changed = false;
 #endif
@@ -3429,16 +3718,26 @@ void GR_SetOffscreenState(const RECT16 *offscreenRect, int enable) {
     return;
   }
 
-  if (enable) {
+  if (enable && !presentation_replay) {
     GR_ApplyPendingGuestDisplayGeometry();
     GR_RefreshGuestRenderConfiguration();
   }
   const PsyXPresentationViewport logicalViewport = PsyX_GetLogicalViewport();
   const PsyXPresentationViewport renderViewport = PsyX_GetRenderViewport();
+#if defined(RENDERER_OGL)
+  const GrGuestPixelExtent requested_extent =
+      enable && presentation_replay
+          ? GrGuestPixelExtent{g_guestPresentationReplayPixelWidth,
+                               g_guestPresentationReplayPixelHeight}
+      : enable ? GR_CalculateOffscreenPixelExtent(*offscreenRect)
+               : GrGuestPixelExtent{std::max(g_offscreenTextureWidth, 1),
+                                    std::max(g_offscreenTextureHeight, 1)};
+#else
   const GrGuestPixelExtent requested_extent =
       enable ? GR_CalculateOffscreenPixelExtent(*offscreenRect)
              : GrGuestPixelExtent{std::max(g_offscreenTextureWidth, 1),
                                   std::max(g_offscreenTextureHeight, 1)};
+#endif
   int offscreen_pixel_width = requested_extent.width;
   int offscreen_pixel_height = requested_extent.height;
 
@@ -3513,6 +3812,16 @@ void GR_SetOffscreenState(const RECT16 *offscreenRect, int enable) {
 
 #if USE_OPENGL
   if (enable) {
+#if defined(RENDERER_OGL)
+    if (presentation_replay) {
+      g_PreviousOffscreen = *offscreenRect;
+      glBindFramebuffer(GL_FRAMEBUFFER, g_glGuestPresentationReplayFramebuffer);
+      glDisable(GL_STENCIL_TEST);
+      g_PreviousStencilMode = -1;
+      GR_ClearGuestPresentationReplayTarget(0U, 0U, 0U);
+      return;
+    }
+#endif
     // Backing storage only grows when the immutable selected target requires
     // it. Root/nested switches change the active viewport without reallocating
     // multi-megabyte color/depth resources.
@@ -3600,6 +3909,14 @@ void GR_SetOffscreenState(const RECT16 *offscreenRect, int enable) {
     glScissor(previous_scissor[0], previous_scissor[1], previous_scissor[2],
               previous_scissor[3]);
   } else {
+#if defined(RENDERER_OGL)
+    if (presentation_replay) {
+      glEnable(GL_STENCIL_TEST);
+      g_PreviousStencilMode = -1;
+      glBindFramebuffer(GL_FRAMEBUFFER, PsyX_GetNativeDrawFramebuffer());
+      return;
+    }
+#endif
     const int scissor_enabled = g_PreviousScissorState;
     if (scissor_enabled)
       glDisable(GL_SCISSOR_TEST);
