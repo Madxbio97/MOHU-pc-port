@@ -334,7 +334,8 @@ int g_cfg_fxaaFinalFrame = 0;
 
 int vram_need_update = 1;
 int framebuffer_need_update = 0;
-static int g_appliedSwapInterval = -1000;
+static int g_requestedSwapInterval = -1000;
+static int g_appliedSwapInterval = 0;
 
 static constexpr int gr_vram_dirty_word_bits = 64;
 static constexpr int gr_vram_dirty_word_count =
@@ -1177,13 +1178,22 @@ void GR_Shutdown() {
   GR_ResetWorldDepthEpochs();
 }
 
-void GR_UpdateSwapIntervalState(int swapInterval) {
+int GR_UpdateSwapIntervalState(int swapInterval) {
 #if defined(RENDERER_OGL)
-  if (g_appliedSwapInterval == swapInterval)
-    return;
+  if (g_requestedSwapInterval == swapInterval)
+    return g_appliedSwapInterval;
 
-  g_appliedSwapInterval = swapInterval;
-  SDL_GL_SetSwapInterval(swapInterval);
+  g_requestedSwapInterval = swapInterval;
+  if (SDL_GL_SetSwapInterval(swapInterval) == 0) {
+    g_appliedSwapInterval = SDL_GL_GetSwapInterval();
+  } else {
+    static_cast<void>(SDL_GL_SetSwapInterval(0));
+    g_appliedSwapInterval = 0;
+  }
+  return g_appliedSwapInterval;
+#else
+  (void)swapInterval;
+  return 0;
 #endif
 }
 

@@ -109,6 +109,12 @@ int main() {
     std::cerr << "Presentation cadence resolution is unstable\n";
     return 202;
   }
+  if (PsyX_ShouldUseSoftwareFrameLimit(1, 60) != 0 ||
+      PsyX_ShouldUseSoftwareFrameLimit(0, 60) == 0 ||
+      PsyX_ShouldUseSoftwareFrameLimit(0, 0) != 0) {
+    std::cerr << "Presentation limiter ownership is unstable\n";
+    return 203;
+  }
   g_cfg_framebufferFeedback = 0;
   g_cfg_vblankThread = 0;
   g_cfg_composedGuestScanout = 0;

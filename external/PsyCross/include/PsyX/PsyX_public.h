@@ -207,6 +207,9 @@ extern void PsyX_SetSwapInterval(int interval);
 /* Resolves exact presentation cadence against the active display refresh. */
 extern int PsyX_ResolveSwapInterval(int requestedInterval,
                                    int displayRefreshRate, int frameLimit);
+/* Avoids layering a scheduler wait over an active blocking swap. */
+extern int PsyX_ShouldUseSoftwareFrameLimit(int effectiveSwapInterval,
+                                            int frameLimit);
 
 /* Caps completed presents. Zero disables the software frame limiter. */
 extern void PsyX_SetFrameLimit(int framesPerSecond);

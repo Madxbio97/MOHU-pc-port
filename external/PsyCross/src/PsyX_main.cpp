@@ -46,6 +46,7 @@ int g_swapInterval = 1;
 int g_enableSwapInterval = 1;
 int g_skipSwapInterval = 0;
 int g_frameLimit = 0;
+static int g_effectiveSwapInterval = 0;
 timerCtx_t g_vblTimer;
 
 static Uint64 g_frameLimitFrequency = 0;
@@ -71,7 +72,8 @@ static Uint64 PsyX_NextFrameLimitInterval()
 
 static void PsyX_PaceCompletedFrame()
 {
-	if (g_frameLimit <= 0 || g_frameLimitFrequency == 0)
+	if (!PsyX_ShouldUseSoftwareFrameLimit(g_effectiveSwapInterval, g_frameLimit) ||
+		g_frameLimitFrequency == 0)
 		return;
 
 	Uint64 now = SDL_GetPerformanceCounter();
@@ -153,7 +155,7 @@ extern void GR_ResetDevice();
 extern void GR_Shutdown();
 extern void GR_BeginScene();
 extern void GR_EndScene();
-extern void GR_UpdateSwapIntervalState(int swapInterval);
+extern int GR_UpdateSwapIntervalState(int swapInterval);
 
 int g_vmode = -1;
 int g_frameSkip = 0;
@@ -939,7 +941,13 @@ char PsyX_BeginScene()
 			swapInterval = PsyX_ResolveSwapInterval(
 				swapInterval, curMode.refresh_rate, g_frameLimit);
 
-		GR_UpdateSwapIntervalState(swapInterval);
+		const int effectiveSwapInterval =
+			GR_UpdateSwapIntervalState(swapInterval);
+		if (g_effectiveSwapInterval != effectiveSwapInterval)
+		{
+			g_effectiveSwapInterval = effectiveSwapInterval;
+			PsyX_ResetFrameLimiter();
+		}
 	}
 
 	GR_BeginScene();
@@ -1146,6 +1154,11 @@ int PsyX_ResolveSwapInterval(int requestedInterval, int displayRefreshRate,
 
 	const int interval = displayRefreshRate / frameLimit;
 	return interval > 0 ? interval : 0;
+}
+
+int PsyX_ShouldUseSoftwareFrameLimit(int effectiveSwapInterval, int frameLimit)
+{
+	return effectiveSwapInterval <= 0 && frameLimit > 0;
 }
 
 void PsyX_SetFrameLimit(int framesPerSecond)
