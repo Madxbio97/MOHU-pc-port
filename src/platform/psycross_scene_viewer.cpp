@@ -1,0 +1,247 @@
+#include "psycross_scene_viewer.hpp"
+#include "chopper_gun_pickup_texture.hpp"
+#include "muzzle_flash_texture.hpp"
+#include "psycross_audio_output.hpp"
+#include "psycross_font_texture.hpp"
+#include "psycross_movie_player.hpp"
+#include "psycross_runtime_guards.hpp"
+#include "psycross_video_mode.hpp"
+#include "psycross_vram.hpp"
+#include "psycross_window_mode.hpp"
+#include "vest_pickup_texture.hpp"
+
+#include "sf/assets/tim_image.hpp"
+#include "sf/core/error.hpp"
+#include "sf/core/polygon_clipper.hpp"
+#include "sf/game/agent_mission_hud.hpp"
+#include "sf/game/dynamic_lighting.hpp"
+#include "sf/game/effects.hpp"
+#include "sf/game/gameplay.hpp"
+#include "sf/game/legacy_effect_presentation_policy.hpp"
+#include "sf/game/legacy_presentation_bridge.hpp"
+#include "sf/game/localization.hpp"
+#include "sf/game/mission.hpp"
+#include "sf/game/pause_menu.hpp"
+#include "sf/game/pause_menu_data.hpp"
+#include "sf/game/retail_cheats.hpp"
+#include "sf/platform/actor_shadow_stability.hpp"
+#include "sf/platform/gameplay_message_reveal_policy.hpp"
+#include "sf/platform/optic_history.hpp"
+#include "sf/platform/player_camera_fade.hpp"
+#include "sf/platform/player_input.hpp"
+#include "sf/platform/presentation_frame_meter.hpp"
+#include "sf/platform/retail_depth_cue.hpp"
+#include "sf/platform/retail_scope_text_policy.hpp"
+#include "sf/platform/retail_ui_presentation.hpp"
+#include "sf/platform/retail_vertex_light_presentation.hpp"
+#include "sf/platform/stable_frame_vector.hpp"
+#include "sf/platform/world_chunk_appearance.hpp"
+#include "sf/platform/world_object_shadow_policy.hpp"
+
+#include <PsyX/PsyX_globals.h>
+#include <PsyX/PsyX_public.h>
+#include <PsyX/PsyX_render.h>
+#include <SDL.h>
+#include <psx/libetc.h>
+#include <psx/libgpu.h>
+#include <psx/libgte.h>
+#include <psx/libpad.h>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <limits>
+#include <memory>
+#include <numbers>
+#include <optional>
+#include <ranges>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
+
+extern "C" void DpqColor(CVECTOR *input, int depth_cue, CVECTOR *output);
+
+namespace sf::platform::detail {
+namespace {
+
+constexpr int screen_width = 384;
+constexpr int screen_height = 240;
+constexpr double guest_draw_offset_x = static_cast<double>(screen_width) * 0.5;
+constexpr double guest_draw_offset_y = static_cast<double>(screen_height) * 0.5;
+constexpr int ordering_table_size = 4096;
+// USA v1.1 DAT_8012f9b8: exact source record inserted into DAT_80116464 by
+// the retail flashlight toggle path.
+constexpr std::uint32_t retail_flashlight_source = 0x8012f9b8U;
+// The EMD/HMD paths clip complete polygons, so a close gameplay plane no
+// longer drops whole wall or actor rectangles near the camera.
+constexpr int near_plane = 32;
+constexpr double near_clip_depth = static_cast<double>(near_plane) + 2.0;
+// Manual aim now keeps its eye outside the same conservative gameplay plane;
+// using one depth here also avoids tiny GTE depths and projected overflow.
+constexpr double first_person_near_clip_depth = near_clip_depth;
+double active_near_clip_depth = near_clip_depth;
+constexpr std::uint16_t mission_clut_source_x = 768U;
+constexpr std::uint16_t mission_clut_source_y = 480U;
+// Mission residency starts with physical pages 6..31 and spills into the
+// host-only extension. Keep the PC HUD copy in framebuffer pages 0..3 instead
+// of restoring its retail page-12 atlas over streamed wall textures.
+constexpr std::uint16_t hud_resident_clut_x = 0U;
+constexpr std::uint16_t hud_resident_clut_y = 254U;
+// Combat sprites occupy the unused bottom 64 rows of native CFIRE page 5.
+// CFIRE uses rows 0..191, so this keeps every authored combat texel persistent
+// while leaving every complete mission page available to the streamer.
+constexpr unsigned int effect_resident_page = 5U;
+constexpr std::uint16_t effect_resident_page_x = 320U;
+constexpr std::uint16_t effect_resident_page_y = 0U;
+constexpr std::uint16_t effect_resident_vram_y = 192U;
+constexpr std::uint16_t effect_resident_clut_x = 0U;
+constexpr std::uint16_t effect_resident_secondary_clut_y = 253U;
+constexpr std::uint16_t muzzle_flash_resident_u = 0U;
+constexpr std::uint16_t muzzle_flash_resident_clut_y = 252U;
+constexpr std::uint16_t pickup_resident_clut_y = 248U;
+// Keep the 32x32 armour sprite in the audited free part of CFIRE page 5.
+// Its independent CLUT avoids corrupting the resident HUD and effect palettes.
+constexpr std::uint16_t pickup_resident_x = 336U;
+constexpr std::uint16_t pickup_resident_y = 224U;
+constexpr std::string_view armor_pickup_texture = "VEST_PICKUP.TIM";
+// The remaining lower-right strip ends immediately below the bullet marks.
+constexpr std::uint16_t chopper_gun_pickup_resident_clut_y = 249U;
+constexpr std::uint16_t chopper_gun_pickup_resident_x = 352U;
+constexpr std::uint16_t chopper_gun_pickup_resident_y = 240U;
+constexpr std::string_view chopper_gun_pickup_texture = "CHNGUN_PICKUP.TIM";
+constexpr std::uint16_t environment_resident_clut_y = 251U;
+
+ControllerPromptFamily controllerPromptFamily(int family) noexcept {
+  switch (family) {
+  case PSYX_CONTROLLER_FAMILY_XBOX:
+    return ControllerPromptFamily::xbox;
+  case PSYX_CONTROLLER_FAMILY_PLAYSTATION:
+    return ControllerPromptFamily::playstation;
+  case PSYX_CONTROLLER_FAMILY_NINTENDO:
+    return ControllerPromptFamily::nintendo;
+  default:
+    return ControllerPromptFamily::generic;
+  }
+}
+
+InputPromptBindings
+controllerPromptBindings(const PsyXControllerSnapshot &snapshot,
+                         const game::PauseSettings &settings) {
+  constexpr std::uint16_t start_button = 0x0008U;
+  constexpr std::uint16_t triangle_button = 0x1000U;
+  constexpr std::uint16_t cross_button = 0x4000U;
+  constexpr std::uint16_t square_button = 0x8000U;
+  const auto family = controllerPromptFamily(snapshot.family);
+  const auto action_button = [&settings](game::ControllerAction action,
+                                         std::uint16_t fallback) {
+    const auto mapped = game::controllerButtonForAction(settings, action);
+    return static_cast<std::uint16_t>(mapped != 0U ? mapped : fallback);
+  };
+  const auto name = [family](std::uint16_t button) {
+    return controllerButtonPromptName(family, button);
+  };
+  return controllerInputPromptBindings(
+      ControllerInputProtocol::unknown,
+      InputPromptBindingNames{
+          .confirm = name(cross_button),
+          .cancel = name(triangle_button),
+          .pause = name(start_button),
+          .interact = name(action_button(game::ControllerAction::use_zoom_in,
+                                         triangle_button)),
+          .fire =
+              name(action_button(game::ControllerAction::shoot, square_button)),
+      });
+}
+
+std::array<std::string, 16U>
+controllerButtonLabels(const PsyXControllerSnapshot &snapshot) {
+  const auto family = controllerPromptFamily(snapshot.family);
+  auto labels = std::array<std::string, 16U>{};
+  for (std::size_t bit = 0U; bit < labels.size(); ++bit) {
+    labels[bit] = controllerButtonPromptName(
+        family, static_cast<std::uint16_t>(1U << bit));
+  }
+  return labels;
+}
+
+[[nodiscard]] bool textureDiagnosticsEnabled() noexcept {
+  static const auto enabled = [] {
+    const auto *value = SDL_getenv("SF_TEXTURE_DIAGNOSTICS");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+// Dynamic CFIRE/SPFX frames used to be uploaded into their retail pages
+// 28/29/31 every frame, temporarily replacing live world/actor textures and
+// ZCLUT row 511. Native presentation owns framebuffer pages 4-5, so keep one
+// immutable fire atlas there. HUD/CFIRE/combat palettes occupy the otherwise
+// unused rows 252-255 of framebuffer pages 0-3; resident HUD pixels end at
+// row 191, so no palette write intersects streamed texture storage.
+constexpr unsigned int fire_resident_fire_page = 4U;
+constexpr unsigned int fire_resident_other_page = 5U;
+constexpr std::uint16_t fire_resident_clut_x = 0U;
+constexpr std::uint16_t fire_resident_clut_y = 255U;
+constexpr std::array<std::string_view, 8> scope_bearings{
+    "SCP0.TIM",   "SCP45.TIM",  "SCP90.TIM",  "SCP135.TIM",
+    "SCP180.TIM", "SCP225.TIM", "SCP270.TIM", "SCP315.TIM",
+};
+constexpr std::array<std::string_view, 5> nightvision_scope_layers{
+    "INFRA.TIM", "INFRA_R.TIM", "INFRAA.TIM", "INFRAB.TIM", "INFRAC.TIM",
+};
+// The authored INFRA sprites live on streamed page 24. Relocate them as one
+// non-overlapping strip into the unused right half of the resident HUD atlas.
+constexpr std::array<std::uint16_t, 5> nightvision_resident_x{
+    128U, 144U, 160U, 174U, 189U,
+};
+constexpr std::uint16_t nightvision_resident_y = 0U;
+
+std::array<std::array<unsigned int, 32>, 2> streamed_texture_page_remap = [] {
+  std::array<std::array<unsigned int, 32>, 2> result{};
+  for (auto &bank : result) {
+    for (unsigned int page = 0; page < bank.size(); ++page) {
+      bank[page] = physicalTexturePage(page);
+    }
+  }
+  return result;
+}();
+
+std::array<std::array<unsigned int, 32>, 2> streamed_clut_row_remap = [] {
+  std::array<std::array<unsigned int, 32>, 2> result{};
+  for (auto &bank : result) {
+    for (unsigned int row = 0; row < bank.size(); ++row) {
+      bank[row] = row;
+    }
+  }
+  return result;
+}();
+
+std::uint32_t streamed_vlf_page_mask{};
+
+// These implementation fragments have declaration-order dependencies.
+// clang-format off
+#include "psycross_scene_textures.inc"
+#include "psycross_scene_presentation.inc"
+#include "psycross_scene_render_core.inc"
+#include "psycross_scene_models.inc"
+#include "psycross_scene_effects.inc"
+#include "psycross_scene_world.inc"
+#include "psycross_scene_hud.inc"
+#include "psycross_scene_pause.inc"
+// clang-format on
+} // namespace
+
+InputPromptBindings titleControllerInputPromptBindings(int controller_family) {
+  return retailMenuControllerInputPromptBindings(
+      controllerPromptFamily(controller_family));
+}
+
+#include "psycross_scene_runtime.inc"
+#include "psycross_scene_save_renderer.inc"
+} // namespace sf::platform::detail

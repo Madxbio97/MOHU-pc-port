@@ -1,0 +1,1800 @@
+#include "sf/platform/host.hpp"
+
+#include "psycross_audio_output.hpp"
+#include "psycross_guest_gpu.hpp"
+#include "psycross_mission_start.hpp"
+#include "psycross_movie_player.hpp"
+#include "psycross_runtime_guards.hpp"
+#include "psycross_scene_viewer.hpp"
+#include "psycross_video_mode.hpp"
+#include "psycross_window_mode.hpp"
+#include "sf/platform/runtime_presentation_policy.hpp"
+#include "volumetric_atlas_texture.hpp"
+
+#include "sf/core/error.hpp"
+#include "sf/game/campaign.hpp"
+#include "sf/game/game_disc.hpp"
+#include "sf/game/mission.hpp"
+#include "sf/game/retail_cheats.hpp"
+#include "sf/game/title.hpp"
+
+#include <PsyX/PsyX_globals.h>
+#include <PsyX/PsyX_public.h>
+#include <PsyX/PsyX_render.h>
+#include <SDL.h>
+#include <psx/libetc.h>
+#include <psx/libgpu.h>
+#include <psx/libgte.h>
+#include <psx/libpad.h>
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <span>
+#include <utility>
+#include <vector>
+
+namespace sf::platform {
+namespace {
+
+detail::StandaloneMovieSkipPolicy
+endingMovieSkipPolicy(const game::MissionDefinition &definition) noexcept {
+  const auto catalog = game::missionCatalog();
+  if (!catalog.empty() && definition.index == catalog.back().index) {
+    // EOL/SILO.STR contains the credits and the post-credits scene.  It is a
+    // single retail stream, so allowing a carried confirm/cancel edge from the
+    // save menu to skip it loses the entire campaign ending.
+    return detail::StandaloneMovieSkipPolicy::prevent;
+  }
+  return detail::StandaloneMovieSkipPolicy::allow;
+}
+
+void configureGraphics(const GraphicsSettings &settings) noexcept {
+  const bool postprocess_aa = settings.smaa || settings.fxaa;
+  g_cfg_msaaSamples = postprocess_aa ? 0 : settings.msaa_samples;
+  g_cfg_bilinearFiltering = settings.bilinear_filtering ? 1 : 0;
+  g_cfg_trilinearFiltering = settings.trilinear_filtering ? 1 : 0;
+  g_cfg_anisotropicFiltering = settings.anisotropic_filtering ? 1 : 0;
+  g_cfg_smaa = settings.smaa ? 1 : 0;
+  g_cfg_fxaa = settings.fxaa ? 1 : 0;
+  g_cfg_volumetricFog = settings.volumetric_fog ? 1 : 0;
+  g_cfg_volumetricEffects = settings.volumetric_effects ? 1 : 0;
+  g_cfg_aspectMode = settings.aspect_ratio == AspectRatioMode::adaptive
+                         ? PSYX_ASPECT_ADAPTIVE
+                         : PSYX_ASPECT_ORIGINAL_4_3;
+  g_cfg_composedGuestScanout = 0;
+  g_cfg_smaaFinalFrame = 0;
+  g_cfg_fxaaFinalFrame = 0;
+  g_cfg_renderWidth = std::max(settings.width, 1);
+  g_cfg_renderHeight = std::max(settings.height, 1);
+  g_cfg_swapInterval = settings.vsync ? 1 : 0;
+  // Presentation is native: no game code samples the displayed framebuffer
+  // through PSX VRAM, and the guest simulation has its own deterministic
+  // 20 Hz clock. Avoid the legacy readback and busy VBlank compatibility
+  // paths, both of which otherwise steal time from display-refresh pacing.
+  g_cfg_framebufferFeedback = 0;
+  g_cfg_vblankThread = 0;
+}
+
+void configureControllerProtocol(ControllerProtocol protocol) noexcept {
+  const auto set = [](const char *name, bool enabled) {
+    static_cast<void>(
+        SDL_SetHintWithPriority(name, enabled ? "1" : "0", SDL_HINT_OVERRIDE));
+  };
+
+  // Fix the Windows joystick driver set before SDL initializes it. Forced
+  // modes disable competing drivers so one physical pad is opened once.
+  const auto automatic = protocol == ControllerProtocol::automatic;
+  set(SDL_HINT_XINPUT_ENABLED,
+      automatic || protocol == ControllerProtocol::xinput);
+  set(SDL_HINT_DIRECTINPUT_ENABLED,
+      automatic || protocol == ControllerProtocol::direct_input);
+  set(SDL_HINT_JOYSTICK_RAWINPUT,
+      automatic || protocol == ControllerProtocol::raw_input);
+  set(SDL_HINT_JOYSTICK_RAWINPUT_CORRELATE_XINPUT, true);
+  set(SDL_HINT_JOYSTICK_WGI, automatic);
+  set(SDL_HINT_JOYSTICK_HIDAPI, automatic);
+  set(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, true);
+  set(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, true);
+}
+
+void configurePresentation(const GraphicsSettings &settings) noexcept {
+  // SDL's high-resolution timer and GL context both exist only after
+  // PsyX_Initialise. Apply the two independent presentation controls here:
+  // swap interval removes tearing, while the software cap controls cadence.
+  PsyX_EnableSwapInterval(settings.vsync ? 1 : 0);
+  PsyX_SetSwapInterval(1);
+  PsyX_SetFrameLimit(static_cast<int>(settings.frame_limit));
+  if (settings.volumetric_effects) {
+    using namespace detail::volumetric_atlas_texture;
+    static_assert(rgba.size() == static_cast<std::size_t>(width) * height * 4U);
+    if (GR_UploadVolumetricDensityAtlas(static_cast<int>(width),
+                                        static_cast<int>(height),
+                                        rgba.data()) == 0) {
+      // The renderer keeps its procedural volume path, and ultimately the
+      // exact retail sprite fallback, if the authored atlas cannot upload.
+      PsyX_Log_Warning(
+          "Volumetric density atlas is unavailable; using procedural shapes\n");
+    }
+  }
+}
+
+void configureInput() {
+  g_cfg_keyboardMapping.kc_dpad_up =
+      PsyX_LookupKeyboardMapping("NONE", g_cfg_keyboardMapping.kc_dpad_up);
+  g_cfg_keyboardMapping.kc_dpad_down =
+      PsyX_LookupKeyboardMapping("NONE", g_cfg_keyboardMapping.kc_dpad_down);
+  g_cfg_keyboardMapping.kc_dpad_left =
+      PsyX_LookupKeyboardMapping("NONE", g_cfg_keyboardMapping.kc_dpad_left);
+  g_cfg_keyboardMapping.kc_dpad_right =
+      PsyX_LookupKeyboardMapping("NONE", g_cfg_keyboardMapping.kc_dpad_right);
+  // PC actions are sampled directly by the player-input adapter. Keep them
+  // out of PsyCross's merged virtual pad so Left Shift cannot turn a physical
+  // R1 target-lock into the PC run action and Space cannot become Select.
+  g_cfg_keyboardMapping.kc_r1 =
+      PsyX_LookupKeyboardMapping("NONE", g_cfg_keyboardMapping.kc_r1);
+  g_cfg_keyboardMapping.kc_l1 =
+      PsyX_LookupKeyboardMapping("NONE", g_cfg_keyboardMapping.kc_l1);
+  g_cfg_keyboardMapping.kc_select =
+      PsyX_LookupKeyboardMapping("NONE", g_cfg_keyboardMapping.kc_select);
+}
+
+std::uint16_t readHostButtons(const PADRAW &pad) noexcept;
+struct RuntimePadSample {
+  RuntimePadInput pad;
+  std::int32_t mouse_delta_x{};
+  std::int32_t mouse_delta_y{};
+  bool mouse_look_active{};
+  double movement_camera_yaw{};
+};
+
+RuntimePadSample sampleRuntimePadInput(
+    const KeyboardMouseBindings &bindings,
+    const MohUndergroundRuntimeActionBindings &runtime_actions,
+    detail::RelativeMouseCapture &mouse_capture) noexcept;
+
+class PsyCrossHost final : public Host {
+public:
+  PsyCrossHost(std::string title, GraphicsSettings graphics,
+               RuntimeFrameCallback frame = {},
+               RuntimeGpuFrameCallback gpu_frame = {},
+               KeyboardMouseBindings input = defaultKeyboardMouseBindings(),
+               MohUndergroundRuntimeActionBindings runtime_actions =
+                   defaultMohUndergroundRuntimeActionBindings(),
+               RuntimeAudioDrainCallback audio = {},
+               RuntimeGraphicsDiagnosticCallback graphics_diagnostics = {})
+      : title_(title.begin(), title.end()), graphics_(graphics),
+        frame_(std::move(frame)), gpu_frame_(std::move(gpu_frame)),
+        input_(std::move(input)), runtime_actions_(std::move(runtime_actions)),
+        audio_(std::move(audio)),
+        graphics_diagnostics_(std::move(graphics_diagnostics)) {
+    title_.push_back('\0');
+  }
+
+  void run() override {
+    configureGraphics(graphics_);
+    if (gpu_frame_) {
+      // Raw guest pages use the selected output resolution directly while
+      // preserving the PS1's exact logical 1024x512 VRAM contract.
+      g_cfg_composedGuestScanout = 1;
+      // Native-target MSAA cannot affect the single-sample guest offscreen
+      // pass. SMAA is applied after that pass is closed at GR_EndScene.
+      g_cfg_msaaSamples = 0;
+      g_cfg_smaaFinalFrame = graphics_.smaa ? 1 : 0;
+      g_cfg_fxaaFinalFrame = graphics_.fxaa ? 1 : 0;
+    }
+    // Raw guest pages mix exact and fallback packets in one target. Preserve
+    // perspective W, but keep their shared depth policy in GP0 painter order.
+    g_cfg_pgxpTextureCorrection = gpu_frame_ ? 1 : g_cfg_pgxpTextureCorrection;
+    g_cfg_pgxpZBuffer = gpu_frame_ ? 1 : g_cfg_pgxpZBuffer;
+    struct RuntimeGraphicsDiagnosticState {
+      bool master{true};
+      bool perspective{true};
+      bool precise_screen{true};
+      bool exact_transform{true};
+      bool exact_capture{true};
+      bool catalog{true};
+      bool identity{true};
+      bool preserve{};
+      bool projective_depth{true};
+      // Ray/plane recovery cannot prove guest vertex provenance.
+      // Keep it opt-in for diagnostics, never production.
+      bool quad_recovery{};
+      bool coherence{true};
+      bool atomic_fallback{true};
+    } diagnostic_state;
+    guest_gpu_.setDiagnosticGeometryOptions(true, true, true, true, false, true,
+                                            true);
+    guest_gpu_.setRuntimeGeometryPolicy(true, false, false);
+
+    configureControllerProtocol(graphics_.controller_protocol);
+    PsyX_Initialise(title_.data(), graphics_.width, graphics_.height, 0);
+    configurePresentation(graphics_);
+    [[maybe_unused]] detail::PsyCrossWindowMode window_mode{
+        graphics_.fullscreen};
+    detail::configurePsyCrossVideoMode(detail::gameplay_video_mode, true);
+    if (gpu_frame_) {
+      GR_EnableDepth(1);
+      GR_SetDepthState(1, 1);
+    }
+    std::unique_ptr<detail::PsyCrossAudioOutput> runtime_audio;
+    std::array<psx::SpuPcmFrame, 4'096U> runtime_audio_scratch{};
+    if (audio_) {
+      // PsyX owns the process OpenAL context, so create the runtime source only
+      // after platform initialization has completed.
+      runtime_audio =
+          std::make_unique<detail::PsyCrossAudioOutput>(2U, "retail-spu");
+      // One guest quantum plus one device request bounds startup latency while
+      // preserving enough phase cushion for the callback sink.
+    }
+    detail::RelativeMouseCapture runtime_mouse_capture;
+    const auto maximum_guest_steps =
+        runtimeGuestCatchUpStepsForPresentation(graphics_.frame_limit);
+    RuntimeGuestCadencePolicy runtime_cadence{60.0, maximum_guest_steps,
+                                              maximum_guest_steps * 2U};
+    RuntimeAudioPlaybackRatePolicy runtime_audio_clock;
+    auto runtime_previous_counter = SDL_GetPerformanceCounter();
+    const auto runtime_counter_frequency = SDL_GetPerformanceFrequency();
+    std::uint64_t guest_projection_epoch{};
+    struct GraphicsDiagnosticSnapshot {
+      std::uint64_t polygons{};
+      std::uint64_t precise{};
+      std::uint64_t exact{};
+      std::uint64_t enhanced{};
+      std::uint64_t enhanced_rotation{};
+      std::uint64_t enhanced_translation{};
+      std::uint64_t enhanced_vector{};
+      std::uint64_t exact_view_depth{};
+      std::uint64_t integer{};
+      std::uint64_t missing_handles_0{};
+      std::uint64_t missing_handles_1{};
+      std::uint64_t missing_handles_2{};
+      std::uint64_t missing_handles_3{};
+      std::uint64_t missing_handles_4{};
+      std::uint64_t partial{};
+      std::uint64_t missing{};
+      std::uint64_t hazard{};
+      std::uint64_t ir_saturation{};
+      std::uint64_t depth_saturation{};
+      std::uint64_t divide_overflow{};
+      std::uint64_t screen_saturation{};
+      std::uint64_t screen{};
+      std::uint64_t reprojection{};
+      std::uint64_t camera{};
+      std::uint64_t near_plane{};
+      std::uint64_t catalog_builds{};
+      std::uint64_t catalog_primitives{};
+      std::uint64_t catalog_ambiguities{};
+      std::uint64_t recovered_vertices{};
+      std::uint64_t conflicts{};
+      std::uint64_t fractional{};
+      std::uint64_t snapped{};
+      std::uint64_t unique{};
+      std::uint64_t reused{};
+      std::uint64_t synthetic{};
+      std::uint64_t packet_fallback{};
+      std::uint64_t plane_recovered{};
+      std::uint64_t plane_rejected{};
+      std::uint64_t native_primitives{};
+      std::uint64_t native_triangles{};
+      std::uint64_t native_fallbacks{};
+      std::uint64_t native_state_fallbacks{};
+      std::uint64_t synchronous_readbacks{};
+    };
+    const auto graphicsSnapshot = [this] {
+      return GraphicsDiagnosticSnapshot{
+          guest_gpu_.polygonPrimitives(),
+          guest_gpu_.precisePrimitives(),
+          guest_gpu_.exactPrecisePrimitives(),
+          guest_gpu_.enhancedPrecisePrimitives(),
+          guest_gpu_.enhancedRotationPrimitives(),
+          guest_gpu_.enhancedTranslationPrimitives(),
+          guest_gpu_.enhancedVectorPrimitives(),
+          guest_gpu_.exactViewDepthPrimitives(),
+          guest_gpu_.integerPrecisePrimitives(),
+          guest_gpu_.missingProjectionVertexBucket(0U),
+          guest_gpu_.missingProjectionVertexBucket(1U),
+          guest_gpu_.missingProjectionVertexBucket(2U),
+          guest_gpu_.missingProjectionVertexBucket(3U),
+          guest_gpu_.missingProjectionVertexBucket(4U),
+          guest_gpu_.partialProjectionPrimitives(),
+          guest_gpu_.missingProjectionPrimitives(),
+          guest_gpu_.projectionHazardPrimitives(),
+          guest_gpu_.irSaturationPrimitives(),
+          guest_gpu_.depthSaturationPrimitives(),
+          guest_gpu_.divideOverflowPrimitives(),
+          guest_gpu_.screenSaturationPrimitives(),
+          guest_gpu_.screenMismatchPrimitives(),
+          guest_gpu_.reprojectionMismatchPrimitives(),
+          guest_gpu_.cameraMismatchPrimitives(),
+          guest_gpu_.nearPlanePrimitives(),
+          guest_gpu_.projectionCatalogBuilds(),
+          guest_gpu_.projectionCatalogPrimitives(),
+          guest_gpu_.projectionCatalogAmbiguities(),
+          guest_gpu_.identityRecoveredVertices(),
+          guest_gpu_.sharedMeshConflicts(),
+          guest_gpu_.sharedMeshFractionalVertices(),
+          guest_gpu_.sharedMeshSnappedVertices(),
+          guest_gpu_.sharedMeshUniqueVertices(),
+          guest_gpu_.sharedMeshReusedVertices(),
+          guest_gpu_.sharedMeshSyntheticVertices(),
+          guest_gpu_.sharedMeshPacketFallbackVertices(),
+          guest_gpu_.planeRecoveredPrimitives(),
+          guest_gpu_.planeRecoveryRejectedPrimitives(),
+          guest_gpu_.nativeScenePrimitives(),
+          guest_gpu_.nativeSceneTriangles(),
+          guest_gpu_.nativeSceneFallbacks(),
+          guest_gpu_.nativeSceneStateFallbacks(),
+          GR_GetSynchronousVRAMReadbackCount()};
+    };
+    auto graphics_diagnostic_previous = graphicsSnapshot();
+    auto graphics_diagnostic_counter = SDL_GetPerformanceCounter();
+    std::uint64_t graphics_diagnostic_guest_steps{};
+    std::uint64_t graphics_diagnostic_render_frames{};
+    std::uint64_t graphics_diagnostic_submit_ticks{};
+    std::uint64_t graphics_diagnostic_submit_max_ticks{};
+    std::uint64_t graphics_diagnostic_render_ticks{};
+    std::uint64_t graphics_diagnostic_render_max_ticks{};
+    const auto logGraphicsDiagnostics = [&](const char *context) {
+      const auto current_counter = SDL_GetPerformanceCounter();
+      const auto current = graphicsSnapshot();
+      const auto delta = [](std::uint64_t value, std::uint64_t previous) {
+        return value - previous;
+      };
+      const auto elapsed =
+          runtime_counter_frequency == 0U
+              ? 0.0
+              : static_cast<double>(current_counter -
+                                    graphics_diagnostic_counter) /
+                    static_cast<double>(runtime_counter_frequency);
+      const auto polygons =
+          delta(current.polygons, graphics_diagnostic_previous.polygons);
+      const auto precise =
+          delta(current.precise, graphics_diagnostic_previous.precise);
+      const auto unique =
+          delta(current.unique, graphics_diagnostic_previous.unique);
+      const auto reused =
+          delta(current.reused, graphics_diagnostic_previous.reused);
+      const auto milliseconds =
+          [runtime_counter_frequency](std::uint64_t ticks) {
+            return runtime_counter_frequency == 0U
+                       ? 0.0
+                       : static_cast<double>(ticks) * 1'000.0 /
+                             static_cast<double>(runtime_counter_frequency);
+          };
+      PsyX_Log_Info(
+          "[GraphicsDiag][%s] guest_steps=%llu guest_hz=%.2f render_frames="
+          "%llu submit_avg=%.3fms submit_max=%.3fms render_avg=%.3fms "
+          "render_max=%.3fms sync_reads=%llu\n",
+          context,
+          static_cast<unsigned long long>(graphics_diagnostic_guest_steps),
+          elapsed > 0.0
+              ? static_cast<double>(graphics_diagnostic_guest_steps) / elapsed
+              : 0.0,
+          static_cast<unsigned long long>(graphics_diagnostic_render_frames),
+          graphics_diagnostic_guest_steps == 0U
+              ? 0.0
+              : milliseconds(graphics_diagnostic_submit_ticks) /
+                    static_cast<double>(graphics_diagnostic_guest_steps),
+          milliseconds(graphics_diagnostic_submit_max_ticks),
+          graphics_diagnostic_render_frames == 0U
+              ? 0.0
+              : milliseconds(graphics_diagnostic_render_ticks) /
+                    static_cast<double>(graphics_diagnostic_render_frames),
+          milliseconds(graphics_diagnostic_render_max_ticks),
+          static_cast<unsigned long long>(
+              delta(current.synchronous_readbacks,
+                    graphics_diagnostic_previous.synchronous_readbacks)));
+      PsyX_Log_Info(
+          "[GraphicsDiag][coverage] polygons=%llu precise=%llu(%.1f%%) "
+          "exact=%llu enhanced=%llu(r=%llu t=%llu v=%llu vieww=%llu) "
+          "integer=%llu handles_missing=%llu/%llu/"
+          "%llu/%llu/%llu partial=%llu missing=%llu hazard=%llu(ir=%llu "
+          "depth=%llu "
+          "divide=%llu screen_sat=%llu) near=%llu screen=%llu reproject=%llu "
+          "camera=%llu catalog=%llu/%llu ambiguous=%llu recovered=%llu\n",
+          static_cast<unsigned long long>(polygons),
+          static_cast<unsigned long long>(precise),
+          polygons == 0U ? 0.0
+                         : 100.0 * static_cast<double>(precise) /
+                               static_cast<double>(polygons),
+          static_cast<unsigned long long>(
+              delta(current.exact, graphics_diagnostic_previous.exact)),
+          static_cast<unsigned long long>(
+              delta(current.enhanced, graphics_diagnostic_previous.enhanced)),
+          static_cast<unsigned long long>(
+              delta(current.enhanced_rotation,
+                    graphics_diagnostic_previous.enhanced_rotation)),
+          static_cast<unsigned long long>(
+              delta(current.enhanced_translation,
+                    graphics_diagnostic_previous.enhanced_translation)),
+          static_cast<unsigned long long>(
+              delta(current.enhanced_vector,
+                    graphics_diagnostic_previous.enhanced_vector)),
+          static_cast<unsigned long long>(
+              delta(current.exact_view_depth,
+                    graphics_diagnostic_previous.exact_view_depth)),
+          static_cast<unsigned long long>(
+              delta(current.integer, graphics_diagnostic_previous.integer)),
+          static_cast<unsigned long long>(
+              delta(current.missing_handles_0,
+                    graphics_diagnostic_previous.missing_handles_0)),
+          static_cast<unsigned long long>(
+              delta(current.missing_handles_1,
+                    graphics_diagnostic_previous.missing_handles_1)),
+          static_cast<unsigned long long>(
+              delta(current.missing_handles_2,
+                    graphics_diagnostic_previous.missing_handles_2)),
+          static_cast<unsigned long long>(
+              delta(current.missing_handles_3,
+                    graphics_diagnostic_previous.missing_handles_3)),
+          static_cast<unsigned long long>(
+              delta(current.missing_handles_4,
+                    graphics_diagnostic_previous.missing_handles_4)),
+          static_cast<unsigned long long>(
+              delta(current.partial, graphics_diagnostic_previous.partial)),
+          static_cast<unsigned long long>(
+              delta(current.missing, graphics_diagnostic_previous.missing)),
+          static_cast<unsigned long long>(
+              delta(current.hazard, graphics_diagnostic_previous.hazard)),
+          static_cast<unsigned long long>(
+              delta(current.ir_saturation,
+                    graphics_diagnostic_previous.ir_saturation)),
+          static_cast<unsigned long long>(
+              delta(current.depth_saturation,
+                    graphics_diagnostic_previous.depth_saturation)),
+          static_cast<unsigned long long>(
+              delta(current.divide_overflow,
+                    graphics_diagnostic_previous.divide_overflow)),
+          static_cast<unsigned long long>(
+              delta(current.screen_saturation,
+                    graphics_diagnostic_previous.screen_saturation)),
+          static_cast<unsigned long long>(delta(
+              current.near_plane, graphics_diagnostic_previous.near_plane)),
+          static_cast<unsigned long long>(
+              delta(current.screen, graphics_diagnostic_previous.screen)),
+          static_cast<unsigned long long>(delta(
+              current.reprojection, graphics_diagnostic_previous.reprojection)),
+          static_cast<unsigned long long>(
+              delta(current.camera, graphics_diagnostic_previous.camera)),
+          static_cast<unsigned long long>(
+              delta(current.catalog_primitives,
+                    graphics_diagnostic_previous.catalog_primitives)),
+          static_cast<unsigned long long>(
+              delta(current.catalog_builds,
+                    graphics_diagnostic_previous.catalog_builds)),
+          static_cast<unsigned long long>(
+              delta(current.catalog_ambiguities,
+                    graphics_diagnostic_previous.catalog_ambiguities)),
+          static_cast<unsigned long long>(
+              delta(current.recovered_vertices,
+                    graphics_diagnostic_previous.recovered_vertices)));
+      PsyX_Log_Info("[GraphicsDiag][native] primitives=%llu triangles=%llu "
+                    "fallback=%llu state_material=%llu\n",
+                    static_cast<unsigned long long>(
+                        delta(current.native_primitives,
+                              graphics_diagnostic_previous.native_primitives)),
+                    static_cast<unsigned long long>(
+                        delta(current.native_triangles,
+                              graphics_diagnostic_previous.native_triangles)),
+                    static_cast<unsigned long long>(
+                        delta(current.native_fallbacks,
+                              graphics_diagnostic_previous.native_fallbacks)),
+                    static_cast<unsigned long long>(delta(
+                        current.native_state_fallbacks,
+                        graphics_diagnostic_previous.native_state_fallbacks)));
+      PsyX_Log_Info(
+          "[GraphicsDiag][mesh] unique=%llu reused=%llu(%.1f%%) conflicts="
+          "%llu fractional=%llu snapped=%llu synthetic=%llu raw=%llu "
+          "plane_recovered=%llu plane_rejected=%llu\n",
+          static_cast<unsigned long long>(unique),
+          static_cast<unsigned long long>(reused),
+          unique + reused == 0U ? 0.0
+                                : 100.0 * static_cast<double>(reused) /
+                                      static_cast<double>(unique + reused),
+          static_cast<unsigned long long>(
+              delta(current.conflicts, graphics_diagnostic_previous.conflicts)),
+          static_cast<unsigned long long>(delta(
+              current.fractional, graphics_diagnostic_previous.fractional)),
+          static_cast<unsigned long long>(
+              delta(current.snapped, graphics_diagnostic_previous.snapped)),
+          static_cast<unsigned long long>(
+              delta(current.synthetic, graphics_diagnostic_previous.synthetic)),
+          static_cast<unsigned long long>(
+              delta(current.packet_fallback,
+                    graphics_diagnostic_previous.packet_fallback)),
+          static_cast<unsigned long long>(
+              delta(current.plane_recovered,
+                    graphics_diagnostic_previous.plane_recovered)),
+          static_cast<unsigned long long>(
+              delta(current.plane_rejected,
+                    graphics_diagnostic_previous.plane_rejected)));
+      PsyX_Log_Info(
+          "[GraphicsDiag][modes] master=%u perspective=%u precise_xy=%u "
+          "exact_transform=%u exact_capture=%u catalog=%u identity=%u "
+          "preserve=%u projective_depth=%u quad_recovery=%u coherence=%u "
+          "atomic_fallback=%u zbuffer=%u\n",
+          diagnostic_state.master, diagnostic_state.perspective,
+          diagnostic_state.precise_screen, diagnostic_state.exact_transform,
+          diagnostic_state.exact_capture, diagnostic_state.catalog,
+          diagnostic_state.identity, diagnostic_state.preserve,
+          diagnostic_state.projective_depth, diagnostic_state.quad_recovery,
+          diagnostic_state.coherence, diagnostic_state.atomic_fallback,
+          g_cfg_pgxpZBuffer != 0);
+      if (runtime_audio) {
+        runtime_audio->logDiagnostics(context);
+      }
+      graphics_diagnostic_previous = current;
+      graphics_diagnostic_counter = current_counter;
+      graphics_diagnostic_guest_steps = 0U;
+      graphics_diagnostic_render_frames = 0U;
+      graphics_diagnostic_submit_ticks = 0U;
+      graphics_diagnostic_submit_max_ticks = 0U;
+      graphics_diagnostic_render_ticks = 0U;
+      graphics_diagnostic_render_max_ticks = 0U;
+    };
+    const auto applyDiagnosticState = [&] {
+      guest_gpu_.setDiagnosticGeometryOptions(
+          diagnostic_state.master, diagnostic_state.perspective,
+          diagnostic_state.precise_screen, diagnostic_state.projective_depth,
+          diagnostic_state.quad_recovery, diagnostic_state.coherence,
+          diagnostic_state.atomic_fallback);
+      g_cfg_pgxpTextureCorrection =
+          diagnostic_state.master && diagnostic_state.perspective ? 1 : 0;
+    };
+    const auto featureName = [](RuntimeGraphicsDiagnosticFeature feature) {
+      constexpr std::array names{
+          "perspective",   "precise-xy", "exact-transform", "exact-capture",
+          "catalog",       "identity",   "preserve",        "projective-depth",
+          "quad-recovery", "coherence",  "atomic-fallback", "master"};
+      return names[static_cast<std::size_t>(feature)];
+    };
+    PsyX_Log_Info(
+        "[GeometryToggle] F1=perspective F2=precise-xy F3=exact-transform "
+        "F4=exact-capture F5=catalog F6=identity F7=preserve "
+        "F8=projective-depth "
+        "F9=quad-recovery F10=coherence F11=atomic-fallback F12=master "
+        "Shift+F11=fullscreen\n");
+    const auto toggleDiagnosticFeature = [&](std::size_t index) {
+      const auto feature = static_cast<RuntimeGraphicsDiagnosticFeature>(index);
+      bool *value{};
+      switch (feature) {
+      case RuntimeGraphicsDiagnosticFeature::perspective_correction:
+        value = &diagnostic_state.perspective;
+        break;
+      case RuntimeGraphicsDiagnosticFeature::precise_screen_position:
+        value = &diagnostic_state.precise_screen;
+        break;
+      case RuntimeGraphicsDiagnosticFeature::exact_transform:
+        value = &diagnostic_state.exact_transform;
+        break;
+      case RuntimeGraphicsDiagnosticFeature::exact_capture:
+        value = &diagnostic_state.exact_capture;
+        break;
+      case RuntimeGraphicsDiagnosticFeature::compact_catalog:
+        value = &diagnostic_state.catalog;
+        break;
+      case RuntimeGraphicsDiagnosticFeature::identity_sidecar:
+        value = &diagnostic_state.identity;
+        break;
+      case RuntimeGraphicsDiagnosticFeature::preserve_projection_precision:
+        value = &diagnostic_state.preserve;
+        break;
+      case RuntimeGraphicsDiagnosticFeature::projective_depth_clamp:
+        value = &diagnostic_state.projective_depth;
+        break;
+      case RuntimeGraphicsDiagnosticFeature::quad_recovery:
+        value = &diagnostic_state.quad_recovery;
+        break;
+      case RuntimeGraphicsDiagnosticFeature::coherence_recovery:
+        value = &diagnostic_state.coherence;
+        break;
+      case RuntimeGraphicsDiagnosticFeature::atomic_primitive_fallback:
+        value = &diagnostic_state.atomic_fallback;
+        break;
+      case RuntimeGraphicsDiagnosticFeature::master:
+        value = &diagnostic_state.master;
+        break;
+      case RuntimeGraphicsDiagnosticFeature::count:
+        return;
+      }
+      *value = !*value;
+      const auto accepted =
+          !graphics_diagnostics_ || graphics_diagnostics_(feature, *value);
+      if (!accepted)
+        *value = !*value;
+      applyDiagnosticState();
+      PsyX_Log_Info("[GeometryToggle] F%zu %s=%s accepted=%s\n", index + 1U,
+                    featureName(feature), *value ? "ON" : "OFF",
+                    accepted ? "yes" : "no");
+      logGraphicsDiagnostics("toggle");
+    };
+
+    RuntimePresentationPolicy runtime_presentation;
+    const auto prepareRuntimeDisplay =
+        [this, &runtime_presentation](const RuntimeGpuFrame &frame) {
+          const auto content = runtime_presentation.update({
+              frame.display_width,
+              frame.display_height,
+              frame.display_rgb24,
+              frame.display_interlaced,
+              !frame.native_scene_triangles.empty(),
+          });
+          const auto aspect =
+              presentationAspectRatio(graphics_.aspect_ratio, content);
+          g_cfg_aspectMode = aspect == AspectRatioMode::adaptive
+                                 ? PSYX_ASPECT_ADAPTIVE
+                                 : PSYX_ASPECT_ORIGINAL_4_3;
+          GR_SetGuestDisplayGeometry(static_cast<int>(frame.display_width),
+                                     static_cast<int>(frame.display_height));
+        };
+
+    const auto presentRuntimeDisplay = [this](const RuntimeGpuFrame &frame) {
+      guest_gpu_.presentDisplay(frame.display_x, frame.display_y,
+                                frame.display_width, frame.display_height,
+                                frame.display_enabled, frame.display_rgb24,
+                                frame.display_interlaced);
+    };
+    for (;;) {
+      if (frame_) {
+        PsyX_UpdateInput();
+        if (graphics_diagnostics_) {
+          const auto *keys = SDL_GetKeyboardState(nullptr);
+          for (std::size_t index{}; index < 12U; ++index) {
+            const auto scancode =
+                static_cast<SDL_Scancode>(SDL_SCANCODE_F1 + index);
+            const auto down = keys[scancode] != 0;
+            const auto fullscreen_shortcut =
+                index == 10U && (SDL_GetModState() & KMOD_SHIFT) != 0;
+            if (down && !diagnostic_key_down_[index] && !fullscreen_shortcut)
+              toggleDiagnosticFeature(index);
+            diagnostic_key_down_[index] = down;
+          }
+        }
+        const auto runtime_counter = SDL_GetPerformanceCounter();
+        const auto elapsed_seconds =
+            runtime_counter_frequency != 0U
+                ? static_cast<double>(runtime_counter -
+                                      runtime_previous_counter) /
+                      static_cast<double>(runtime_counter_frequency)
+                : 1.0 / 60.0;
+        runtime_previous_counter = runtime_counter;
+        const auto guest_steps = runtime_cadence.advance(elapsed_seconds);
+        if (runtime_audio) {
+          runtime_audio->setPlaybackRate(
+              runtime_audio_clock.advance(elapsed_seconds, guest_steps));
+        }
+        if (guest_steps != 0U) {
+          const auto input_sample = sampleRuntimePadInput(
+              input_, runtime_actions_, runtime_mouse_capture);
+          auto runtime_running = true;
+          for (std::size_t step{}; step < guest_steps; ++step) {
+            const auto pad = applyMohUndergroundRuntimeMouseLook(
+                input_sample.pad,
+                runtimeMouseDeltaForGuestStep(input_sample.mouse_delta_x, step,
+                                              guest_steps),
+                runtimeMouseDeltaForGuestStep(input_sample.mouse_delta_y, step,
+                                              guest_steps),
+                input_sample.mouse_look_active,
+                graphics_.mouse_sensitivity_percent, runtime_actions_,
+                input_sample.movement_camera_yaw);
+            if (!frame_(pad)) {
+              runtime_running = false;
+              break;
+            }
+            if (gpu_frame_) {
+              const auto gpu_frame = gpu_frame_();
+              prepareRuntimeDisplay(gpu_frame);
+              if (step + 1U == guest_steps) {
+                presentRuntimeDisplay(gpu_frame);
+              }
+              GR_BeginGuestProjectionEpoch(
+                  ++guest_projection_epoch,
+                  static_cast<int>(gpu_frame.display_width),
+                  static_cast<int>(gpu_frame.display_height),
+                  gpu_frame.display_rgb24 ? 1 : 0,
+                  gpu_frame.display_interlaced ? 1 : 0);
+              GR_BeginGuestSubmit();
+              const auto submit_started = SDL_GetPerformanceCounter();
+              guest_gpu_.setNativeScene(gpu_frame.native_scene_positions,
+                                        gpu_frame.native_scene_triangles);
+              guest_gpu_.submit(gpu_frame.words, gpu_frame.projections,
+                                gpu_frame.projection_identities,
+                                gpu_frame.command_buffer_epoch,
+                                gpu_frame.projection_catalog);
+              const auto submit_ticks =
+                  SDL_GetPerformanceCounter() - submit_started;
+              graphics_diagnostic_submit_ticks += submit_ticks;
+              graphics_diagnostic_submit_max_ticks =
+                  std::max(graphics_diagnostic_submit_max_ticks, submit_ticks);
+              ++graphics_diagnostic_guest_steps;
+            }
+          }
+          if (!runtime_running) {
+            PsyX_Log_Info(
+                "Runtime cadence: max host interval %.3f ms, dropped wall "
+                "debt %.3f ms, remaining backlog %.3f ms, audio resyncs "
+                "%llu\n",
+                runtime_cadence.maximumElapsedSeconds() * 1'000.0,
+                runtime_cadence.droppedSeconds() * 1'000.0,
+                runtime_cadence.backlogSeconds() * 1'000.0,
+                static_cast<unsigned long long>(
+                    runtime_cadence.lateRecoveryCount()));
+            logGraphicsDiagnostics("final");
+            break;
+          }
+        }
+        if (runtime_audio) {
+          if (guest_steps != 0U) {
+            const auto valid = drainRuntimeAudioFrames(
+                std::span<psx::SpuPcmFrame>{runtime_audio_scratch},
+                RuntimeAudioDrainMode::queue,
+                [this](std::span<psx::SpuPcmFrame> destination) {
+                  return audio_(destination);
+                },
+                [&runtime_audio](std::span<const psx::SpuPcmFrame> frames) {
+                  runtime_audio->queue(frames);
+                });
+            if (!valid) {
+              throw core::Error{
+                  core::ErrorCode::invalid_argument,
+                  "Runtime audio callback exceeded its destination capacity"};
+            }
+            runtime_audio->flush();
+          }
+          runtime_audio->update();
+        }
+        const auto iteration_policy = runtimeHostIterationPolicy(guest_steps);
+        if (iteration_policy.refresh_retained_display && gpu_frame_) {
+          const auto gpu_frame = gpu_frame_();
+          prepareRuntimeDisplay(gpu_frame);
+          presentRuntimeDisplay(gpu_frame);
+        }
+      }
+      const auto render_started = SDL_GetPerformanceCounter();
+      static_cast<void>(PsyX_BeginScene());
+      DrawSync(0);
+      PsyX_EndScene();
+      const auto render_ticks = SDL_GetPerformanceCounter() - render_started;
+      graphics_diagnostic_render_ticks += render_ticks;
+      graphics_diagnostic_render_max_ticks =
+          std::max(graphics_diagnostic_render_max_ticks, render_ticks);
+      ++graphics_diagnostic_render_frames;
+      if (graphics_diagnostic_guest_steps >= 300U) {
+        logGraphicsDiagnostics("periodic");
+      }
+    }
+  }
+
+private:
+  std::vector<char> title_;
+  GraphicsSettings graphics_;
+  RuntimeFrameCallback frame_;
+  RuntimeGpuFrameCallback gpu_frame_;
+  KeyboardMouseBindings input_;
+  MohUndergroundRuntimeActionBindings runtime_actions_;
+  RuntimeAudioDrainCallback audio_;
+  RuntimeGraphicsDiagnosticCallback graphics_diagnostics_;
+  std::array<bool, 12U> diagnostic_key_down_{};
+  detail::PsyCrossGuestGpu guest_gpu_;
+};
+
+void uploadTitleNoticeFont() {
+  // Keep PsyCross's debug font clear of the title TIMs at x=896..950 and the
+  // movie upload rectangle at x=0..319, y=256..495.
+  FntLoad(960, 256);
+}
+
+void configureTitleNotice() {
+  uploadTitleNoticeFont();
+  static_cast<void>(FntOpen(54, 70, 252, 154, 2, 256));
+}
+
+game::TitleSaveSlots
+loadTitleSaveSlots(const std::filesystem::path &path) noexcept {
+  const auto loaded = game::loadTitleSaveSlotsFile(path);
+  if (loaded.status == game::TitleSaveLoadStatus::invalid) {
+    PsyX_Log_Error("Ignoring invalid or unreadable title save file\n");
+  } else if (loaded.status == game::TitleSaveLoadStatus::recovered) {
+    PsyX_Log_Info("Recovered title save from the last complete backup\n");
+  }
+  return loaded.slots;
+}
+
+bool storeTitleSaveSlots(const std::filesystem::path &path,
+                         const game::TitleSaveSlots &slots) noexcept {
+  const auto stored = game::storeTitleSaveSlotsFile(path, slots);
+  if (!stored) {
+    PsyX_Log_Error("Campaign progress could not be persisted\n");
+  }
+  return stored;
+}
+
+enum class SaveStoreDecision {
+  stored,
+  continue_without_saving,
+  return_to_title,
+};
+
+std::uint16_t readHostButtons(const PADRAW &pad) noexcept {
+  return static_cast<std::uint16_t>(pad.buttons[0]) |
+         (static_cast<std::uint16_t>(pad.buttons[1]) << 8U);
+}
+
+KeyboardMouseActionSnapshot
+sampleHostKeyboardMouseActions(const KeyboardMouseBindings &bindings) {
+  int keyboard_count{};
+  const auto *keyboard = SDL_GetKeyboardState(&keyboard_count);
+  const auto keyboard_state =
+      keyboard != nullptr && keyboard_count > 0
+          ? std::span<const std::uint8_t>{keyboard, static_cast<std::size_t>(
+                                                        keyboard_count)}
+          : std::span<const std::uint8_t>{};
+  const auto mouse_buttons = SDL_GetMouseState(nullptr, nullptr);
+  return sampleKeyboardMouseActions(
+      bindings, KeyboardMouseDeviceState{
+                    .keyboard = keyboard_state,
+                    .mouse_left = (mouse_buttons & SDL_BUTTON_LMASK) != 0U,
+                    .mouse_right = (mouse_buttons & SDL_BUTTON_RMASK) != 0U,
+                    .mouse_middle = (mouse_buttons & SDL_BUTTON_MMASK) != 0U,
+                    .mouse_x1 = (mouse_buttons & SDL_BUTTON_X1MASK) != 0U,
+                    .mouse_x2 = (mouse_buttons & SDL_BUTTON_X2MASK) != 0U,
+                    .mouse_wheel_delta = detail::consumePsyCrossMouseWheel(),
+                });
+}
+
+RuntimePadSample sampleRuntimePadInput(
+    const KeyboardMouseBindings &bindings,
+    const MohUndergroundRuntimeActionBindings &runtime_actions,
+    detail::RelativeMouseCapture &mouse_capture) noexcept {
+  const auto actions = sampleHostKeyboardMouseActions(bindings);
+  RuntimePadInput physical;
+  PsyXControllerSnapshot snapshot{};
+  if (PsyX_Pad_GetControllerSnapshot(0, &snapshot) != 0 &&
+      snapshot.connected != 0U) {
+    physical.active_low_buttons =
+        static_cast<std::uint16_t>(snapshot.buttons[0]) |
+        (static_cast<std::uint16_t>(snapshot.buttons[1]) << 8U);
+    std::copy_n(snapshot.analog, physical.analog.size(),
+                physical.analog.begin());
+  }
+  mouse_capture.set(SDL_GetKeyboardFocus() != nullptr);
+  auto mouse_delta_x = int{};
+  auto mouse_delta_y = int{};
+  if (mouse_capture.enabled()) {
+    SDL_GetRelativeMouseState(&mouse_delta_x, &mouse_delta_y);
+  }
+  const auto movement_camera_yaw =
+      static_cast<double>(actions[KeyboardMouseAction::strafe_right]) -
+      static_cast<double>(actions[KeyboardMouseAction::strafe_left]);
+  return RuntimePadSample{
+      .pad =
+          mergeMohUndergroundRuntimeInput(physical, actions, runtime_actions),
+      .mouse_delta_x = static_cast<std::int32_t>(mouse_delta_x),
+      .mouse_delta_y = static_cast<std::int32_t>(mouse_delta_y),
+      .mouse_look_active = mouse_capture.enabled(),
+      .movement_camera_yaw = movement_camera_yaw,
+  };
+}
+SaveStoreDecision
+storeTitleSaveSlotsWithRecovery(const std::filesystem::path &path,
+                                const game::TitleSaveSlots &slots, PADRAW &pad,
+                                std::uint16_t &previous_buttons,
+                                const KeyboardMouseBindings &bindings) {
+  if (storeTitleSaveSlots(path, slots)) {
+    return SaveStoreDecision::stored;
+  }
+
+  configureTitleNotice();
+  constexpr std::uint16_t retry_buttons = 0x4000U | 0x08U;
+  constexpr std::uint16_t continue_buttons = 0x8000U;
+  constexpr std::uint16_t title_buttons = 0x2000U | 0x01U;
+  const auto input_name = [&](KeyboardMouseAction action) {
+    return std::string{keyboardMouseInputName(bindings[action])};
+  };
+  const auto notice =
+      "       SAVE FAILED\n\n  " + input_name(KeyboardMouseAction::interact) +
+      "  Retry\n  " + input_name(KeyboardMouseAction::fire) +
+      "  Continue without saving\n  " + input_name(KeyboardMouseAction::pause) +
+      "  Return to title\n\n"
+      "Campaign progress remains active.";
+  auto keyboard_initialized = false;
+  auto interact_was_down = false;
+  auto fire_was_down = false;
+  auto pause_was_down = false;
+  for (;;) {
+    PsyX_UpdateInput();
+    const auto buttons = readHostButtons(pad);
+    const auto pressed =
+        static_cast<std::uint16_t>(~buttons & previous_buttons);
+    previous_buttons = buttons;
+    const auto actions = sampleHostKeyboardMouseActions(bindings);
+    const auto interact_down = actions[KeyboardMouseAction::interact];
+    const auto fire_down = actions[KeyboardMouseAction::fire];
+    const auto pause_down = actions[KeyboardMouseAction::pause];
+    const auto interact_pressed =
+        keyboard_initialized && interact_down && !interact_was_down;
+    const auto fire_pressed =
+        keyboard_initialized && fire_down && !fire_was_down;
+    const auto pause_pressed =
+        keyboard_initialized && pause_down && !pause_was_down;
+    keyboard_initialized = true;
+    interact_was_down = interact_down;
+    fire_was_down = fire_down;
+    pause_was_down = pause_down;
+
+    if ((pressed & title_buttons) != 0U || pause_pressed) {
+      return SaveStoreDecision::return_to_title;
+    }
+    if ((pressed & continue_buttons) != 0U || fire_pressed) {
+      PsyX_Log_Info("Continuing campaign without durable save progress\n");
+      return SaveStoreDecision::continue_without_saving;
+    }
+    if (((pressed & retry_buttons) != 0U || interact_pressed) &&
+        storeTitleSaveSlots(path, slots)) {
+      return SaveStoreDecision::stored;
+    }
+
+    if (PsyX_BeginScene() != 0) {
+      char format[] = "%s";
+      static_cast<void>(FntPrint(format, notice.c_str()));
+      static_cast<void>(FntFlush());
+      PsyX_EndScene();
+    }
+  }
+}
+
+ControllerMenuSample
+controllerMenuSample(const PsyXControllerSnapshot &snapshot) noexcept;
+ControllerMenuSample updateTitleInputPromptBindings(
+    detail::PsyCrossCampaignSaveRenderer &renderer,
+    const KeyboardMouseBindings &keyboard_bindings,
+    const KeyboardMouseActionSnapshot &keyboard_actions,
+    InputPromptBindings &active_bindings, int &previous_controller_instance);
+
+game::CampaignSaveResult runCampaignSaveMenu(
+    const game::MissionPackage &mission, const game::TitleSaveSlots &slots,
+    PADRAW &pad, std::uint16_t &previous_buttons,
+    detail::PsyCrossUiAudio &ui_audio, const KeyboardMouseBindings &bindings) {
+  // Gameplay already owns the correct 384x240 presentation target. Reuse its
+  // original font/ACD renderer instead of switching to the debug-font movie
+  // target whose VRAM page has been overwritten by the mission renderer.
+  detail::PsyCrossCampaignSaveRenderer renderer{mission, bindings};
+  auto active_prompt_bindings = keyboardMouseInputPromptBindings(bindings);
+  auto previous_controller_instance = -1;
+
+  PsyX_Log_Info("Campaign save UI entered\n");
+  game::CampaignSaveMenu menu;
+  ControllerMenuNavigator analog_navigation;
+  auto first_frame_presented = false;
+  constexpr std::uint16_t previous_buttons_mask = 0x80U | 0x10U;
+  constexpr std::uint16_t next_buttons_mask = 0x20U | 0x40U;
+  constexpr std::uint16_t confirm_buttons_mask = 0x4000U | 0x8000U | 0x08U;
+  constexpr std::uint16_t cancel_buttons_mask = 0x2000U | 0x01U;
+  auto keyboard_initialized = false;
+  auto interact_was_down = false;
+  auto pause_was_down = false;
+  for (;;) {
+    PsyX_UpdateInput();
+    ui_audio.update();
+    const auto buttons = readHostButtons(pad);
+    const auto pressed =
+        static_cast<std::uint16_t>(~buttons & previous_buttons);
+    previous_buttons = buttons;
+    const auto actions = sampleHostKeyboardMouseActions(bindings);
+    const auto interact_down = actions[KeyboardMouseAction::interact];
+    const auto pause_down = actions[KeyboardMouseAction::pause];
+    const auto interact_pressed =
+        keyboard_initialized && interact_down && !interact_was_down;
+    const auto pause_pressed =
+        keyboard_initialized && pause_down && !pause_was_down;
+    keyboard_initialized = true;
+    interact_was_down = interact_down;
+    pause_was_down = pause_down;
+    const auto menu_sample = updateTitleInputPromptBindings(
+        renderer, bindings, actions, active_prompt_bindings,
+        previous_controller_instance);
+    const auto analog = analog_navigation.update(menu_sample);
+    const game::CampaignSaveInput input{
+        (pressed & previous_buttons_mask) != 0U || analog.previous,
+        (pressed & next_buttons_mask) != 0U || analog.next,
+        (pressed & confirm_buttons_mask) != 0U || interact_pressed,
+        (pressed & cancel_buttons_mask) != 0U || pause_pressed,
+    };
+    const auto previous_phase = menu.phase();
+    const auto previous_save_selection = menu.saveSelected();
+    const auto previous_overwrite_selection = menu.overwriteSelected();
+    const auto previous_slot = menu.slotSelection();
+    const auto result = menu.update(input, slots);
+    if (input.cancel) {
+      ui_audio.play(detail::PsyCrossUiCue::cancel);
+    } else if (input.confirm) {
+      ui_audio.play(detail::PsyCrossUiCue::confirm);
+    } else if (menu.phase() != previous_phase ||
+               menu.saveSelected() != previous_save_selection ||
+               menu.overwriteSelected() != previous_overwrite_selection ||
+               menu.slotSelection() != previous_slot) {
+      ui_audio.play(detail::PsyCrossUiCue::navigate);
+    }
+    if (result.decision != game::CampaignSaveDecision::none) {
+      return result;
+    }
+
+    // Draw into either a fresh scene or the still-open implicit scene left by
+    // the terminal guest packet. Ending that scene before covering it used to
+    // swap the old, un-faded gameplay backbuffer to the window for one frame.
+    // The ACD renderer starts with an opaque full-screen black tile, so it is
+    // also the correct recovery path for an inherited scene.
+    static_cast<void>(PsyX_BeginScene());
+    renderer.draw(menu, slots);
+    PsyX_EndScene();
+    if (!first_frame_presented) {
+      first_frame_presented = true;
+      PsyX_Log_Info("Campaign save UI first frame presented\n");
+    }
+  }
+}
+
+ControllerMenuSample
+controllerMenuSample(const PsyXControllerSnapshot &snapshot) noexcept {
+  if (snapshot.connected == 0U) {
+    return {};
+  }
+  // Menus must remain usable after either gameplay stick layout is selected.
+  // Collapse both physical sticks to the strongest axis; the stateful menu
+  // navigator below rejects center noise and emits one edge per gesture.
+  const auto axis =
+      dominantControllerMenuAxis(snapshot.analog[0], snapshot.analog[1],
+                                 snapshot.analog[2], snapshot.analog[3]);
+  return ControllerMenuSample{.connected = true,
+                              .instance_id = snapshot.instanceId,
+                              .horizontal = 128U,
+                              .vertical = axis};
+}
+
+ControllerMenuSample updateTitleInputPromptBindings(
+    detail::PsyCrossCampaignSaveRenderer &renderer,
+    const KeyboardMouseBindings &keyboard_bindings,
+    const KeyboardMouseActionSnapshot &keyboard_actions,
+    InputPromptBindings &active_bindings, int &previous_controller_instance) {
+  PsyXControllerSnapshot snapshot{};
+  static_cast<void>(PsyX_Pad_GetControllerSnapshot(0, &snapshot));
+  const auto menu_sample = controllerMenuSample(snapshot);
+  auto keyboard_mouse_activity = false;
+  for (const auto held : keyboard_actions.held) {
+    keyboard_mouse_activity = keyboard_mouse_activity || held;
+  }
+  const auto buttons = static_cast<std::uint16_t>(
+      static_cast<std::uint16_t>(snapshot.buttons[0]) |
+      (static_cast<std::uint16_t>(snapshot.buttons[1]) << 8U));
+  const auto controller_held = static_cast<std::uint16_t>(~buttons);
+  constexpr int prompt_axis_deadzone = 56;
+  const auto axis_offset = static_cast<int>(menu_sample.vertical) - 128;
+  const auto controller_activity = controller_held != 0U ||
+                                   axis_offset < -prompt_axis_deadzone ||
+                                   axis_offset > prompt_axis_deadzone;
+  const auto controller_identity_changed =
+      menu_sample.connected &&
+      snapshot.instanceId != previous_controller_instance;
+  if (!menu_sample.connected || keyboard_mouse_activity) {
+    active_bindings = keyboardMouseInputPromptBindings(keyboard_bindings);
+  } else if (controller_activity || controller_identity_changed ||
+             active_bindings.device == InputPromptDevice::controller) {
+    active_bindings =
+        detail::titleControllerInputPromptBindings(snapshot.family);
+  }
+  renderer.setInputPromptBindings(active_bindings);
+  previous_controller_instance =
+      menu_sample.connected ? snapshot.instanceId : -1;
+  return menu_sample;
+}
+
+std::vector<u_long> packWords(std::span<const std::uint16_t> words) {
+  std::vector<u_long> packed((words.size() + 1U) / 2U);
+  for (std::size_t index = 0; index < words.size(); ++index) {
+    const auto shift = static_cast<unsigned int>((index & 1U) * 16U);
+    packed[index / 2U] |= static_cast<u_long>(words[index]) << shift;
+  }
+  return packed;
+}
+
+RECT16 blockRect(const assets::TimBlock &block) {
+  const auto checked = [](std::uint16_t value) {
+    if (value > static_cast<std::uint16_t>(std::numeric_limits<short>::max())) {
+      throw core::Error{core::ErrorCode::unsupported,
+                        "TIM VRAM coordinate exceeds PsyCross range"};
+    }
+    return static_cast<short>(value);
+  };
+  return RECT16{
+      checked(block.x),
+      checked(block.y),
+      checked(block.width_words),
+      checked(block.height),
+  };
+}
+
+void uploadBlock(const assets::TimBlock &block) {
+  auto rect = blockRect(block);
+  auto packed = packWords(block.words);
+  LoadImage(&rect, packed.data());
+}
+
+int texturePageMode(assets::TimPixelMode mode) {
+  switch (mode) {
+  case assets::TimPixelMode::indexed4:
+    return 0;
+  case assets::TimPixelMode::indexed8:
+    return 1;
+  case assets::TimPixelMode::direct16:
+    return 2;
+  case assets::TimPixelMode::direct24:
+    return 3;
+  }
+  return 2;
+}
+
+void uploadTitleAssets(const game::TitleAssets &assets) {
+  for (const auto &sprite : assets.sprites()) {
+    if (sprite.image.clut()) {
+      uploadBlock(*sprite.image.clut());
+    }
+    uploadBlock(sprite.image.pixels());
+  }
+  DrawSync(0);
+}
+
+void drawTitleSprite(const game::TitleSprite &source, std::uint8_t brightness) {
+  if (source.image.mode() != assets::TimPixelMode::indexed8 ||
+      !source.image.clut()) {
+    throw core::Error{core::ErrorCode::unsupported,
+                      "Title menu sprites must use an 8-bit indexed TIM"};
+  }
+
+  const auto &pixels = source.image.pixels();
+  const auto &clut = *source.image.clut();
+  constexpr unsigned int texture_page_word_width = 64U;
+  constexpr unsigned int texture_page_height = 256U;
+  constexpr unsigned int indexed8_pixels_per_word = 2U;
+  const auto u = static_cast<unsigned int>(pixels.x % texture_page_word_width) *
+                 indexed8_pixels_per_word;
+  const auto v = static_cast<unsigned int>(pixels.y % texture_page_height);
+  const auto width = static_cast<unsigned int>(source.image.displayWidth());
+  const auto height = static_cast<unsigned int>(source.image.displayHeight());
+  if (u + width > 256U || v + height > 256U) {
+    throw core::Error{core::ErrorCode::unsupported,
+                      "Title menu TIM crosses its texture-page boundary"};
+  }
+
+  DR_TPAGE page{};
+  // TITLE.OVL assigns ABR 1 (background + foreground) to all four sprites.
+  // Title sprites are part of the visible 320x240 movie frame. Keep DFE
+  // enabled so PsyCross composes them into the active display target, not its
+  // VRAM-copy offscreen path.
+  SetDrawTPage(&page, 1, 1, GetTPage(1, 1, pixels.x, pixels.y));
+  DrawPrim(&page);
+
+  // TITLE.OVL authored these positions for the regular 384x240 display, but
+  // MOVIE.OVL presents TITLE.STR in a 320x240 target. A raw SPRT kept the
+  // 384-wide coordinates and consequently pushed VIDEO.TIM through the right
+  // edge of the 4:3 movie. Reproject the horizontal layout into the active
+  // movie canvas; FT4 keeps the complete source image while independently
+  // scaling its destination width.
+  constexpr auto title_layout_width = 384U;
+  constexpr auto title_movie_width = 320U;
+  const auto scale_title_x = [](unsigned int value) {
+    return (value * title_movie_width + title_layout_width / 2U) /
+           title_layout_width;
+  };
+  const auto destination_x = scale_title_x(
+      static_cast<unsigned int>(std::max<std::int16_t>(source.x, 0)));
+  const auto destination_width = scale_title_x(width);
+  const auto destination_y =
+      static_cast<unsigned int>(std::max<std::int16_t>(source.y, 0));
+
+  POLY_FT4 sprite{};
+  setPolyFT4(&sprite);
+  setSemiTrans(&sprite, 1);
+  setRGB0(&sprite, brightness, brightness, brightness);
+  sprite.tpage = GetTPage(1, 1, pixels.x, pixels.y);
+  sprite.clut = GetClut(clut.x, clut.y);
+  setXY4(&sprite, static_cast<float>(destination_x),
+         static_cast<float>(destination_y),
+         static_cast<float>(destination_x + destination_width),
+         static_cast<float>(destination_y), static_cast<float>(destination_x),
+         static_cast<float>(destination_y + height),
+         static_cast<float>(destination_x + destination_width),
+         static_cast<float>(destination_y + height));
+  setUV4(&sprite, static_cast<u_char>(u), static_cast<u_char>(v),
+         static_cast<u_char>(u + width), static_cast<u_char>(v),
+         static_cast<u_char>(u), static_cast<u_char>(v + height),
+         static_cast<u_char>(u + width), static_cast<u_char>(v + height));
+  DrawPrim(&sprite);
+}
+
+class ControllerSettingsPersistence final {
+public:
+  ControllerSettingsPersistence(
+      GraphicsSettings &graphics,
+      const ControllerSettingsCommitCallback &callback) noexcept
+      : graphics_(graphics), callback_(callback) {}
+
+  [[nodiscard]] bool commit(const ControllerButtonBindings &bindings,
+                            bool vibration) noexcept {
+    graphics_.controller_bindings = bindings;
+    graphics_.controller_vibration = vibration;
+    return persistCurrent();
+  }
+
+  void retry() noexcept {
+    if (!pending_) {
+      return;
+    }
+    if (!persistCurrent()) {
+      PsyX_Log_Warning("Controller settings persistence remains pending\n");
+    }
+  }
+
+private:
+  [[nodiscard]] bool persistCurrent() noexcept {
+    if (!callback_) {
+      pending_ = false;
+      return true;
+    }
+    try {
+      pending_ = !callback_(graphics_.controller_bindings,
+                            graphics_.controller_vibration);
+    } catch (...) {
+      pending_ = true;
+    }
+    return !pending_;
+  }
+
+  GraphicsSettings &graphics_;
+  const ControllerSettingsCommitCallback &callback_;
+  bool pending_{};
+};
+
+class PsyCrossTitleHost final : public Host {
+public:
+  PsyCrossTitleHost(std::string title, game::TitleAssets assets,
+                    game::TitleMovies movies,
+                    game::MissionPackage initial_mission,
+                    std::filesystem::path cue_path,
+                    std::string supported_game_serial,
+                    GraphicsSettings graphics, KeyboardMouseBindings input,
+                    game::RetailCheatState cheats,
+                    ControllerSettingsCommitCallback controller_settings_commit)
+      : title_(title.begin(), title.end()), assets_(std::move(assets)),
+        movies_(std::move(movies)),
+        initial_mission_(std::move(initial_mission)),
+        cue_path_(std::move(cue_path)),
+        supported_game_serial_(std::move(supported_game_serial)),
+        graphics_(graphics), input_(input), cheats_(cheats),
+        controller_settings_commit_(std::move(controller_settings_commit)) {
+    title_.push_back('\0');
+  }
+
+  void run() override {
+    ControllerSettingsPersistence controller_settings_persistence{
+        graphics_, controller_settings_commit_};
+    configureGraphics(graphics_);
+    configureControllerProtocol(graphics_.controller_protocol);
+    PsyX_Initialise(title_.data(), graphics_.width, graphics_.height, 0);
+    configurePresentation(graphics_);
+    [[maybe_unused]] detail::PsyCrossWindowMode window_mode{
+        graphics_.fullscreen};
+    configureInput();
+    detail::configurePsyCrossVideoMode(detail::gameplay_video_mode, true);
+
+    uploadTitleAssets(assets_);
+    configureTitleNotice();
+    const auto save_location =
+        game::defaultTitleSaveLocation(cue_path_, supported_game_serial_);
+    const auto migration = game::migrateLegacyTitleSaveSlotsFile(save_location);
+    if (migration == game::TitleSaveMigrationStatus::migrated) {
+      PsyX_Log_Info("Migrated campaign save to the user-data directory\n");
+    } else if (migration == game::TitleSaveMigrationStatus::failed) {
+      PsyX_Log_Error("Legacy campaign save migration failed\n");
+    }
+    const auto &save_path = save_location.primary;
+    menu_.setSaveSlots(loadTitleSaveSlots(save_path));
+    PADRAW pad{};
+    PadInitDirect(reinterpret_cast<unsigned char *>(&pad), nullptr);
+    PadStartCom();
+
+    std::uint16_t previous_buttons = 0xffffU;
+    bool title_keyboard_initialized{};
+    bool title_interact_was_down{};
+    bool title_pause_was_down{};
+    detail::PsyCrossUiAudio ui_audio{cue_path_};
+    detail::PsyCrossMoviePlayer movie_player;
+    auto active_title_prompt_bindings =
+        keyboardMouseInputPromptBindings(input_);
+    auto previous_title_controller_instance = -1;
+    detail::PsyCrossCampaignSaveRenderer title_load_renderer{initial_mission_,
+                                                             input_};
+    const detail::MovieOverlayCallbacks overlay{
+        [this, &pad, &ui_audio, &title_keyboard_initialized,
+         &title_interact_was_down, &title_pause_was_down, &title_load_renderer,
+         &active_title_prompt_bindings, &previous_title_controller_instance](
+            std::uint16_t pressed, std::uint32_t movie_frame) {
+          ui_audio.update();
+          const auto actions = sampleHostKeyboardMouseActions(input_);
+          const auto interact_down = actions[KeyboardMouseAction::interact];
+          const auto pause_down = actions[KeyboardMouseAction::pause];
+          const auto interact_pressed = title_keyboard_initialized &&
+                                        interact_down &&
+                                        !title_interact_was_down;
+          const auto pause_pressed =
+              title_keyboard_initialized && pause_down && !title_pause_was_down;
+          title_keyboard_initialized = true;
+          title_interact_was_down = interact_down;
+          title_pause_was_down = pause_down;
+          const auto menu_sample = updateTitleInputPromptBindings(
+              title_load_renderer, input_, actions,
+              active_title_prompt_bindings, previous_title_controller_instance);
+          const auto analog = title_menu_navigation_.update(menu_sample);
+          const game::TitleInput input{
+              .previous = (pressed & (0x80U | 0x10U)) != 0 || analog.previous,
+              .next = (pressed & (0x20U | 0x40U)) != 0 || analog.next,
+              .confirm = (pressed & (0x4000U | 0x8000U | 0x08U)) != 0 ||
+                         interact_pressed,
+              .cancel = (pressed & (0x2000U | 0x01U)) != 0 || pause_pressed,
+              .confirm_down = ((~readHostButtons(pad)) &
+                               (0x4000U | 0x8000U | 0x08U)) != 0U ||
+                              interact_down,
+          };
+          const auto previous_selection = menu_.selection();
+          const auto previous_phase = menu_.phase();
+          const auto previous_slot = menu_.loadSlotSelection();
+          const auto previous_difficulty = menu_.difficultySelection();
+          const auto command = menu_.update(input, movie_frame);
+          if ((previous_phase == game::TitlePhase::load_slots ||
+               previous_phase == game::TitlePhase::select_difficulty ||
+               previous_phase == game::TitlePhase::agent_warning) &&
+              menu_.phase() == game::TitlePhase::menu) {
+            // The retail font atlas shares VRAM pages with TITLE.HOG. Restore
+            // the title sprites before returning from a font-backed picker.
+            uploadTitleAssets(assets_);
+          }
+          if (input.cancel) {
+            ui_audio.play(detail::PsyCrossUiCue::cancel);
+          } else if (input.confirm && (command != game::TitleCommand::none ||
+                                       menu_.phase() != previous_phase)) {
+            ui_audio.play(detail::PsyCrossUiCue::confirm);
+          } else if (menu_.selection() != previous_selection ||
+                     menu_.loadSlotSelection() != previous_slot ||
+                     menu_.difficultySelection() != previous_difficulty) {
+            ui_audio.play(detail::PsyCrossUiCue::navigate);
+          }
+          if (command == game::TitleCommand::exit ||
+              command == game::TitleCommand::new_game ||
+              command == game::TitleCommand::load_game ||
+              command == game::TitleCommand::training_video) {
+            selected_command_ = command;
+            PsyX_Log_Info("Title command accepted: %s\n",
+                          game::titleCommandName(command).data());
+            return false;
+          }
+          return true;
+        },
+        [this, &title_load_renderer] {
+          if (menu_.phase() == game::TitlePhase::load_slots) {
+            title_load_renderer.drawLoadSlots(menu_.saveSlots(),
+                                              menu_.loadSlotSelection());
+          } else if (menu_.phase() == game::TitlePhase::select_difficulty) {
+            title_load_renderer.drawDifficultySelection(menu_);
+          } else if (menu_.phase() == game::TitlePhase::agent_warning) {
+            title_load_renderer.drawAgentModeWarning();
+          } else {
+            for (std::size_t index = 0; index < game::TitleMenu::visual_count;
+                 ++index) {
+              const auto visual = static_cast<game::TitleVisual>(index);
+              const auto brightness = menu_.brightness(visual);
+              if (brightness != 0) {
+                drawTitleSprite(assets_.sprite(visual), brightness);
+              }
+            }
+          }
+        },
+        [this]() -> const game::DiscMovie * {
+          if (selected_command_ == game::TitleCommand::new_game &&
+              !initial_mission_.openingMovie().path.empty()) {
+            return &initial_mission_.openingMovie();
+          }
+          if (selected_command_ == game::TitleCommand::training_video) {
+            return &movies_.trainingMovie();
+          }
+          return nullptr;
+        },
+    };
+    auto play_startup_movies = true;
+    for (;;) {
+      selected_command_ = game::TitleCommand::none;
+      // Baseline the first live title frame. A stick held through startup,
+      // training video, or a return from gameplay must be released before it
+      // can move the selection.
+      title_menu_navigation_.reset();
+      previous_buttons = movie_player.play(movies_, pad, previous_buttons,
+                                           overlay, play_startup_movies);
+      if (selected_command_ == game::TitleCommand::training_video) {
+        menu_.completeSearch();
+        play_startup_movies = false;
+        continue;
+      }
+      play_startup_movies = false;
+
+      if (selected_command_ != game::TitleCommand::new_game &&
+          selected_command_ != game::TitleCommand::load_game) {
+        break;
+      }
+      auto save_slots = menu_.saveSlots();
+      const auto title_played_opening_movie =
+          selected_command_ == game::TitleCommand::new_game &&
+          !initial_mission_.openingMovie().path.empty();
+      std::optional<game::CampaignProgress> campaign;
+      auto campaign_carry = std::optional<game::CampaignCarryState>{};
+      if (selected_command_ == game::TitleCommand::load_game) {
+        campaign = game::CampaignProgress::resume(save_slots,
+                                                  menu_.loadSlotSelection());
+        if (!campaign) {
+          PsyX_Log_Error("Load Game rejected invalid selected slot\n");
+          uploadTitleAssets(assets_);
+          configureTitleNotice();
+          menu_.setSaveSlots(loadTitleSaveSlots(save_path));
+          continue;
+        }
+        PsyX_Log_Info("Load Game: slot=%zu mission=%u\n",
+                      *campaign->saveSlot() + 1U, campaign->missionIndex());
+        campaign_carry = save_slots[*campaign->saveSlot()].carry;
+      } else {
+        campaign = game::CampaignProgress::startUnsaved(
+            initial_mission_.definition().index, title_played_opening_movie,
+            menu_.selectedDifficulty());
+        if (!campaign) {
+          PsyX_Log_Error("New Game rejected an invalid campaign cursor\n");
+          uploadTitleAssets(assets_);
+          configureTitleNotice();
+          menu_.setSaveSlots(loadTitleSaveSlots(save_path));
+          continue;
+        }
+        PsyX_Log_Info(
+            "New Game FMV complete; opening unsaved mission %u "
+            "on %s difficulty\n",
+            campaign->missionIndex() + 1U,
+            game::campaignDifficultyDisplayName(campaign->difficulty()).data());
+      }
+      controller_settings_persistence.retry();
+      detail::PsyCrossMissionStart mission_start;
+      const auto commit_controller_settings =
+          [&controller_settings_persistence](
+              const ControllerButtonBindings &bindings, bool vibration) {
+            return controller_settings_persistence.commit(bindings, vibration);
+          };
+      detail::PsyCrossSceneViewer scene_viewer{input_,
+                                               cheats_,
+                                               campaign->difficulty(),
+                                               graphics_.controller_bindings,
+                                               graphics_.controller_vibration,
+                                               commit_controller_settings};
+      std::optional<game::MissionPackage> loaded_mission;
+      auto exit_application = false;
+      while (campaign->active()) {
+        const auto mission_index = campaign->missionIndex();
+        game::MissionPackage *mission{};
+        if (mission_index == initial_mission_.definition().index) {
+          mission = &initial_mission_;
+        } else {
+          auto disc = game::GameDisc::open(cue_path_);
+          loaded_mission.emplace(
+              game::MissionPackage::load(disc, mission_index));
+          mission = &*loaded_mission;
+        }
+        if (campaign->pendingEndingMovieMission()) {
+          PsyX_Log_Info("Recovering interrupted EOL for mission %u\n",
+                        mission_index + 1U);
+          if (!mission->endingMovie().path.empty()) {
+            previous_buttons = movie_player.playStandalone(
+                mission->endingMovie(), pad, previous_buttons,
+                endingMovieSkipPolicy(mission->definition()));
+          }
+          auto candidate_campaign = *campaign;
+          auto candidate_slots = save_slots;
+          const auto advance =
+              candidate_campaign.completeMission(candidate_slots);
+          if (advance == game::CampaignAdvance::invalid) {
+            PsyX_Log_Error("Pending EOL transition is inconsistent\n");
+            break;
+          }
+          const auto store_decision = storeTitleSaveSlotsWithRecovery(
+              save_path, candidate_slots, pad, previous_buttons, input_);
+          if (store_decision == SaveStoreDecision::return_to_title) {
+            break;
+          }
+          *campaign = candidate_campaign;
+          save_slots = candidate_slots;
+          campaign_carry = campaign->saveSlot()
+                               ? save_slots[*campaign->saveSlot()].carry
+                               : std::nullopt;
+          if (advance == game::CampaignAdvance::campaign_complete) {
+            PsyX_Log_Info("Campaign complete\n");
+            break;
+          }
+          continue;
+        }
+        if (campaign->openingMovieRequired(mission->definition())) {
+          previous_buttons = movie_player.playStandalone(
+              mission->openingMovie(), pad, previous_buttons);
+        }
+        campaign->markOpeningMovieHandled();
+        // Every campaign entry owns a mission-start loading boundary. DLFs
+        // with authored directive text use it verbatim; continuation maps use
+        // their catalog title instead of silently skipping the briefing UI.
+        previous_buttons = mission_start.run(
+            *mission, pad, previous_buttons, input_, campaign_carry,
+            campaign->difficulty() == game::CampaignDifficulty::agent);
+
+        const auto &definition = mission->definition();
+        std::cout << "Starting mission " << (definition.index + 1U) << ": "
+                  << definition.title << " [" << definition.resource_name
+                  << "]\nMounted " << mission->archive().entries().size()
+                  << " FOG files, " << mission->textureFileCount()
+                  << " textures and " << mission->worldModelCount()
+                  << " world models\n";
+        const auto scene_result =
+            scene_viewer.run(*mission, pad, previous_buttons, cue_path_,
+                             campaign->maximumUnlockedMission(),
+                             mission_start.takePreloadedGameplay(),
+                             mission_start.takePreloadedAudio());
+        controller_settings_persistence.retry();
+        previous_buttons = scene_result.previous_buttons;
+        if (scene_result.reason == detail::SceneExitReason::mission_selected &&
+            scene_result.selected_mission) {
+          const auto selected = *scene_result.selected_mission;
+          if (!campaign->selectUnlockedMission(selected)) {
+            // Reaching this branch requires the explicit all-missions cheat;
+            // normal mission selection can never move beyond the high-water
+            // mark of the loaded save.
+            auto replacement = game::CampaignProgress::startUnsaved(
+                selected, false, campaign->difficulty());
+            if (!replacement) {
+              PsyX_Log_Error("Pause mission selection rejected mission %u\n",
+                             selected + 1U);
+              break;
+            }
+            campaign = std::move(replacement);
+          }
+          campaign_carry.reset();
+          loaded_mission.reset();
+          PsyX_Log_Info("Pause mission selection: mission=%u\n", selected + 1U);
+          continue;
+        }
+        if (scene_result.reason == detail::SceneExitReason::mission_complete) {
+          const auto next_mission = mission_index + 1U;
+          const auto carry_for_next =
+              game::campaignMissionsShareCarry(mission_index, next_mission)
+                  ? scene_result.carry
+                  : std::nullopt;
+          if (game::campaignMissionsShareCarry(mission_index, next_mission) &&
+              !carry_for_next) {
+            // A terminal overlay can retire its live inventory table before
+            // the native host observes the EOL request. The scene viewer
+            // normally supplies its last coherent snapshot; if even that is
+            // unavailable, continuing with mission defaults is safer than
+            // tearing down the entire campaign and returning to title.
+            PsyX_Log_Warning(
+                "Campaign transition has no coherent player carry; "
+                "continuing with mission defaults\n");
+          }
+          const auto save_result = runCampaignSaveMenu(
+              *mission, save_slots, pad, previous_buttons, ui_audio, input_);
+          auto completion_is_saved = false;
+          if (save_result.decision == game::CampaignSaveDecision::save &&
+              save_result.slot) {
+            auto staged_campaign = *campaign;
+            auto staged_slots = save_slots;
+            if (!staged_campaign.stageMissionCompletionInSlot(
+                    staged_slots, *save_result.slot, carry_for_next)) {
+              PsyX_Log_Error("Campaign save transaction rejected state\n");
+              break;
+            }
+            // The selected slot remains on this mission with a pending EOL.
+            // A shutdown during the following movie therefore resumes the
+            // exact retail handoff instead of skipping it.
+            const auto store_decision = storeTitleSaveSlotsWithRecovery(
+                save_path, staged_slots, pad, previous_buttons, input_);
+            if (store_decision == SaveStoreDecision::return_to_title) {
+              break;
+            }
+            if (store_decision == SaveStoreDecision::stored) {
+              *campaign = staged_campaign;
+              save_slots = staged_slots;
+              completion_is_saved = true;
+            }
+          }
+          if (!mission->endingMovie().path.empty()) {
+            previous_buttons = movie_player.playStandalone(
+                mission->endingMovie(), pad, previous_buttons,
+                endingMovieSkipPolicy(mission->definition()));
+          }
+
+          auto candidate_campaign = *campaign;
+          auto candidate_slots = save_slots;
+          const auto advance =
+              completion_is_saved
+                  ? candidate_campaign.completeMission(candidate_slots)
+                  : candidate_campaign.completeMissionWithoutSaving();
+          if (advance == game::CampaignAdvance::invalid) {
+            PsyX_Log_Error("Campaign transition rejected inconsistent state\n");
+            break;
+          }
+          if (completion_is_saved) {
+            const auto store_decision = storeTitleSaveSlotsWithRecovery(
+                save_path, candidate_slots, pad, previous_buttons, input_);
+            if (store_decision == SaveStoreDecision::return_to_title) {
+              break;
+            }
+          }
+          *campaign = candidate_campaign;
+          save_slots = candidate_slots;
+          campaign_carry = advance == game::CampaignAdvance::next_mission
+                               ? carry_for_next
+                               : std::nullopt;
+          if (advance == game::CampaignAdvance::campaign_complete) {
+            PsyX_Log_Info("Campaign complete\n");
+            break;
+          }
+          continue;
+        }
+        exit_application =
+            scene_result.reason == detail::SceneExitReason::exit_application;
+        break;
+      }
+      if (exit_application) {
+        break;
+      }
+      uploadTitleAssets(assets_);
+      configureTitleNotice();
+      menu_.completeSearch();
+      menu_.setSaveSlots(loadTitleSaveSlots(save_path));
+    }
+    PadStopCom();
+  }
+
+private:
+  std::vector<char> title_;
+  game::TitleAssets assets_;
+  game::TitleMovies movies_;
+  game::MissionPackage initial_mission_;
+  std::filesystem::path cue_path_;
+  std::string supported_game_serial_;
+  game::TitleMenu menu_;
+  game::TitleCommand selected_command_{game::TitleCommand::none};
+  ControllerMenuNavigator title_menu_navigation_;
+  GraphicsSettings graphics_;
+  KeyboardMouseBindings input_;
+  game::RetailCheatState cheats_;
+  ControllerSettingsCommitCallback controller_settings_commit_;
+};
+
+class PsyCrossSceneHost final : public Host {
+public:
+  PsyCrossSceneHost(std::string title, game::MissionPackage mission,
+                    std::filesystem::path cue_path, GraphicsSettings graphics,
+                    KeyboardMouseBindings input, game::RetailCheatState cheats,
+                    ControllerSettingsCommitCallback controller_settings_commit)
+      : title_(title.begin(), title.end()), mission_(std::move(mission)),
+        cue_path_(std::move(cue_path)), graphics_(graphics), input_(input),
+        cheats_(cheats),
+        controller_settings_commit_(std::move(controller_settings_commit)) {
+    title_.push_back('\0');
+  }
+
+  void run() override {
+    ControllerSettingsPersistence controller_settings_persistence{
+        graphics_, controller_settings_commit_};
+    configureGraphics(graphics_);
+    configureControllerProtocol(graphics_.controller_protocol);
+    PsyX_Initialise(title_.data(), graphics_.width, graphics_.height, 0);
+    configurePresentation(graphics_);
+    [[maybe_unused]] detail::PsyCrossWindowMode window_mode{
+        graphics_.fullscreen};
+    configureInput();
+    detail::configurePsyCrossVideoMode(detail::gameplay_video_mode, true);
+
+    PADRAW pad{};
+    PadInitDirect(reinterpret_cast<unsigned char *>(&pad), nullptr);
+    PadStartCom();
+    detail::PsyCrossMoviePlayer movie_player;
+    auto previous_buttons = std::uint16_t{0xffffU};
+    if (!mission_.openingMovie().path.empty()) {
+      previous_buttons = movie_player.playStandalone(mission_.openingMovie(),
+                                                     pad, previous_buttons);
+    }
+    detail::PsyCrossMissionStart mission_start;
+    previous_buttons =
+        mission_start.run(mission_, pad, previous_buttons, input_);
+    controller_settings_persistence.retry();
+    const auto commit_controller_settings =
+        [&controller_settings_persistence](
+            const ControllerButtonBindings &bindings, bool vibration) {
+          return controller_settings_persistence.commit(bindings, vibration);
+        };
+    detail::PsyCrossSceneViewer scene_viewer{input_,
+                                             cheats_,
+                                             game::CampaignDifficulty::original,
+                                             graphics_.controller_bindings,
+                                             graphics_.controller_vibration,
+                                             commit_controller_settings};
+    const auto result = scene_viewer.run(mission_, pad, previous_buttons,
+                                         cue_path_, mission_.definition().index,
+                                         mission_start.takePreloadedGameplay(),
+                                         mission_start.takePreloadedAudio());
+    controller_settings_persistence.retry();
+    if (result.reason == detail::SceneExitReason::mission_complete &&
+        !mission_.endingMovie().path.empty()) {
+      static_cast<void>(movie_player.playStandalone(
+          mission_.endingMovie(), pad, result.previous_buttons,
+          endingMovieSkipPolicy(mission_.definition())));
+    }
+    PadStopCom();
+  }
+
+private:
+  std::vector<char> title_;
+  game::MissionPackage mission_;
+  std::filesystem::path cue_path_;
+  GraphicsSettings graphics_;
+  KeyboardMouseBindings input_;
+  game::RetailCheatState cheats_;
+  ControllerSettingsCommitCallback controller_settings_commit_;
+};
+
+} // namespace
+std::unique_ptr<Host> createPsyCrossRuntimeHost(
+    std::string title, RuntimeFrameCallback frame,
+    RuntimeGpuFrameCallback gpu_frame, GraphicsSettings graphics,
+    KeyboardMouseBindings input,
+    MohUndergroundRuntimeActionBindings runtime_actions,
+    RuntimeAudioDrainCallback audio,
+    RuntimeGraphicsDiagnosticCallback graphics_diagnostics) {
+  return std::make_unique<PsyCrossHost>(
+      std::move(title), graphics, std::move(frame), std::move(gpu_frame),
+      std::move(input), std::move(runtime_actions), std::move(audio),
+      std::move(graphics_diagnostics));
+}
+
+std::unique_ptr<Host> createPsyCrossHost(std::string title,
+                                         GraphicsSettings graphics) {
+  return std::make_unique<PsyCrossHost>(std::move(title), graphics);
+}
+
+std::unique_ptr<Host> createPsyCrossTitleHost(
+    std::string title, game::TitleAssets assets, game::TitleMovies movies,
+    game::MissionPackage initial_mission, std::filesystem::path cue_path,
+    std::string supported_game_serial, GraphicsSettings graphics,
+    KeyboardMouseBindings input, game::RetailCheatState cheats,
+    ControllerSettingsCommitCallback controller_settings_commit) {
+  return std::make_unique<PsyCrossTitleHost>(
+      std::move(title), std::move(assets), std::move(movies),
+      std::move(initial_mission), std::move(cue_path),
+      std::move(supported_game_serial), graphics, input, cheats,
+      std::move(controller_settings_commit));
+}
+
+std::unique_ptr<Host> createPsyCrossSceneHost(
+    std::string title, game::MissionPackage mission,
+    std::filesystem::path cue_path, GraphicsSettings graphics,
+    KeyboardMouseBindings input, game::RetailCheatState cheats,
+    ControllerSettingsCommitCallback controller_settings_commit) {
+  return std::make_unique<PsyCrossSceneHost>(
+      std::move(title), std::move(mission), std::move(cue_path), graphics,
+      input, cheats, std::move(controller_settings_commit));
+}
+
+} // namespace sf::platform

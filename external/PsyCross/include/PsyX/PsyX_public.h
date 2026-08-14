@@ -1,0 +1,218 @@
+#ifndef EMULATOR_PUBLIC_H
+#define EMULATOR_PUBLIC_H
+
+#define CONTROLLER_MAP_FLAG_AXIS 0x4000
+#define CONTROLLER_MAP_FLAG_INVERSE 0x8000
+
+typedef struct {
+  int id;
+
+  int kc_square, kc_circle, kc_triangle, kc_cross;
+
+  int kc_l1, kc_l2, kc_l3;
+  int kc_r1, kc_r2, kc_r3;
+
+  int kc_start, kc_select;
+
+  int kc_dpad_left, kc_dpad_right, kc_dpad_up, kc_dpad_down;
+} PsyXKeyboardMapping;
+
+typedef struct {
+  int id;
+
+  // you can bind axis by adding CONTROLLER_MAP_AXIS_FLAG
+  int gc_square, gc_circle, gc_triangle, gc_cross;
+
+  int gc_l1, gc_l2, gc_l3;
+  int gc_r1, gc_r2, gc_r3;
+
+  int gc_start, gc_select;
+
+  int gc_dpad_left, gc_dpad_right, gc_dpad_up, gc_dpad_down;
+
+  int gc_axis_left_x, gc_axis_left_y;
+  int gc_axis_right_x, gc_axis_right_y;
+} PsyXControllerMapping;
+
+typedef void (*GameDebugKeysHandlerFunc)(int nKey, char down);
+typedef void (*GameDebugMouseHandlerFunc)(int x, int y, int dx, int dy);
+typedef void (*GameOnTextInputHandler)(const char *buf);
+
+typedef enum {
+  PSYX_ASPECT_ORIGINAL_4_3 = 0,
+  PSYX_ASPECT_ADAPTIVE = 1,
+} PsyXAspectMode;
+
+typedef struct {
+  int x;
+  int y;
+  int w;
+  int h;
+} PsyXPresentationViewport;
+
+typedef struct {
+  float x;
+  float y;
+} PsyXPresentationScale;
+
+typedef enum {
+  PSYX_CONTROLLER_FAMILY_UNKNOWN = 0,
+  PSYX_CONTROLLER_FAMILY_GENERIC,
+  PSYX_CONTROLLER_FAMILY_XBOX,
+  PSYX_CONTROLLER_FAMILY_PLAYSTATION,
+  PSYX_CONTROLLER_FAMILY_NINTENDO,
+} PsyXControllerFamily;
+
+typedef struct {
+  unsigned char connected;
+  unsigned char rumbleSupported;
+  unsigned char buttons[2];
+  unsigned char analog[4];
+  int family;
+  int type;
+  int instanceId;
+} PsyXControllerSnapshot;
+
+//------------------------------------------------------------------------
+
+#if defined(_LANGUAGE_C_PLUS_PLUS) || defined(__cplusplus) ||                  \
+    defined(c_plusplus)
+extern "C" {
+#endif
+/* Mapped inputs */
+extern PsyXControllerMapping g_cfg_controllerMapping;
+extern PsyXKeyboardMapping g_cfg_keyboardMapping;
+extern int g_cfg_controllerToSlotMapping[2];
+
+/* Game inputs */
+extern GameOnTextInputHandler g_cfg_gameOnTextInput;
+
+/* Graphics configuration */
+extern int g_cfg_swapInterval;
+extern int g_cfg_pgxpZBuffer;
+extern int g_cfg_bilinearFiltering;
+extern int g_cfg_trilinearFiltering;
+extern int g_cfg_anisotropicFiltering;
+extern int g_cfg_smaa;
+extern int g_cfg_fxaa;
+extern int g_cfg_volumetricFog;
+extern int g_cfg_volumetricEffects;
+extern int g_cfg_pgxpTextureCorrection;
+extern int g_cfg_msaaSamples;
+extern int g_cfg_aspectMode;
+/* Raw guest scanout is already a fully composed frame even at native 1x.
+ * Keep its fallback and retained presentation transforms identical. */
+extern int g_cfg_composedGuestScanout;
+/* Applies SMAA after a raw guest offscreen pass is closed, immediately
+ * before the completed native target is presented. */
+extern int g_cfg_smaaFinalFrame;
+extern int g_cfg_fxaaFinalFrame;
+/* Native color/depth target size. Kept separate from the output drawable so
+ * fullscreen and high-DPI presentation do not silently override the user's
+ * selected internal resolution. */
+extern int g_cfg_renderWidth, g_cfg_renderHeight;
+/* Native clients can opt out of legacy display-to-VRAM feedback. */
+extern int g_cfg_framebufferFeedback;
+/* Native clients with their own fixed-step clock do not need the PSX VBlank
+ * thread. */
+extern int g_cfg_vblankThread;
+
+/* Debug inputs */
+extern GameDebugKeysHandlerFunc g_dbg_gameDebugKeys;
+extern GameDebugMouseHandlerFunc g_dbg_gameDebugMouse;
+
+/* Usually called at the beginning of main function */
+extern void PsyX_Initialise(char *windowName, int screenWidth, int screenHeight,
+                            int fullscreen);
+
+/* Cleans all resources and closes open instances */
+extern void PsyX_Shutdown(void);
+
+/* Returns the screen size dimensions */
+extern void PsyX_GetScreenSize(int *screenWidth, int *screenHeight);
+
+/* Resolves original 4:3 letterboxing or a full adaptive output viewport. */
+extern PsyXPresentationViewport
+PsyX_CalculatePresentationViewport(int drawableWidth, int drawableHeight,
+                                   int aspectMode);
+
+/* Fits the selected internal target into the output without changing pixel
+ * aspect. Original content remains 4:3; adaptive content keeps the selected
+ * render-resolution aspect. */
+extern PsyXPresentationViewport
+PsyX_CalculateOutputViewport(int drawableWidth, int drawableHeight,
+                             int renderWidth, int renderHeight, int aspectMode);
+
+/* Resolves a logical guest draw rectangle into the stable selected-resolution
+ * target. Full 320x240 and 512x240 pages therefore occupy identical pixel
+ * extents while contained clips retain proportional edge mapping. */
+extern PsyXPresentationViewport PsyX_CalculateGuestRenderExtent(
+    int outputWidth, int outputHeight, int aspectMode, int logicalWidth,
+    int logicalHeight, int canonicalWidth, int canonicalHeight, int rootPage);
+
+/* Preserves the authored 4:3 pixel aspect: Hor+ for wide adaptive outputs,
+ *
+ * Vert+ for narrow adaptive outputs, and identity for original mode. */
+extern PsyXPresentationScale PsyX_CalculatePresentationScale(int drawableWidth,
+                                                             int drawableHeight,
+                                                             int aspectMode);
+
+/* Sets mouse cursor position */
+extern void PsyX_SetCursorPosition(int x, int y);
+
+/* Sets mouse relative movement */
+extern void PsyX_SetCursorRelative(int enable);
+
+/* Usually called after ClearOTag/ClearOTagR */
+extern char PsyX_BeginScene(void);
+
+/* Usually called after DrawOTag/DrawOTagEnv */
+extern void PsyX_EndScene(void);
+
+/* Counts calls and returns the most recent one-second frame-rate sample. */
+extern unsigned int PsyX_CalcFPS(void);
+
+/* Explicitly updates emulator input loop */
+extern void PsyX_UpdateInput(void);
+
+/* Copies the latest physical-controller state for a pad slot. Buttons use
+ * active-low PlayStation bits; analog order is RH, RV, LH, LV. */
+extern int PsyX_Pad_GetControllerSnapshot(int slot,
+                                          PsyXControllerSnapshot *snapshot);
+
+/* Reports and controls rumble for the physical controller in a pad slot. */
+extern int PsyX_Pad_HasRumble(int slot);
+extern int PsyX_Pad_SetRumble(int slot, unsigned short low16,
+                              unsigned short high16, unsigned int duration_ms);
+extern void PsyX_Pad_StopRumble(int slot);
+
+/* Returns keyboard mapping index */
+extern int PsyX_LookupKeyboardMapping(const char *str, int default_value);
+
+/* Returns controller mapping index */
+extern int PsyX_LookupGameControllerMapping(const char *str, int default_value);
+
+/* Screen size of emulated PSX viewport with widescreen offsets */
+extern void PsyX_GetPSXWidescreenMappedViewport(struct _RECT16 *rect);
+
+/* Waits for timer */
+extern void PsyX_WaitForTimestep(int count);
+
+/* Changes swap interval state */
+extern void PsyX_EnableSwapInterval(int enable);
+
+/* Changes the OpenGL swap interval used when synchronization is enabled. */
+extern void PsyX_SetSwapInterval(int interval);
+
+/* Caps completed presents. Zero disables the software frame limiter. */
+extern void PsyX_SetFrameLimit(int framesPerSecond);
+
+/* Re-anchors pacing after a blocking load, movie or display-mode change. */
+extern void PsyX_ResetFrameLimiter(void);
+
+#if defined(_LANGUAGE_C_PLUS_PLUS) || defined(__cplusplus) ||                  \
+    defined(c_plusplus)
+}
+#endif
+
+#endif
