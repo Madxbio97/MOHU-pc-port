@@ -148,6 +148,7 @@ sf_set_project_warnings(sf_game)
 
 add_library(mohu_runtime
     src/mohu/gpu_command_stream.cpp
+    src/mohu/gpu_primitive_matcher.cpp
     src/mohu/runtime.cpp
 )
 add_library(mohu::runtime ALIAS mohu_runtime)
@@ -245,7 +246,8 @@ if(SF_ENABLE_PSYCROSS)
     target_compile_features(sf_psycross_backend PUBLIC cxx_std_20)
     target_link_libraries(sf_psycross_backend
         PUBLIC sf::game sf::platform_input
-        PRIVATE sf::media psycross_static OpenAL::OpenAL OpenGL::GL SDL2::SDL2)
+        PRIVATE mohu::runtime sf::media psycross_static OpenAL::OpenAL
+                OpenGL::GL SDL2::SDL2)
     sf_set_project_warnings(sf_psycross_backend)
 
     target_link_libraries(mohu_gameplay_probe

@@ -16,9 +16,89 @@ struct PgxpDrawContext {
   std::uint32_t draw_area_top_left{};
   std::uint32_t draw_area_bottom_right{};
   std::uint32_t draw_offset{};
+  std::uint32_t mask_setting{};
 
   friend bool operator==(const PgxpDrawContext &,
                          const PgxpDrawContext &) = default;
+};
+
+struct PresentationReplayDrawTarget {
+  std::uint16_t x{};
+  std::uint16_t y{};
+  std::uint16_t width{};
+  std::uint16_t height{};
+
+  friend bool operator==(const PresentationReplayDrawTarget &,
+                         const PresentationReplayDrawTarget &) = default;
+};
+
+enum class PresentationReplayEventKind : std::uint8_t {
+  draw,
+  clear,
+};
+
+struct PresentationReplayDrawEvent {
+  PresentationReplayEventKind kind{PresentationReplayEventKind::draw};
+  std::size_t word_offset{};
+  std::size_t word_count{};
+  std::size_t projection_offset{};
+  std::size_t projection_count{};
+  std::size_t dma_source_offset{};
+  std::size_t dma_source_count{};
+  PgxpDrawContext draw_context{};
+  std::uint32_t texture_window{};
+  bool precise_candidate{};
+  bool allow_perspective{};
+  bool allow_precise_screen{};
+  bool use_projective_depth{};
+};
+
+struct PresentationReplayDrawPage {
+  PresentationReplayDrawTarget target{};
+  std::vector<std::uint32_t> word_storage;
+  std::vector<psx::GteProjectedVertex> projection_storage;
+  std::vector<psx::GpuDmaWordSource> dma_source_storage;
+  std::vector<PresentationReplayDrawEvent> events;
+
+  [[nodiscard]] std::span<const std::uint32_t>
+  commandWords(const PresentationReplayDrawEvent &event) const noexcept {
+    return event.word_offset <= word_storage.size() &&
+                   event.word_count <= word_storage.size() - event.word_offset
+               ? std::span<const std::uint32_t>{word_storage}.subspan(
+                     event.word_offset, event.word_count)
+               : std::span<const std::uint32_t>{};
+  }
+  [[nodiscard]] std::span<const psx::GteProjectedVertex>
+  resolvedProjections(const PresentationReplayDrawEvent &event) const noexcept {
+    return event.projection_offset <= projection_storage.size() &&
+                   event.projection_count <=
+                       projection_storage.size() - event.projection_offset
+               ? std::span<const psx::GteProjectedVertex>{projection_storage}
+                     .subspan(event.projection_offset, event.projection_count)
+               : std::span<const psx::GteProjectedVertex>{};
+  }
+  [[nodiscard]] std::span<const psx::GpuDmaWordSource>
+  dmaSources(const PresentationReplayDrawEvent &event) const noexcept {
+    return event.dma_source_offset <= dma_source_storage.size() &&
+                   event.dma_source_count <=
+                       dma_source_storage.size() - event.dma_source_offset
+               ? std::span<const psx::GpuDmaWordSource>{dma_source_storage}
+                     .subspan(event.dma_source_offset, event.dma_source_count)
+               : std::span<const psx::GpuDmaWordSource>{};
+  }
+};
+
+struct PresentationReplayFrame {
+  std::uint64_t generation{};
+  std::uint16_t display_x{};
+  std::uint16_t display_y{};
+  std::uint16_t display_width{};
+  std::uint16_t display_height{};
+  bool display_enabled{};
+  bool display_rgb24{};
+  bool display_interlaced{};
+  bool contains_vram_commands{};
+  std::vector<PresentationReplayDrawPage> pages;
 };
 
 class PsyCrossGuestGpu final {
@@ -32,6 +112,15 @@ public:
               std::uint64_t command_buffer_epoch = 0U,
               std::span<const psx::GteProjectedVertex> projection_catalog = {},
               std::span<const psx::GpuDmaWordSource> dma_sources = {});
+  [[nodiscard]] bool presentInterpolatedDisplay(float alpha);
+
+  void setPresentationInterpolationEnabled(bool enabled) noexcept {
+    if (presentation_interpolation_enabled_ == enabled) {
+      return;
+    }
+    presentation_interpolation_enabled_ = enabled;
+    resetPresentationReplayHistory();
+  }
 
   void setCoherenceEdgeSnapping(bool enabled) noexcept {
     coherence_edge_snapping_enabled_ = enabled;
@@ -45,11 +134,45 @@ public:
     shared_mesh_prepass_enabled_ = shared_mesh_prepass;
   }
 
+  [[nodiscard]] bool presentationReplayReady() const noexcept;
+  [[nodiscard]] const PresentationReplayFrame &
+  currentPresentationReplayFrame() const noexcept {
+    return current_presentation_replay_frame_;
+  }
+  [[nodiscard]] const PresentationReplayFrame &
+  previousPresentationReplayFrame() const noexcept {
+    return previous_presentation_replay_frame_;
+  }
+  [[nodiscard]] std::uint64_t
+  capturedPresentationReplayEvents() const noexcept {
+    return captured_presentation_replay_events_;
+  }
+  [[nodiscard]] std::uint64_t
+  promotedPresentationReplayFrames() const noexcept {
+    return promoted_presentation_replay_frames_;
+  }
+  [[nodiscard]] std::uint64_t
+  skippedPresentationReplayVramCommands() const noexcept {
+    return skipped_presentation_replay_vram_commands_;
+  }
+  [[nodiscard]] std::uint64_t
+  interpolatedPresentationReplayFrames() const noexcept {
+    return interpolated_presentation_replay_frames_;
+  }
+  [[nodiscard]] std::uint64_t
+  rejectedPresentationReplayFrames() const noexcept {
+    return rejected_presentation_replay_frames_;
+  }
+  [[nodiscard]] std::uint64_t
+  replayedPresentationStateCommands() const noexcept {
+    return replayed_presentation_state_commands_;
+  }
+
   void setGeometryOptions(bool master, bool perspective_correction,
-                                    bool precise_screen_position,
-                                    bool projective_depth_clamp,
-                                    bool quad_recovery, bool coherence_recovery,
-                                    bool atomic_primitive_fallback) noexcept {
+                          bool precise_screen_position,
+                          bool projective_depth_clamp, bool quad_recovery,
+                          bool coherence_recovery,
+                          bool atomic_primitive_fallback) noexcept {
     geometry_enabled_ = master;
     perspective_correction_enabled_ = perspective_correction;
     precise_screen_position_enabled_ = precise_screen_position;
@@ -305,7 +428,8 @@ private:
   void dispatch(std::span<const std::uint32_t> command,
                 std::span<const psx::GteProjectedVertex> projections,
                 bool precise_candidate, bool allow_precise,
-                bool allow_precise_screen, bool use_projective_depth);
+                bool allow_precise_screen, bool use_projective_depth,
+                bool record_statistics = true);
   void clearWrapped(std::uint16_t x, std::uint16_t y, std::uint16_t width,
                     std::uint16_t height, std::uint32_t color);
   void uploadWrapped(std::uint16_t x, std::uint16_t y, std::uint16_t width,
@@ -313,10 +437,50 @@ private:
   void moveWrapped(std::uint16_t source_x, std::uint16_t source_y,
                    std::uint16_t destination_x, std::uint16_t destination_y,
                    std::uint16_t width, std::uint16_t height);
+  void capturePresentationReplayDraw(
+      std::span<const std::uint32_t> command,
+      std::span<const psx::GteProjectedVertex> projections,
+      std::span<const psx::GpuDmaWordSource> dma_sources,
+      const PgxpDrawContext &draw_context, std::uint32_t texture_window,
+      bool precise_candidate, bool allow_perspective, bool allow_precise_screen,
+      bool use_projective_depth);
+  void capturePresentationReplayClear(
+      std::span<const std::uint32_t> command,
+      std::span<const psx::GpuDmaWordSource> dma_sources,
+      const PgxpDrawContext &draw_context, std::uint32_t texture_window);
+  void notePresentationReplayVramCommand();
+  void promotePresentationReplayFrame(std::uint16_t source_x,
+                                      std::uint16_t source_y,
+                                      std::uint16_t width, std::uint16_t height,
+                                      bool enabled, bool rgb24,
+                                      bool interlaced);
+  void rebuildPresentationReplayPlan();
+  void resetPresentationReplayHistory() noexcept;
+  struct PresentationReplayInterpolationPlan {
+    static constexpr std::size_t invalid_index = static_cast<std::size_t>(-1);
+
+    std::size_t previous_page{invalid_index};
+    std::size_t current_page{invalid_index};
+    std::vector<std::size_t> previous_projection_for_current_word;
+    bool ready{};
+  };
   std::vector<std::uint32_t> pending_;
   std::vector<psx::GteProjectedVertex> pending_projections_;
   std::vector<std::uint64_t> pending_projection_identities_;
   std::vector<psx::GpuDmaWordSource> pending_dma_sources_;
+  PresentationReplayFrame pending_presentation_replay_frame_;
+  PresentationReplayFrame previous_presentation_replay_frame_;
+  PresentationReplayFrame current_presentation_replay_frame_;
+  PresentationReplayInterpolationPlan presentation_replay_plan_;
+  std::uint64_t next_presentation_replay_generation_{1U};
+  std::uint64_t captured_presentation_replay_events_{};
+  std::uint64_t promoted_presentation_replay_frames_{};
+  std::uint64_t skipped_presentation_replay_vram_commands_{};
+  std::uint64_t interpolated_presentation_replay_frames_{};
+  std::uint64_t rejected_presentation_replay_frames_{};
+  std::uint64_t replayed_presentation_state_commands_{};
+  std::uint32_t presentation_mask_setting_{};
+  bool presentation_interpolation_enabled_{};
   std::vector<CanonicalProjectionEntry> canonical_projection_table_;
   std::uint32_t canonical_projection_generation_{};
   bool canonical_projection_overflow_{};

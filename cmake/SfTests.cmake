@@ -50,6 +50,8 @@ if(SF_BUILD_TESTS)
     endif()
     sf_add_unit_test(mohu_gpu_command_stream_tests
         tests/mohu_gpu_command_stream_tests.cpp LIBRARIES mohu::runtime)
+    sf_add_unit_test(mohu_gpu_primitive_matcher_tests
+        tests/mohu_gpu_primitive_matcher_tests.cpp LIBRARIES mohu::runtime)
     sf_add_unit_test(sf_legacy_presentation_bridge_tests
         tests/legacy_presentation_bridge_tests.cpp LIBRARIES sf::game)
     sf_add_unit_test(sf_raw_sector_source_tests

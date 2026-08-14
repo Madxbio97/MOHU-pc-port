@@ -2378,8 +2378,8 @@ int main() {
   // identity and cannot safely provide another vertex's camera-space W.
   PGXP_ClearCache();
   sf::platform::detail::PsyCrossGuestGpu clipped_handle_gpu;
-  clipped_handle_gpu.setGeometryOptions(true, true, true, true, true,
-                                                  true, true);
+  clipped_handle_gpu.setGeometryOptions(true, true, true, true, true, true,
+                                        true);
   clipped_handle_gpu.submit(adjacent_f4_words, {}, clipped_handle_words, 7004U,
                             handle_catalog);
   if (clipped_handle_gpu.precisePrimitives() != 2U ||
@@ -3028,8 +3028,7 @@ int main() {
 
   PGXP_ClearCache();
   sf::platform::detail::PsyCrossGuestGpu close_z_gpu;
-  close_z_gpu.setGeometryOptions(true, true, true, true, false, false,
-                                           true);
+  close_z_gpu.setGeometryOptions(true, true, true, true, false, false, true);
   close_z_gpu.setCoherenceEdgeSnapping(true);
   GR_BeginGuestSubmit();
   close_z_gpu.submit(adjacent_f4_words, close_z_projections);
@@ -4815,6 +4814,237 @@ int main() {
     PsyX_Shutdown();
     return 78;
   }
+
+  // Capture happens after geometry policy resolution and owns every sidecar.
+  // Presentation promotes the completed page before the following submit.
+  sf::platform::detail::PsyCrossGuestGpu replay_capture_gpu;
+  replay_capture_gpu.setPresentationInterpolationEnabled(true);
+  constexpr std::uint16_t capture_x = 320U;
+  constexpr std::uint16_t capture_y = 256U;
+  constexpr std::uint16_t capture_size = 16U;
+  std::vector<std::uint32_t> capture_words{
+      (0xe3000000U | capture_x |
+       (static_cast<std::uint32_t>(capture_y) * 0x400U)),
+      (0xe4000000U | (capture_x + capture_size - 1U) |
+       (static_cast<std::uint32_t>(capture_y + capture_size - 1U) * 0x400U)),
+      0xe5000000U,
+      0x02000000U,
+      static_cast<std::uint32_t>(capture_x) |
+          (static_cast<std::uint32_t>(capture_y) << 16U),
+      static_cast<std::uint32_t>(capture_size) |
+          (static_cast<std::uint32_t>(capture_size) << 16U),
+      0x200000f8U,
+      (static_cast<std::uint32_t>(capture_x + 1U) |
+       (static_cast<std::uint32_t>(capture_y + 1U) * 0x10000U)),
+      (static_cast<std::uint32_t>(capture_x + 12U) |
+       (static_cast<std::uint32_t>(capture_y + 1U) * 0x10000U)),
+      (static_cast<std::uint32_t>(capture_x + 1U) |
+       (static_cast<std::uint32_t>(capture_y + 12U) * 0x10000U)),
+  };
+  std::vector<sf::psx::GteProjectedVertex> capture_projections(
+      capture_words.size());
+  for (const auto word : {7U, 8U, 9U}) {
+    auto &projection = capture_projections[word];
+    projection.packed_sxy = capture_words[word];
+    const auto screen_x = static_cast<float>(
+        static_cast<std::int16_t>(capture_words[word] & 0xffffU));
+    const auto screen_y = static_cast<float>(
+        static_cast<std::int16_t>(capture_words[word] >> 16U));
+    projection.view_x = screen_x * 1000.0F / 320.0F;
+    projection.view_y = screen_y * 1000.0F / 320.0F;
+    projection.view_z = 1000.0F;
+    projection.projective_depth = 1000.0F;
+    projection.screen_x = screen_x;
+    projection.screen_y = screen_y;
+    projection.screen_h = 320.0F;
+    projection.valid = true;
+  }
+  std::vector<sf::psx::GpuDmaWordSource> capture_dma(capture_words.size());
+  for (std::size_t word{}; word < capture_dma.size(); ++word) {
+    capture_dma[word] = {static_cast<std::uint32_t>(0x00010000U + word * 4U),
+                         0x00010000U, sf::psx::GpuDmaSourceKind::linked_list};
+  }
+  const auto expected_capture_words = capture_words;
+  const auto expected_capture_dma = std::vector<sf::psx::GpuDmaWordSource>{
+      capture_dma.begin() + 6, capture_dma.end()};
+  replay_capture_gpu.submit(capture_words, capture_projections, {}, 0U, {},
+                            capture_dma);
+  capture_words.assign(capture_words.size(), 0U);
+  capture_projections.assign(capture_projections.size(), {});
+  capture_dma.assign(capture_dma.size(), {});
+  if (replay_capture_gpu.presentationReplayReady() ||
+      replay_capture_gpu.currentPresentationReplayFrame().generation != 0U ||
+      replay_capture_gpu.capturedPresentationReplayEvents() != 2U) {
+    std::cerr << "Replay capture published before display promotion\n";
+    PsyX_Shutdown();
+    return 206;
+  }
+  replay_capture_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                    capture_size, true, false, false);
+  const auto &captured_frame =
+      replay_capture_gpu.currentPresentationReplayFrame();
+  const auto captured_generation = captured_frame.generation;
+  const auto *captured_page =
+      captured_frame.pages.size() == 1U ? &captured_frame.pages[0] : nullptr;
+  const sf::platform::detail::PresentationReplayDrawEvent *captured_event{};
+  if (captured_page != nullptr) {
+    const auto found = std::ranges::find(
+        captured_page->events,
+        sf::platform::detail::PresentationReplayEventKind::draw,
+        &sf::platform::detail::PresentationReplayDrawEvent::kind);
+    if (found != captured_page->events.end()) {
+      captured_event = &*found;
+    }
+  }
+  const auto capture_owned =
+      captured_event != nullptr && captured_page->events.size() == 2U &&
+      std::ranges::equal(
+          captured_page->commandWords(*captured_event),
+          std::span<const std::uint32_t>{expected_capture_words}.subspan(6U)) &&
+      std::ranges::equal(captured_page->dmaSources(*captured_event),
+                         expected_capture_dma) &&
+      captured_page->resolvedProjections(*captured_event).size() == 4U &&
+      captured_page->target ==
+          sf::platform::detail::PresentationReplayDrawTarget{
+              capture_x, capture_y, capture_size, capture_size};
+  if (replay_capture_gpu.presentationReplayReady() || !capture_owned ||
+      replay_capture_gpu.promotedPresentationReplayFrames() != 1U) {
+    std::cerr << "Resolved replay event was not promoted as owning data; ready="
+              << replay_capture_gpu.presentationReplayReady()
+              << " generation=" << captured_frame.generation
+              << " pages=" << captured_frame.pages.size()
+              << " unsafe=" << captured_frame.contains_vram_commands;
+    if (!captured_frame.pages.empty()) {
+      std::cerr << " events=" << captured_frame.pages[0].events.size()
+                << " target=" << captured_frame.pages[0].target.x << ','
+                << captured_frame.pages[0].target.y << ','
+                << captured_frame.pages[0].target.width << ','
+                << captured_frame.pages[0].target.height;
+    }
+    std::cerr << '\n';
+    PsyX_Shutdown();
+    return 207;
+  }
+
+  std::vector<std::uint32_t> second_capture{
+      (0xe3000000U | capture_x |
+       (static_cast<std::uint32_t>(capture_y) * 0x400U)),
+      (0xe4000000U | (capture_x + capture_size - 1U) |
+       (static_cast<std::uint32_t>(capture_y + capture_size - 1U) * 0x400U)),
+      0xe5000000U,
+      0x02000000U,
+      static_cast<std::uint32_t>(capture_x) |
+          (static_cast<std::uint32_t>(capture_y) << 16U),
+      static_cast<std::uint32_t>(capture_size) |
+          (static_cast<std::uint32_t>(capture_size) << 16U),
+      0x200000f8U,
+      (static_cast<std::uint32_t>(capture_x + 2U) |
+       (static_cast<std::uint32_t>(capture_y + 2U) * 0x10000U)),
+      (static_cast<std::uint32_t>(capture_x + 13U) |
+       (static_cast<std::uint32_t>(capture_y + 2U) * 0x10000U)),
+      (static_cast<std::uint32_t>(capture_x + 2U) |
+       (static_cast<std::uint32_t>(capture_y + 13U) * 0x10000U)),
+      0x60000040U,
+      static_cast<std::uint32_t>(capture_x + 4U) |
+          (static_cast<std::uint32_t>(capture_y + 4U) * 0x10000U),
+      2U | (2U << 16U),
+  };
+  std::vector<sf::psx::GteProjectedVertex> second_projections(
+      second_capture.size());
+  for (const auto word : {7U, 8U, 9U}) {
+    auto &projection = second_projections[word];
+    projection.packed_sxy = second_capture[word];
+    const auto screen_x = static_cast<float>(
+        static_cast<std::int16_t>(second_capture[word] & 0xffffU));
+    const auto screen_y = static_cast<float>(
+        static_cast<std::int16_t>(second_capture[word] >> 16U));
+    projection.view_x = screen_x * 1000.0F / 320.0F;
+    projection.view_y = screen_y * 1000.0F / 320.0F;
+    projection.view_z = 1000.0F;
+    projection.projective_depth = 1000.0F;
+    projection.screen_x = screen_x;
+    projection.screen_y = screen_y;
+    projection.screen_h = 320.0F;
+    projection.valid = true;
+  }
+  std::vector<sf::psx::GpuDmaWordSource> second_dma(second_capture.size());
+  std::ranges::copy(expected_capture_dma,
+                    second_dma.begin() + static_cast<std::ptrdiff_t>(6U));
+  replay_capture_gpu.submit(second_capture, second_projections, {}, 0U, {},
+                            second_dma);
+  replay_capture_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                    capture_size, true, false, false);
+  if (replay_capture_gpu.previousPresentationReplayFrame().generation !=
+          captured_generation ||
+      replay_capture_gpu.currentPresentationReplayFrame().generation ==
+          replay_capture_gpu.previousPresentationReplayFrame().generation ||
+      !replay_capture_gpu.presentationReplayReady()) {
+    std::cerr << "Replay history did not rotate previous/current frames\n";
+    PsyX_Shutdown();
+    return 208;
+  }
+
+  if (replay_capture_gpu.presentInterpolatedDisplay(1.0F)) {
+    std::cerr << "Replay accepted current-frame alpha endpoint\n";
+    PsyX_Shutdown();
+    return 210;
+  }
+  const auto replay_write_before = GR_GetVRAMWriteSequence();
+  const auto replay_pack_before = GR_GetGuestVRAMPackCount();
+  const auto replay_capture_before = GR_GetGuestCaptureCount();
+  const auto replay_readback_before = GR_GetSynchronousVRAMReadbackCount();
+  if (!replay_capture_gpu.presentInterpolatedDisplay(0.5F) ||
+      replay_capture_gpu.interpolatedPresentationReplayFrames() != 1U ||
+      replay_capture_gpu.replayedPresentationStateCommands() != 6U ||
+      GR_GetVRAMWriteSequence() != replay_write_before ||
+      GR_GetGuestVRAMPackCount() != replay_pack_before ||
+      GR_GetGuestCaptureCount() != replay_capture_before ||
+      GR_GetSynchronousVRAMReadbackCount() != replay_readback_before) {
+    std::cerr << "Interpolated replay failed or mutated authoritative VRAM\n";
+    PsyX_Shutdown();
+    return 211;
+  }
+
+  auto cut_capture = second_capture;
+  auto cut_projections = second_projections;
+  for (const auto word : {7U, 8U, 9U}) {
+    cut_capture[word] += 3U;
+    auto &projection = cut_projections[word];
+    projection.packed_sxy = cut_capture[word];
+    projection.screen_x += 3.0F;
+    projection.view_x =
+        projection.screen_x * projection.view_z / projection.screen_h;
+  }
+  replay_capture_gpu.submit(cut_capture, cut_projections, {}, 0U, {},
+                            second_dma);
+  replay_capture_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                    capture_size, true, false, false);
+  if (replay_capture_gpu.presentationReplayReady() ||
+      replay_capture_gpu.presentInterpolatedDisplay(0.5F) ||
+      replay_capture_gpu.interpolatedPresentationReplayFrames() != 1U) {
+    std::cerr << "Global camera-cut guard partially interpolated a frame\n";
+    PsyX_Shutdown();
+    return 212;
+  }
+
+  constexpr std::array unsafe_vram_command{
+      0x02000000U,
+      static_cast<std::uint32_t>(capture_x) |
+          (static_cast<std::uint32_t>(capture_y) << 16U),
+      1U | (1U << 16U)};
+  replay_capture_gpu.submit(unsafe_vram_command);
+  replay_capture_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                    capture_size, true, false, false);
+  if (replay_capture_gpu.presentationReplayReady() ||
+      !replay_capture_gpu.currentPresentationReplayFrame()
+           .contains_vram_commands ||
+      replay_capture_gpu.skippedPresentationReplayVramCommands() != 1U) {
+    std::cerr << "VRAM command entered draw-only replay history\n";
+    PsyX_Shutdown();
+    return 209;
+  }
+  DrawSync(0);
+  PsyX_EndScene();
 
   // Presentation replay owns a fresh native-resolution scratch target. Four
   // repeats of the same semitransparent primitive must be pixel-identical and

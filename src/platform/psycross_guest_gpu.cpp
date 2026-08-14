@@ -1,5 +1,6 @@
 #include "psycross_guest_gpu.hpp"
 
+#include "mohu/gpu_primitive_matcher.hpp"
 #include "sf/psx/gp0_command.hpp"
 
 #include <PsyX/PsyX_public.h>
@@ -749,12 +750,755 @@ void updatePgxpDrawContext(PgxpDrawContext &context, std::uint8_t opcode,
   case 0xe5U:
     context.draw_offset = command & 0x003fffffU;
     break;
+  case 0xe6U:
+    context.mask_setting = command & 0x00000003U;
+    break;
   default:
     break;
   }
 }
 
+[[nodiscard]] std::uint32_t currentTextureWindow() noexcept {
+  DRAWENV draw{};
+  GetDrawEnv(&draw);
+  return (static_cast<std::uint32_t>(draw.tw.w) & 0x1fU) |
+         ((static_cast<std::uint32_t>(draw.tw.h) & 0x1fU) << 5U) |
+         ((static_cast<std::uint32_t>(draw.tw.x) & 0x1fU) << 10U) |
+         ((static_cast<std::uint32_t>(draw.tw.y) & 0x1fU) << 15U);
+}
+
+[[nodiscard]] PresentationReplayDrawTarget
+replayDrawTarget(const PgxpDrawContext &context) noexcept {
+  const auto x = context.draw_area_top_left & 0x03ffU;
+  const auto y = (context.draw_area_top_left >> 10U) & 0x01ffU;
+  const auto right = context.draw_area_bottom_right & 0x03ffU;
+  const auto bottom = (context.draw_area_bottom_right >> 10U) & 0x01ffU;
+  if (right < x || bottom < y) {
+    return {};
+  }
+  return {static_cast<std::uint16_t>(x), static_cast<std::uint16_t>(y),
+          static_cast<std::uint16_t>(right - x + 1U),
+          static_cast<std::uint16_t>(bottom - y + 1U)};
+}
+
+[[nodiscard]] bool
+replayTargetContains(const PresentationReplayDrawTarget &target,
+                     std::uint16_t x, std::uint16_t y, std::uint16_t width,
+                     std::uint16_t height) noexcept {
+  return target.width != 0U && target.height != 0U && width != 0U &&
+         height != 0U && x >= target.x && y >= target.y &&
+         static_cast<unsigned int>(x) + width <=
+             static_cast<unsigned int>(target.x) + target.width &&
+         static_cast<unsigned int>(y) + height <=
+             static_cast<unsigned int>(target.y) + target.height;
+}
+
+[[nodiscard]] std::size_t
+replayPageIndex(const PresentationReplayFrame &frame) noexcept {
+  auto selected = static_cast<std::size_t>(-1);
+  auto selected_area = std::numeric_limits<std::uint32_t>::max();
+  auto ambiguous = false;
+  for (std::size_t index{}; index < frame.pages.size(); ++index) {
+    const auto &page = frame.pages[index];
+    if (!replayTargetContains(page.target, frame.display_x, frame.display_y,
+                              frame.display_width, frame.display_height)) {
+      continue;
+    }
+    const auto area = static_cast<std::uint32_t>(page.target.width) *
+                      static_cast<std::uint32_t>(page.target.height);
+    if (area < selected_area) {
+      selected = index;
+      selected_area = area;
+      ambiguous = false;
+    } else if (area == selected_area) {
+      ambiguous = true;
+    }
+  }
+  return ambiguous ? static_cast<std::size_t>(-1) : selected;
+}
+
+[[nodiscard]] const PresentationReplayDrawEvent *
+replayEventAt(const PresentationReplayDrawPage &page,
+              std::size_t command_word) noexcept {
+  const auto found = std::ranges::lower_bound(
+      page.events, command_word, {}, &PresentationReplayDrawEvent::word_offset);
+  return found == page.events.end() || found->word_offset != command_word
+             ? nullptr
+             : &*found;
+}
+
+[[nodiscard]] std::int32_t signedDrawOffset(std::uint32_t value) noexcept {
+  value &= 0x07ffU;
+  return static_cast<std::int32_t>(value >= 0x0400U ? value - 0x0800U : value);
+}
+
+[[nodiscard]] bool replayContextsCompatible(
+    const PresentationReplayDrawEvent &previous,
+    const PresentationReplayDrawTarget &previous_target,
+    const PresentationReplayDrawEvent &current,
+    const PresentationReplayDrawTarget &current_target) noexcept {
+  const auto &left = previous.draw_context;
+  const auto &right = current.draw_context;
+  const auto left_offset_x = signedDrawOffset(left.draw_offset);
+  const auto left_offset_y = signedDrawOffset(left.draw_offset >> 11U);
+  const auto right_offset_x = signedDrawOffset(right.draw_offset);
+  const auto right_offset_y = signedDrawOffset(right.draw_offset >> 11U);
+  return previous.kind == current.kind && left.draw_mode == right.draw_mode &&
+         previous.texture_window == current.texture_window &&
+         left.mask_setting == right.mask_setting &&
+         previous_target.width == current_target.width &&
+         previous_target.height == current_target.height &&
+         left_offset_x - previous_target.x ==
+             right_offset_x - current_target.x &&
+         left_offset_y - previous_target.y ==
+             right_offset_y - current_target.y &&
+         previous.precise_candidate == current.precise_candidate &&
+         previous.allow_perspective == current.allow_perspective &&
+         previous.allow_precise_screen == current.allow_precise_screen &&
+         previous.use_projective_depth == current.use_projective_depth;
+}
+
+[[nodiscard]] bool
+replayOptionalIdentityCompatible(std::uint64_t previous,
+                                 std::uint64_t current) noexcept {
+  return previous == 0U ? current == 0U : current != 0U && previous == current;
+}
+
+[[nodiscard]] bool replayProjectionProvenanceCompatible(
+    const psx::GteProjectedVertex &previous,
+    const psx::GteProjectedVertex &current) noexcept {
+  if (previous.exact_transform != current.exact_transform ||
+      previous.fractional_transform != current.fractional_transform ||
+      !replayOptionalIdentityCompatible(previous.source_vertex_id,
+                                        current.source_vertex_id) ||
+      !replayOptionalIdentityCompatible(previous.mesh_vertex_id,
+                                        current.mesh_vertex_id)) {
+    return false;
+  }
+  const auto previous_lineage_valid = previous.transform_lineage != 0U;
+  const auto current_lineage_valid = current.transform_lineage != 0U;
+  const auto previous_epoch_valid = previous.projection_epoch != 0U;
+  const auto current_epoch_valid = current.projection_epoch != 0U;
+  if (previous_lineage_valid != current_lineage_valid ||
+      previous_epoch_valid != current_epoch_valid) {
+    return false;
+  }
+  return !previous.exact_transform || (previous.hasExactTransformProvenance() &&
+                                       current.hasExactTransformProvenance());
+}
+
+[[nodiscard]] bool
+replayProjectionEligible(const psx::GteProjectedVertex &projection,
+                         std::uint32_t packed, bool perspective) noexcept {
+  static_cast<void>(perspective);
+  return projection.valid && projection.packed_sxy == packed &&
+         projection.pgxpEligible() &&
+         projection.view_z > minimum_legacy_precise_view_depth &&
+         projection.screen_h > 0.0F && std::isfinite(projection.view_x) &&
+         std::isfinite(projection.view_y) && std::isfinite(projection.view_z) &&
+         std::isfinite(projection.projective_depth) &&
+         std::isfinite(projection.screen_x) &&
+         std::isfinite(projection.screen_y) &&
+         std::isfinite(projection.screen_h) &&
+         std::isfinite(projection.screen_offset_x) &&
+         std::isfinite(projection.screen_offset_y) &&
+         !projection.ir_saturated && !projection.depth_saturated &&
+         !projection.divide_overflow && !projection.screen_saturated;
+}
+
+[[nodiscard]] bool replayProjectionPairEligible(
+    const psx::GteProjectedVertex &previous, std::uint32_t previous_packed,
+    const psx::GteProjectedVertex &current, std::uint32_t current_packed,
+    bool perspective, float maximum_screen_displacement) noexcept {
+  if (!replayProjectionEligible(previous, previous_packed, perspective) ||
+      !replayProjectionEligible(current, current_packed, perspective) ||
+      !replayProjectionProvenanceCompatible(previous, current)) {
+    return false;
+  }
+  const auto displacement = std::hypot(current.screen_x - previous.screen_x,
+                                       current.screen_y - previous.screen_y);
+  if (!std::isfinite(displacement) ||
+      displacement > maximum_screen_displacement) {
+    return false;
+  }
+  const auto depth_ratio = current.view_z / previous.view_z;
+  return std::isfinite(depth_ratio) && depth_ratio >= 0.125F &&
+         depth_ratio <= 8.0F;
+}
+
+[[nodiscard]] psx::GteProjectedVertex
+interpolateReplayProjection(const psx::GteProjectedVertex &previous,
+                            const psx::GteProjectedVertex &current,
+                            float alpha) noexcept {
+  auto result = current;
+  result.view_z = std::lerp(previous.view_z, current.view_z, alpha);
+  result.projective_depth =
+      std::lerp(previous.projective_depth, current.projective_depth, alpha);
+  result.screen_x = std::lerp(previous.screen_x, current.screen_x, alpha);
+  result.screen_y = std::lerp(previous.screen_y, current.screen_y, alpha);
+  result.screen_h = std::lerp(previous.screen_h, current.screen_h, alpha);
+  result.screen_offset_x =
+      std::lerp(previous.screen_offset_x, current.screen_offset_x, alpha);
+  result.screen_offset_y =
+      std::lerp(previous.screen_offset_y, current.screen_offset_y, alpha);
+  result.view_x = (result.screen_x - result.screen_offset_x) * result.view_z /
+                  result.screen_h;
+  result.view_y = (result.screen_y - result.screen_offset_y) * result.view_z /
+                  result.screen_h;
+  result.exact_transform = false;
+  result.fractional_transform = true;
+  result.enhanced_sources = 0U;
+  result.source_vertex_id = 0U;
+  result.mesh_vertex_id = 0U;
+  result.transform_lineage = 0U;
+  result.projection_epoch = 0U;
+  return result;
+}
+
 } // namespace
+
+bool PsyCrossGuestGpu::presentationReplayReady() const noexcept {
+  return presentation_replay_plan_.ready;
+}
+
+void PsyCrossGuestGpu::capturePresentationReplayDraw(
+    std::span<const std::uint32_t> command,
+    std::span<const psx::GteProjectedVertex> projections,
+    std::span<const psx::GpuDmaWordSource> dma_sources,
+    const PgxpDrawContext &draw_context, std::uint32_t texture_window,
+    bool precise_candidate, bool allow_perspective, bool allow_precise_screen,
+    bool use_projective_depth) {
+  const auto target = replayDrawTarget(draw_context);
+  if (command.empty() || target.width == 0U || target.height == 0U) {
+    return;
+  }
+  auto &frame = pending_presentation_replay_frame_;
+  if (frame.generation == 0U) {
+    frame.generation = next_presentation_replay_generation_++;
+  }
+  auto page = std::ranges::find(frame.pages, target,
+                                &PresentationReplayDrawPage::target);
+  if (page == frame.pages.end()) {
+    frame.pages.push_back({.target = target});
+    page = std::prev(frame.pages.end());
+  }
+  const auto word_offset = page->word_storage.size();
+  const auto projection_offset = page->projection_storage.size();
+  const auto dma_source_offset = page->dma_source_storage.size();
+  page->word_storage.insert(page->word_storage.end(), command.begin(),
+                            command.end());
+  page->projection_storage.resize(projection_offset + command.size());
+  if (projections.size() == command.size()) {
+    std::ranges::copy(projections,
+                      page->projection_storage.begin() +
+                          static_cast<std::ptrdiff_t>(projection_offset));
+  }
+  page->dma_source_storage.resize(dma_source_offset + command.size());
+  if (dma_sources.size() == command.size()) {
+    std::ranges::copy(dma_sources,
+                      page->dma_source_storage.begin() +
+                          static_cast<std::ptrdiff_t>(dma_source_offset));
+  }
+  page->events.push_back({PresentationReplayEventKind::draw, word_offset,
+                          command.size(), projection_offset, command.size(),
+                          dma_source_offset, command.size(), draw_context,
+                          texture_window, precise_candidate, allow_perspective,
+                          allow_precise_screen, use_projective_depth});
+  ++captured_presentation_replay_events_;
+}
+
+void PsyCrossGuestGpu::capturePresentationReplayClear(
+    std::span<const std::uint32_t> command,
+    std::span<const psx::GpuDmaWordSource> dma_sources,
+    const PgxpDrawContext &draw_context, std::uint32_t texture_window) {
+  const auto target = replayDrawTarget(draw_context);
+  if (command.size() != 3U || target.width == 0U || target.height == 0U) {
+    notePresentationReplayVramCommand();
+    return;
+  }
+  const auto x = static_cast<unsigned int>(command[1U] & 0x03ffU);
+  const auto y = static_cast<unsigned int>((command[1U] >> 16U) & 0x01ffU);
+  const auto width = static_cast<unsigned int>(transferWidth(command[2U]));
+  const auto height = static_cast<unsigned int>(transferHeight(command[2U]));
+  if (x + width > vram_width || y + height > vram_height || x != target.x ||
+      y != target.y || width != target.width || height != target.height) {
+    notePresentationReplayVramCommand();
+    return;
+  }
+  auto &frame = pending_presentation_replay_frame_;
+  if (frame.generation == 0U) {
+    frame.generation = next_presentation_replay_generation_++;
+  }
+  auto page = std::ranges::find(frame.pages, target,
+                                &PresentationReplayDrawPage::target);
+  if (page == frame.pages.end()) {
+    frame.pages.push_back({.target = target});
+    page = std::prev(frame.pages.end());
+  }
+  const auto word_offset = page->word_storage.size();
+  const auto dma_source_offset = page->dma_source_storage.size();
+  page->word_storage.insert(page->word_storage.end(), command.begin(),
+                            command.end());
+  page->projection_storage.resize(page->projection_storage.size() +
+                                  command.size());
+  page->dma_source_storage.resize(dma_source_offset + command.size());
+  if (dma_sources.size() == command.size()) {
+    std::ranges::copy(dma_sources,
+                      page->dma_source_storage.begin() +
+                          static_cast<std::ptrdiff_t>(dma_source_offset));
+  }
+  page->events.push_back(
+      {PresentationReplayEventKind::clear, word_offset, command.size(),
+       page->projection_storage.size() - command.size(), command.size(),
+       dma_source_offset, command.size(), draw_context, texture_window});
+  ++captured_presentation_replay_events_;
+}
+
+void PsyCrossGuestGpu::notePresentationReplayVramCommand() {
+  auto &frame = pending_presentation_replay_frame_;
+  if (frame.generation == 0U) {
+    frame.generation = next_presentation_replay_generation_++;
+  }
+  frame.contains_vram_commands = true;
+  ++skipped_presentation_replay_vram_commands_;
+}
+
+void PsyCrossGuestGpu::promotePresentationReplayFrame(
+    std::uint16_t source_x, std::uint16_t source_y, std::uint16_t width,
+    std::uint16_t height, bool enabled, bool rgb24, bool interlaced) {
+  if (!presentation_interpolation_enabled_) {
+    return;
+  }
+  if (pending_presentation_replay_frame_.generation == 0U) {
+    return;
+  }
+  previous_presentation_replay_frame_ =
+      std::move(current_presentation_replay_frame_);
+  current_presentation_replay_frame_ =
+      std::move(pending_presentation_replay_frame_);
+  pending_presentation_replay_frame_ = {};
+  auto &frame = current_presentation_replay_frame_;
+  frame.display_x = source_x;
+  frame.display_y = source_y;
+  frame.display_width = width;
+  frame.display_height = height;
+  frame.display_enabled = enabled;
+  frame.display_rgb24 = rgb24;
+  frame.display_interlaced = interlaced;
+  ++promoted_presentation_replay_frames_;
+  rebuildPresentationReplayPlan();
+}
+
+void PsyCrossGuestGpu::rebuildPresentationReplayPlan() {
+  presentation_replay_plan_ = {};
+  const auto &previous_frame = previous_presentation_replay_frame_;
+  const auto &current_frame = current_presentation_replay_frame_;
+  if (!presentation_interpolation_enabled_ || previous_frame.generation == 0U ||
+      current_frame.generation == 0U || !previous_frame.display_enabled ||
+      !current_frame.display_enabled || previous_frame.display_rgb24 ||
+      current_frame.display_rgb24 || previous_frame.display_interlaced ||
+      current_frame.display_interlaced ||
+      previous_frame.contains_vram_commands ||
+      current_frame.contains_vram_commands ||
+      previous_frame.display_width != current_frame.display_width ||
+      previous_frame.display_height != current_frame.display_height ||
+      current_frame.display_width == 0U || current_frame.display_height == 0U) {
+    return;
+  }
+
+  const auto previous_page_index = replayPageIndex(previous_frame);
+  const auto current_page_index = replayPageIndex(current_frame);
+  if (previous_page_index ==
+          PresentationReplayInterpolationPlan::invalid_index ||
+      current_page_index ==
+          PresentationReplayInterpolationPlan::invalid_index) {
+    ++rejected_presentation_replay_frames_;
+    return;
+  }
+  const auto &previous_page = previous_frame.pages[previous_page_index];
+  const auto &current_page = current_frame.pages[current_page_index];
+  const auto has_clear = [](const PresentationReplayDrawPage &page) {
+    return std::ranges::any_of(page.events, [](const auto &event) {
+      return event.kind == PresentationReplayEventKind::clear;
+    });
+  };
+  if (!has_clear(previous_page) || !has_clear(current_page) ||
+      previous_page.word_storage.size() !=
+          previous_page.dma_source_storage.size() ||
+      current_page.word_storage.size() !=
+          current_page.dma_source_storage.size()) {
+    ++rejected_presentation_replay_frames_;
+    return;
+  }
+  const auto report = mohu::matchGpuPrimitiveSnapshots(
+      mohu::GpuPrimitiveSnapshotView{
+          std::span<const std::uint32_t>{previous_page.word_storage},
+          std::span<const psx::GpuDmaWordSource>{
+              previous_page.dma_source_storage}},
+      mohu::GpuPrimitiveSnapshotView{
+          std::span<const std::uint32_t>{current_page.word_storage},
+          std::span<const psx::GpuDmaWordSource>{
+              current_page.dma_source_storage}});
+  if (!report.input_valid || report.matches.empty()) {
+    ++rejected_presentation_replay_frames_;
+    return;
+  }
+
+  auto mapping = std::vector<std::size_t>(
+      current_page.word_storage.size(),
+      PresentationReplayInterpolationPlan::invalid_index);
+  const auto maximum_displacement =
+      0.5F * std::hypot(static_cast<float>(current_frame.display_width),
+                        static_cast<float>(current_frame.display_height));
+  auto interpolated_primitives = std::size_t{};
+  const auto required_world_event =
+      [](const PresentationReplayDrawPage &page,
+         const PresentationReplayDrawEvent &event) {
+        const auto words = page.commandWords(event);
+        const auto projections = page.resolvedProjections(event);
+        if (event.kind != PresentationReplayEventKind::draw || words.empty() ||
+            projections.size() != words.size() || !event.precise_candidate ||
+            !event.allow_precise_screen) {
+          return false;
+        }
+        const auto opcode = static_cast<std::uint8_t>(words.front() >> 24U);
+        if (opcode < 0x20U || opcode >= 0x40U || (opcode & 0x02U) != 0U) {
+          return false;
+        }
+        std::size_t vertex_count{};
+        const auto coordinate_words =
+            polygonCoordinateWords(opcode, vertex_count);
+        for (std::size_t vertex{}; vertex < vertex_count; ++vertex) {
+          const auto word = coordinate_words[vertex];
+          if (word >= words.size() ||
+              !replayProjectionEligible(projections[word], words[word],
+                                        event.allow_perspective)) {
+            return false;
+          }
+        }
+        return true;
+      };
+  const auto previous_required = static_cast<std::size_t>(
+      std::ranges::count_if(previous_page.events, [&](const auto &event) {
+        return required_world_event(previous_page, event);
+      }));
+  const auto current_required = static_cast<std::size_t>(
+      std::ranges::count_if(current_page.events, [&](const auto &event) {
+        return required_world_event(current_page, event);
+      }));
+  if (previous_required == 0U || previous_required != current_required) {
+    ++rejected_presentation_replay_frames_;
+    return;
+  }
+
+  auto global_cut_primitives = std::size_t{};
+  auto frame_valid = true;
+  for (const auto &match : report.matches) {
+    const auto *previous_event =
+        replayEventAt(previous_page, match.previous_command_word);
+    const auto *current_event =
+        replayEventAt(current_page, match.current_command_word);
+    if (previous_event == nullptr || current_event == nullptr) {
+      frame_valid = false;
+      break;
+    }
+    const auto previous_is_required =
+        required_world_event(previous_page, *previous_event);
+    const auto current_is_required =
+        required_world_event(current_page, *current_event);
+    if (previous_is_required != current_is_required) {
+      frame_valid = false;
+      break;
+    }
+    if (!current_is_required) {
+      continue;
+    }
+    if (!current_event->allow_precise_screen ||
+        !replayContextsCompatible(*previous_event, previous_page.target,
+                                  *current_event, current_page.target)) {
+      frame_valid = false;
+      break;
+    }
+    const auto previous_words = previous_page.commandWords(*previous_event);
+    const auto current_words = current_page.commandWords(*current_event);
+    const auto previous_projections =
+        previous_page.resolvedProjections(*previous_event);
+    const auto current_projections =
+        current_page.resolvedProjections(*current_event);
+    if (previous_words.empty() || current_words.empty() ||
+        previous_projections.size() != previous_words.size() ||
+        current_projections.size() != current_words.size()) {
+      frame_valid = false;
+      break;
+    }
+
+    auto primitive_valid = true;
+    std::array<std::size_t, 4U> current_words_to_map{};
+    std::array<std::size_t, 4U> previous_projection_indices{};
+    auto previous_centroid_x = 0.0F;
+    auto previous_centroid_y = 0.0F;
+    auto current_centroid_x = 0.0F;
+    auto current_centroid_y = 0.0F;
+    std::array<float, 4U> depth_ratios{};
+    auto previous_lineage = std::uint64_t{};
+    auto current_lineage = std::uint64_t{};
+    auto previous_epoch = std::uint64_t{};
+    auto current_epoch = std::uint64_t{};
+    auto provenance_seeded = false;
+    for (std::size_t vertex{}; vertex < match.vertex_count; ++vertex) {
+      const auto previous_word = match.previous_coordinate_words[vertex];
+      const auto current_word = match.current_coordinate_words[vertex];
+      if (previous_word < previous_event->word_offset ||
+          previous_word >=
+              previous_event->word_offset + previous_event->word_count ||
+          current_word < current_event->word_offset ||
+          current_word >=
+              current_event->word_offset + current_event->word_count ||
+          current_word >= mapping.size()) {
+        primitive_valid = false;
+        break;
+      }
+      const auto previous_local = previous_word - previous_event->word_offset;
+      const auto current_local = current_word - current_event->word_offset;
+      const auto previous_projection =
+          previous_event->projection_offset + previous_local;
+      if (previous_local >= previous_projections.size() ||
+          current_local >= current_projections.size() ||
+          previous_projection >= previous_page.projection_storage.size() ||
+          mapping[current_word] !=
+              PresentationReplayInterpolationPlan::invalid_index ||
+          !replayProjectionPairEligible(
+              previous_projections[previous_local],
+              previous_words[previous_local],
+              current_projections[current_local], current_words[current_local],
+              current_event->allow_perspective, maximum_displacement)) {
+        primitive_valid = false;
+        break;
+      }
+      const auto &previous_vertex = previous_projections[previous_local];
+      const auto &current_vertex = current_projections[current_local];
+      if (!provenance_seeded) {
+        previous_lineage = previous_vertex.transform_lineage;
+        current_lineage = current_vertex.transform_lineage;
+        previous_epoch = previous_vertex.projection_epoch;
+        current_epoch = current_vertex.projection_epoch;
+        provenance_seeded = true;
+      } else if (previous_lineage != previous_vertex.transform_lineage ||
+                 current_lineage != current_vertex.transform_lineage ||
+                 previous_epoch != previous_vertex.projection_epoch ||
+                 current_epoch != current_vertex.projection_epoch) {
+        primitive_valid = false;
+        break;
+      }
+      previous_centroid_x += previous_vertex.screen_x;
+      previous_centroid_y += previous_vertex.screen_y;
+      current_centroid_x += current_vertex.screen_x;
+      current_centroid_y += current_vertex.screen_y;
+      depth_ratios[vertex] = current_vertex.view_z / previous_vertex.view_z;
+      current_words_to_map[vertex] = current_word;
+      previous_projection_indices[vertex] = previous_projection;
+    }
+    if (!primitive_valid) {
+      frame_valid = false;
+      break;
+    }
+    const auto inverse_vertex_count = 1.0F / match.vertex_count;
+    previous_centroid_x *= inverse_vertex_count;
+    previous_centroid_y *= inverse_vertex_count;
+    current_centroid_x *= inverse_vertex_count;
+    current_centroid_y *= inverse_vertex_count;
+    std::sort(depth_ratios.begin(), depth_ratios.begin() + match.vertex_count);
+    const auto middle = match.vertex_count / 2U;
+    const auto median_depth_ratio =
+        (match.vertex_count & 1U) != 0U
+            ? depth_ratios[middle]
+            : 0.5F * (depth_ratios[middle - 1U] + depth_ratios[middle]);
+    const auto centroid_displacement =
+        std::hypot(current_centroid_x - previous_centroid_x,
+                   current_centroid_y - previous_centroid_y);
+    if (centroid_displacement > maximum_displacement * 0.25F ||
+        median_depth_ratio < 0.5F || median_depth_ratio > 2.0F) {
+      ++global_cut_primitives;
+    }
+    for (std::size_t vertex{}; vertex < match.vertex_count; ++vertex) {
+      mapping[current_words_to_map[vertex]] =
+          previous_projection_indices[vertex];
+    }
+    ++interpolated_primitives;
+  }
+  if (!frame_valid || interpolated_primitives != current_required ||
+      global_cut_primitives * 2U > interpolated_primitives) {
+    ++rejected_presentation_replay_frames_;
+    return;
+  }
+
+  presentation_replay_plan_.previous_page = previous_page_index;
+  presentation_replay_plan_.current_page = current_page_index;
+  presentation_replay_plan_.previous_projection_for_current_word =
+      std::move(mapping);
+  presentation_replay_plan_.ready = true;
+}
+
+bool PsyCrossGuestGpu::presentInterpolatedDisplay(float alpha) {
+  if (!presentation_interpolation_enabled_ ||
+      !presentation_replay_plan_.ready || !std::isfinite(alpha) ||
+      alpha <= 0.0F || alpha >= 1.0F) {
+    return false;
+  }
+  const auto &previous_frame = previous_presentation_replay_frame_;
+  const auto &current_frame = current_presentation_replay_frame_;
+  const auto previous_page_index = presentation_replay_plan_.previous_page;
+  const auto current_page_index = presentation_replay_plan_.current_page;
+  if (previous_page_index >= previous_frame.pages.size() ||
+      current_page_index >= current_frame.pages.size()) {
+    presentation_replay_plan_.ready = false;
+    ++rejected_presentation_replay_frames_;
+    return false;
+  }
+  const auto &previous_page = previous_frame.pages[previous_page_index];
+  const auto &current_page = current_frame.pages[current_page_index];
+  const auto &mapping =
+      presentation_replay_plan_.previous_projection_for_current_word;
+  if (mapping.size() != current_page.word_storage.size()) {
+    presentation_replay_plan_.ready = false;
+    ++rejected_presentation_replay_frames_;
+    return false;
+  }
+
+  static_cast<void>(PsyX_BeginScene());
+  DrawSync(0);
+  RECT16 completed_page{};
+  GR_SetOffscreenState(&completed_page, 0);
+  DRAWENV previous_draw_environment{};
+  GetDrawEnv(&previous_draw_environment);
+  GR_SetGuestDisplayGeometry(static_cast<int>(current_frame.display_width),
+                             static_cast<int>(current_frame.display_height));
+  GR_BeginGuestProjectionEpoch(
+      current_frame.generation, static_cast<int>(current_frame.display_width),
+      static_cast<int>(current_frame.display_height), 0, 0);
+  RECT16 replay_target{static_cast<short>(current_page.target.x),
+                       static_cast<short>(current_page.target.y),
+                       static_cast<short>(current_page.target.width),
+                       static_cast<short>(current_page.target.height)};
+  const auto replay_started =
+      GR_BeginGuestPresentationReplay(&replay_target) != 0;
+  auto replay_valid = replay_started;
+  if (replay_valid) {
+    replay_valid = GR_ClearGuestPresentationReplay(0U, 0U, 0U) != 0;
+  }
+  std::array<psx::GteProjectedVertex, 16U> interpolated_projections{};
+  std::array<std::uint32_t, 6U> replay_state{};
+  std::array<bool, 6U> replay_state_valid{};
+  for (const auto &event : current_page.events) {
+    if (!replay_valid) {
+      break;
+    }
+    const auto command = current_page.commandWords(event);
+    if (command.size() != event.word_count || command.empty()) {
+      replay_valid = false;
+      break;
+    }
+    if (event.kind == PresentationReplayEventKind::clear) {
+      replay_valid =
+          command.size() == 3U &&
+          static_cast<std::uint8_t>(command.front() >> 24U) == 0x02U &&
+          GR_ClearGuestPresentationReplay(
+              static_cast<unsigned char>(command.front()),
+              static_cast<unsigned char>(command.front() >> 8U),
+              static_cast<unsigned char>(command.front() >> 16U)) != 0;
+      continue;
+    }
+
+    const std::array state_commands{
+        0xe1000000U | (event.draw_context.draw_mode & 0x000003ffU),
+        0xe2000000U | (event.texture_window & 0x000fffffU),
+        0xe3000000U | (event.draw_context.draw_area_top_left & 0x0007ffffU),
+        0xe4000000U | (event.draw_context.draw_area_bottom_right & 0x0007ffffU),
+        0xe5000000U | (event.draw_context.draw_offset & 0x003fffffU),
+        0xe6000000U | (event.draw_context.mask_setting & 0x00000003U),
+    };
+    for (std::size_t state_index{}; state_index < state_commands.size();
+         ++state_index) {
+      const auto state = state_commands[state_index];
+      if (replay_state_valid[state_index] &&
+          replay_state[state_index] == state) {
+        continue;
+      }
+      dispatch(std::span<const std::uint32_t>{&state, 1U}, {}, false, false,
+               false, false, false);
+      replay_state[state_index] = state;
+      replay_state_valid[state_index] = true;
+      ++replayed_presentation_state_commands_;
+    }
+
+    const auto current_projections = current_page.resolvedProjections(event);
+    if (command.size() > interpolated_projections.size() ||
+        current_projections.size() != command.size()) {
+      replay_valid = false;
+      break;
+    }
+    std::ranges::copy(current_projections, interpolated_projections.begin());
+    for (std::size_t local_word{}; local_word < command.size(); ++local_word) {
+      const auto current_word = event.word_offset + local_word;
+      if (current_word >= mapping.size()) {
+        replay_valid = false;
+        break;
+      }
+      const auto previous_projection = mapping[current_word];
+      if (previous_projection ==
+          PresentationReplayInterpolationPlan::invalid_index) {
+        continue;
+      }
+      if (previous_projection >= previous_page.projection_storage.size()) {
+        replay_valid = false;
+        break;
+      }
+      interpolated_projections[local_word] = interpolateReplayProjection(
+          previous_page.projection_storage[previous_projection],
+          current_projections[local_word], alpha);
+    }
+    if (!replay_valid) {
+      break;
+    }
+    dispatch(command,
+             std::span<const psx::GteProjectedVertex>{
+                 interpolated_projections.data(), command.size()},
+             event.precise_candidate, event.allow_perspective,
+             event.allow_precise_screen, event.use_projective_depth, false);
+    const auto opcode = static_cast<std::uint8_t>(command.front() >> 24U);
+    if (opcode >= 0x20U && opcode < 0x40U && (opcode & 0x04U) != 0U) {
+      replay_state_valid[0U] = false;
+    }
+  }
+
+  if (replay_started && GR_EndGuestPresentationReplay() == 0) {
+    replay_valid = false;
+  }
+  if (replay_valid &&
+      GR_PresentGuestPresentationReplay(
+          current_frame.display_x, current_frame.display_y,
+          current_frame.display_width, current_frame.display_height) == 0) {
+    replay_valid = false;
+  }
+  PutDrawEnv(&previous_draw_environment);
+  PsyX_EndScene();
+  if (replay_valid) {
+    ++interpolated_presentation_replay_frames_;
+  } else {
+    presentation_replay_plan_.ready = false;
+    ++rejected_presentation_replay_frames_;
+  }
+  return true;
+}
+
+void PsyCrossGuestGpu::resetPresentationReplayHistory() noexcept {
+  pending_presentation_replay_frame_ = {};
+  previous_presentation_replay_frame_ = {};
+  current_presentation_replay_frame_ = {};
+  presentation_replay_plan_ = {};
+  presentation_mask_setting_ = 0U;
+}
+
 void PsyCrossGuestGpu::presentDisplay(std::uint16_t source_x,
                                       std::uint16_t source_y,
                                       std::uint16_t width, std::uint16_t height,
@@ -804,6 +1548,9 @@ void PsyCrossGuestGpu::presentDisplay(std::uint16_t source_x,
     DrawSync(0);
     RECT16 completed_page{};
     GR_SetOffscreenState(&completed_page, 0);
+    promotePresentationReplayFrame(
+        source_x, source_y, static_cast<std::uint16_t>(scanout_width),
+        static_cast<std::uint16_t>(scanout_height), enabled, rgb24, interlaced);
     if (GR_PresentHighResolutionVRAM(static_cast<int>(source_x),
                                      static_cast<int>(source_y),
                                      static_cast<int>(scanout_width),
@@ -1546,7 +2293,7 @@ void PsyCrossGuestGpu::dispatch(
     std::span<const std::uint32_t> command,
     std::span<const psx::GteProjectedVertex> projections,
     bool precise_candidate, bool allow_precise, bool allow_precise_screen,
-    bool use_projective_depth) {
+    bool use_projective_depth, bool record_statistics) {
   const auto opcode = static_cast<std::uint8_t>(command.front() >> 24U);
   const auto synchronize_vram = [] {
     DrawSync(0);
@@ -1586,7 +2333,7 @@ void PsyCrossGuestGpu::dispatch(
       (opcode >= 0xe1U && opcode <= 0xe6U)) {
     std::array<std::uint32_t, P_LEN + 16U> packet{};
     if (command.size() > packet.size() - P_LEN) {
-      ++unsupported_commands_;
+      unsupported_commands_ += record_statistics ? 1U : 0U;
       return;
     }
     auto *tag = reinterpret_cast<P_TAG *>(packet.data());
@@ -1612,12 +2359,12 @@ void PsyCrossGuestGpu::dispatch(
     }
 #if USE_PGXP
     if (opcode >= 0x20U && opcode < 0x40U) {
-      ++polygon_primitives_;
+      polygon_primitives_ += record_statistics ? 1U : 0U;
       if (precise_candidate) {
-        ++precise_candidates_;
+        precise_candidates_ += record_statistics ? 1U : 0U;
       }
       if (precise_candidate && !allow_precise) {
-        ++coherence_fallback_primitives_;
+        coherence_fallback_primitives_ += record_statistics ? 1U : 0U;
       }
       std::size_t vertex_count{};
       const auto coordinate_words =
@@ -1631,7 +2378,7 @@ void PsyCrossGuestGpu::dispatch(
         }
       }
       if (projected_vertices != 0U && projected_vertices < vertex_count) {
-        ++partial_projection_primitives_;
+        partial_projection_primitives_ += record_statistics ? 1U : 0U;
       }
     }
     if (opcode >= 0x20U && opcode < 0x80U) {
@@ -1646,7 +2393,7 @@ void PsyCrossGuestGpu::dispatch(
     if (pgxp_index != static_cast<u_short>(0xffffU)) {
       DrawPrimPGXP(tag, pgxp_index);
       if (allow_precise) {
-        ++precise_primitives_;
+        precise_primitives_ += record_statistics ? 1U : 0U;
       }
     } else {
       DrawPrim(tag);
@@ -1658,7 +2405,7 @@ void PsyCrossGuestGpu::dispatch(
   }
   if (opcode != 0x00U && opcode != 0x01U &&
       !(opcode >= 0xc0U && opcode < 0xe0U)) {
-    ++unsupported_commands_;
+    unsupported_commands_ += record_statistics ? 1U : 0U;
   }
 }
 
@@ -1674,6 +2421,7 @@ void PsyCrossGuestGpu::submit(
     pending_projections_.clear();
     pending_projection_identities_.clear();
     pending_dma_sources_.clear();
+    resetPresentationReplayHistory();
     command_buffer_epoch_ = command_buffer_epoch;
   }
   const auto pending_words_before_append = pending_.size();
@@ -1735,8 +2483,7 @@ void PsyCrossGuestGpu::submit(
   // packed witness index only when such a hole is actually present. Unique
   // witnesses recover one canonical PsyCross vertex; collisions fail closed.
   const auto catalog_recovery_demanded =
-      coherence_edge_snapping_enabled_ && quad_recovery_enabled_ &&
-      [&] {
+      coherence_edge_snapping_enabled_ && quad_recovery_enabled_ && [&] {
         if (!catalog_handle_active)
           return false;
         auto scanned = std::size_t{};
@@ -2285,6 +3032,8 @@ void PsyCrossGuestGpu::submit(
   }
 
   auto shared_mesh_context = currentPgxpDrawContext();
+  shared_mesh_context.mask_setting = presentation_mask_setting_;
+  auto presentation_texture_window = currentTextureWindow();
   auto consumed = std::size_t{};
   while (consumed < pending_.size()) {
     const auto remaining =
@@ -2342,8 +3091,7 @@ void PsyCrossGuestGpu::submit(
         resolved_storage[word] = *resolved;
         ++recovered_vertices;
       }
-      if (quad_recovery_enabled_ && missing_count == 1U &&
-          vertex_count == 4U) {
+      if (quad_recovery_enabled_ && missing_count == 1U && vertex_count == 4U) {
         const auto quad_words = std::array<std::size_t, 4U>{
             coordinate_words[0U], coordinate_words[1U], coordinate_words[2U],
             coordinate_words[3U]};
@@ -2509,8 +3257,7 @@ void PsyCrossGuestGpu::submit(
           polygon && !identity_resolution_failed &&
           !catalog_resolution_failed &&
           probePrecisePrimitive(opcode, command, resolved_projections,
-                                &reject_reason,
-                                projective_depth_enabled_);
+                                &reject_reason, projective_depth_enabled_);
     }
 
     if (precise_candidate && shared_mesh_policy_active_) {
@@ -2738,11 +3485,35 @@ void PsyCrossGuestGpu::submit(
                                    precise_candidate;
     const auto allow_precise_screen =
         geometry_enabled_ && precise_screen_position_enabled_;
+    auto command_dma_sources = std::span<const psx::GpuDmaWordSource>{};
+    if (!pending_dma_sources_.empty()) {
+      command_dma_sources =
+          std::span<const psx::GpuDmaWordSource>{pending_dma_sources_}.subspan(
+              consumed, length);
+    }
+    if (presentation_interpolation_enabled_) {
+      if (opcode >= 0x20U && opcode < 0x80U) {
+        capturePresentationReplayDraw(
+            command, dispatch_projections, command_dma_sources,
+            shared_mesh_context, presentation_texture_window, precise_candidate,
+            allow_perspective, allow_precise_screen, projective_depth_enabled_);
+      } else if (opcode == 0x02U) {
+        capturePresentationReplayClear(command, command_dma_sources,
+                                       shared_mesh_context,
+                                       presentation_texture_window);
+      } else if (opcode >= 0x80U && opcode < 0xc0U) {
+        notePresentationReplayVramCommand();
+      }
+    }
     dispatch(command, dispatch_projections, precise_candidate,
              allow_perspective, allow_precise_screen,
              projective_depth_enabled_);
     ++submitted_commands_;
     updatePgxpDrawContext(shared_mesh_context, opcode, command.front());
+    presentation_mask_setting_ = shared_mesh_context.mask_setting;
+    if (opcode == 0xe2U) {
+      presentation_texture_window = command.front() & 0x000fffffU;
+    }
     consumed += length;
   }
   if (consumed != 0U) {
@@ -2760,10 +3531,9 @@ void PsyCrossGuestGpu::submit(
               static_cast<std::ptrdiff_t>(consumed));
     }
     if (!pending_dma_sources_.empty()) {
-      pending_dma_sources_.erase(
-          pending_dma_sources_.begin(),
-          pending_dma_sources_.begin() +
-              static_cast<std::ptrdiff_t>(consumed));
+      pending_dma_sources_.erase(pending_dma_sources_.begin(),
+                                 pending_dma_sources_.begin() +
+                                     static_cast<std::ptrdiff_t>(consumed));
     }
   }
   if (pending_.size() > maximum_buffered_words) {

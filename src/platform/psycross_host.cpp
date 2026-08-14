@@ -17,6 +17,7 @@
 #include "sf/game/mission.hpp"
 #include "sf/game/retail_cheats.hpp"
 #include "sf/game/title.hpp"
+#include "sf/platform/audio_output_policy.hpp"
 
 #include <PsyX/PsyX_globals.h>
 #include <PsyX/PsyX_public.h>
@@ -193,6 +194,8 @@ public:
     guest_gpu_.setGeometryOptions(true, true, true, true, false, true, true);
     guest_gpu_.setRuntimeGeometryPolicy(true, false, false);
 
+    guest_gpu_.setPresentationInterpolationEnabled(
+        graphics_.frame_limit == 0U || graphics_.frame_limit > 30U);
     configureControllerProtocol(graphics_.controller_protocol);
     PsyX_Initialise(title_.data(), graphics_.width, graphics_.height, 0);
     configurePresentation(graphics_);
@@ -222,6 +225,7 @@ public:
     std::uint64_t guest_projection_epoch{};
     auto runtime_frame_ready = false;
     RuntimeVisualPublicationTracker runtime_visual_publications;
+    RuntimePresentationInterpolationClock runtime_interpolation_clock;
 
     RuntimePresentationPolicy runtime_presentation;
     const auto prepareRuntimeDisplay =
@@ -241,11 +245,17 @@ public:
                                      static_cast<int>(frame.display_height));
         };
 
-    const auto presentRuntimeDisplay = [this](const RuntimeGpuFrame &frame) {
+    const auto presentRuntimeDisplay = [this, &runtime_interpolation_clock](
+                                           const RuntimeGpuFrame &frame) {
+      const auto promotions_before =
+          guest_gpu_.promotedPresentationReplayFrames();
       guest_gpu_.presentDisplay(frame.display_x, frame.display_y,
                                 frame.display_width, frame.display_height,
                                 frame.display_enabled, frame.display_rgb24,
                                 frame.display_interlaced);
+      if (guest_gpu_.promotedPresentationReplayFrames() != promotions_before) {
+        runtime_interpolation_clock.publishAuthoredFrame();
+      }
     };
     for (;;) {
       auto visual_dirty = false;
@@ -349,6 +359,13 @@ public:
             runtime_audio->flush();
           }
           runtime_audio->update();
+        }
+        const auto interpolation_alpha =
+            runtime_interpolation_clock.advance(elapsed_seconds);
+        if (runtime_frame_ready && gpu_frame_ &&
+            guest_gpu_.presentInterpolatedDisplay(
+                static_cast<float>(interpolation_alpha))) {
+          continue;
         }
         const auto presentation_mode =
             runtimeHostPresentationMode(visual_dirty);
