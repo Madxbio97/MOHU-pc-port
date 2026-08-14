@@ -16,10 +16,13 @@ void require(bool condition, const char *message) {
 }
 
 [[nodiscard]] bool aligned(const mohu::GpuCommandStream &stream) noexcept {
-  return stream.frameWords().size() == stream.frameProjections().size() &&
-         stream.frameWords().size() ==
-             stream.frameProjectionIdentities().size() &&
-         stream.frameWords().size() == stream.frameDmaSources().size();
+  const auto word_count = stream.frameWords().size();
+  const auto empty_or_aligned = [word_count](auto sidecar) noexcept {
+    return sidecar.empty() || sidecar.size() == word_count;
+  };
+  return empty_or_aligned(stream.frameProjections()) &&
+         empty_or_aligned(stream.frameProjectionIdentities()) &&
+         empty_or_aligned(stream.frameDmaSources());
 }
 
 void testCommandCapture() {
@@ -30,10 +33,9 @@ void testCommandCapture() {
   require(gpu.totalGp0Words() == 2U && gpu.frameWords().size() == 2U &&
               gpu.firstWords().size() == 2U && aligned(gpu),
           "GP0 command vectors diverged");
-  require(gpu.frameProjectionIdentities()[0U] == 0U,
-          "Direct GP0 provenance mismatch");
-  require(!gpu.frameDmaSources()[0U].valid(),
-          "Direct GP0 acquired DMA provenance");
+  require(gpu.frameProjectionIdentities().empty() &&
+              gpu.frameDmaSources().empty(),
+          "Empty provenance sidecars were materialized");
 
   gpu.beginFrame();
   require(gpu.frameWords().empty() && gpu.frameProjections().empty() &&
@@ -90,19 +92,53 @@ void testProjectionSidecars() {
           "Disabled projection sidecars still captured data");
 }
 
+void testLazyTransferSidecars() {
+  mohu::GpuCommandStream gpu;
+  constexpr sf::psx::GpuDmaWordSource dma_source{
+      0x2000U, 0x2000U, sf::psx::GpuDmaSourceKind::linear};
+  constexpr std::array upload{0xa0000000U, 0x00000000U, 0x00010010U,
+                              0x80112233U, 0xa0445566U, 0x80778899U,
+                              0xa0aabbccU, 0x80112233U, 0xa0445566U,
+                              0x80778899U, 0xa0aabbccU};
+  for (std::size_t index{}; index < upload.size(); ++index) {
+    require(gpu.writeGp0FromRam(upload[index], dma_source, nullptr, 0U),
+            "CPU-to-VRAM payload capture failed");
+  }
+  require(gpu.frameWords().size() == upload.size() &&
+              gpu.frameProjectionIdentities().empty() &&
+              gpu.frameDmaSources().empty() && aligned(gpu),
+          "CPU-to-VRAM payload retained an unused provenance sidecar");
+
+  gpu.beginFrame();
+  constexpr std::array fill_with_upload_lookalike{0x02000000U, 0xa0000000U,
+                                                  0x00010001U, 0xe1000000U};
+  for (std::size_t index{}; index < fill_with_upload_lookalike.size();
+       ++index) {
+    require(gpu.writeGp0FromRam(fill_with_upload_lookalike[index], dma_source,
+                                nullptr, index + 1U),
+            "Fill/lookalike command capture failed");
+  }
+  require(gpu.frameWords().size() == fill_with_upload_lookalike.size() &&
+              gpu.frameProjectionIdentities().size() ==
+                  fill_with_upload_lookalike.size() &&
+              gpu.frameDmaSources().size() ==
+                  fill_with_upload_lookalike.size() &&
+              aligned(gpu),
+          "Fill payload lookalike disabled aligned provenance");
+}
+
 void testControlCommands() {
   mohu::GpuCommandStream gpu;
   gpu.writeGp1(0x03000001U);
-  require(!gpu.displayState().enabled &&
-              (gpu.readStatus() & (1U << 23U)) != 0U,
+  require(!gpu.displayState().enabled && (gpu.readStatus() & (1U << 23U)) != 0U,
           "GP1 display disable mismatch");
   gpu.writeGp1(0x05019040U);
   require(gpu.displayState().x == 64U && gpu.displayState().y == 100U,
           "GP1 display origin mismatch");
   gpu.writeGp1(0x08000035U);
   require(gpu.displayState().width == 320U &&
-              gpu.displayState().height == 480U &&
-              gpu.displayState().rgb24 && gpu.displayState().interlaced,
+              gpu.displayState().height == 480U && gpu.displayState().rgb24 &&
+              gpu.displayState().interlaced,
           "GP1 display mode mismatch");
   gpu.writeGp1(0x04000002U);
   require(((gpu.readStatus() >> 29U) & 3U) == 2U &&
@@ -115,10 +151,8 @@ void testControlCommands() {
               gpu.frameDmaSources().empty(),
           "GP1 command-buffer reset mismatch");
   gpu.writeGp1(0x00000000U);
-  require(gpu.commandBufferEpoch() == 2U &&
-              gpu.readStatus() == 0x14802000U &&
-              gpu.displayState().enabled &&
-              gpu.displayState().width == 256U &&
+  require(gpu.commandBufferEpoch() == 2U && gpu.readStatus() == 0x14802000U &&
+              gpu.displayState().enabled && gpu.displayState().width == 256U &&
               gpu.displayState().height == 240U,
           "Full GP1 reset mismatch");
 
@@ -144,6 +178,7 @@ int main() {
   try {
     testCommandLengths();
     testCommandCapture();
+    testLazyTransferSidecars();
     testProjectionSidecars();
     testControlCommands();
   } catch (const std::exception &error) {

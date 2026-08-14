@@ -3,6 +3,7 @@
 #include "sf/psx/machine.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -81,7 +82,14 @@ public:
     }
     for (std::size_t index{}; index < word_indices.size(); ++index) {
       if (identities[index] == 0U ||
-          word_indices[index] >= frame_projection_identities_.size()) {
+          word_indices[index] >= frame_words_.size()) {
+        return false;
+      }
+    }
+    if (frame_projection_identities_.empty()) {
+      try {
+        frame_projection_identities_.resize(frame_words_.size());
+      } catch (...) {
         return false;
       }
     }
@@ -111,10 +119,20 @@ public:
   }
 
 private:
+  enum class Gp0BoundaryState : std::uint8_t {
+    command_start,
+    fixed_payload,
+    polyline,
+    cpu_to_vram_header,
+    cpu_to_vram_payload,
+  };
+
   [[nodiscard]] bool appendGp0(std::uint32_t value,
                                const sf::psx::GteProjectedVertex *projected,
                                std::uint64_t source_identity,
                                sf::psx::GpuDmaWordSource dma_source) noexcept;
+  void advanceGp0Boundary(std::uint32_t value) noexcept;
+  void resetFrameCapture() noexcept;
   static constexpr std::uint32_t reset_status = 0x14802000U;
   std::vector<std::uint32_t> frame_words_;
   std::vector<sf::psx::GteProjectedVertex> frame_projections_;
@@ -122,6 +140,10 @@ private:
   std::vector<sf::psx::GpuDmaWordSource> frame_dma_sources_;
   bool projection_tracking_{true};
   bool projection_identity_tracking_{true};
+  bool dma_sidecar_disabled_{};
+  Gp0BoundaryState gp0_boundary_state_{Gp0BoundaryState::command_start};
+  std::size_t gp0_words_remaining_{};
+  std::size_t gp0_polyline_minimum_remaining_{};
   std::array<std::uint32_t, 16U> first_words_{};
   std::size_t first_word_count_{};
   std::uint32_t status_{reset_status};

@@ -1,32 +1,104 @@
 #include "mohu/gpu_command_stream.hpp"
+#include "sf/psx/gp0_command.hpp"
 
 namespace mohu {
 
-void GpuCommandStream::beginFrame() noexcept {
+void GpuCommandStream::resetFrameCapture() noexcept {
   frame_words_.clear();
   frame_projections_.clear();
   frame_projection_identities_.clear();
   frame_dma_sources_.clear();
+  dma_sidecar_disabled_ = false;
+  gp0_boundary_state_ = Gp0BoundaryState::command_start;
+  gp0_words_remaining_ = 0U;
+  gp0_polyline_minimum_remaining_ = 0U;
 }
 
-bool GpuCommandStream::appendGp0(std::uint32_t value,
-                                 const sf::psx::GteProjectedVertex *projected,
-                                 std::uint64_t source_identity,
-                                 sf::psx::GpuDmaWordSource dma_source) noexcept {
+void GpuCommandStream::beginFrame() noexcept { resetFrameCapture(); }
+
+void GpuCommandStream::advanceGp0Boundary(std::uint32_t value) noexcept {
+  switch (gp0_boundary_state_) {
+  case Gp0BoundaryState::command_start: {
+    const auto opcode = static_cast<std::uint8_t>(value >> 24U);
+    if (opcode >= 0xa0U && opcode < 0xc0U) {
+      gp0_boundary_state_ = Gp0BoundaryState::cpu_to_vram_header;
+      gp0_words_remaining_ = 2U;
+      return;
+    }
+    if ((opcode >= 0x48U && opcode < 0x50U) ||
+        (opcode >= 0x58U && opcode < 0x60U)) {
+      gp0_boundary_state_ = Gp0BoundaryState::polyline;
+      gp0_polyline_minimum_remaining_ = opcode < 0x50U ? 2U : 3U;
+      return;
+    }
+    const auto length = opcode >= 0xc0U && opcode < 0xe0U
+                            ? 3U
+                            : sf::psx::gp0FixedCommandLength(opcode);
+    if (length > 1U) {
+      gp0_boundary_state_ = Gp0BoundaryState::fixed_payload;
+      gp0_words_remaining_ = length - 1U;
+    }
+    return;
+  }
+  case Gp0BoundaryState::fixed_payload:
+  case Gp0BoundaryState::cpu_to_vram_payload:
+    if (--gp0_words_remaining_ == 0U) {
+      gp0_boundary_state_ = Gp0BoundaryState::command_start;
+    }
+    return;
+  case Gp0BoundaryState::polyline:
+    if (gp0_polyline_minimum_remaining_ != 0U) {
+      --gp0_polyline_minimum_remaining_;
+    } else if (sf::psx::gp0IsPolylineTerminator(value)) {
+      gp0_boundary_state_ = Gp0BoundaryState::command_start;
+    }
+    return;
+  case Gp0BoundaryState::cpu_to_vram_header:
+    if (--gp0_words_remaining_ != 0U) {
+      return;
+    }
+    const auto pixels =
+        static_cast<std::size_t>(sf::psx::gp0TransferWidth(value)) *
+        sf::psx::gp0TransferHeight(value);
+    gp0_words_remaining_ = (pixels + 1U) / 2U;
+    gp0_boundary_state_ = Gp0BoundaryState::cpu_to_vram_payload;
+    return;
+  }
+}
+
+bool GpuCommandStream::appendGp0(
+    std::uint32_t value, const sf::psx::GteProjectedVertex *projected,
+    std::uint64_t source_identity,
+    sf::psx::GpuDmaWordSource dma_source) noexcept {
   const auto words_size = frame_words_.size();
   const auto projections_size = frame_projections_.size();
   const auto identities_size = frame_projection_identities_.size();
   const auto sources_size = frame_dma_sources_.size();
+  const auto command_start =
+      gp0_boundary_state_ == Gp0BoundaryState::command_start;
+  const auto opcode = static_cast<std::uint8_t>(value >> 24U);
+  const auto disable_dma_sidecar =
+      command_start && opcode >= 0x80U && opcode < 0xc0U;
   try {
     frame_words_.push_back(value);
     if (projection_tracking_) {
       frame_projections_.push_back(
           projected != nullptr ? *projected : sf::psx::GteProjectedVertex{});
     }
-    if (projection_identity_tracking_) {
+    if (projection_identity_tracking_ &&
+        (!frame_projection_identities_.empty() || source_identity != 0U)) {
+      if (frame_projection_identities_.empty()) {
+        frame_projection_identities_.resize(words_size);
+      }
       frame_projection_identities_.push_back(source_identity);
     }
-    frame_dma_sources_.push_back(dma_source);
+    if (!dma_sidecar_disabled_ && !disable_dma_sidecar &&
+        (!frame_dma_sources_.empty() || dma_source.valid())) {
+      if (frame_dma_sources_.empty()) {
+        frame_dma_sources_.resize(words_size);
+      }
+      frame_dma_sources_.push_back(dma_source);
+    }
   } catch (...) {
     while (frame_dma_sources_.size() > sources_size) {
       frame_dma_sources_.pop_back();
@@ -42,6 +114,11 @@ bool GpuCommandStream::appendGp0(std::uint32_t value,
     }
     return false;
   }
+  if (disable_dma_sidecar) {
+    frame_dma_sources_.clear();
+    dma_sidecar_disabled_ = true;
+  }
+  advanceGp0Boundary(value);
   if (first_word_count_ < first_words_.size()) {
     first_words_[first_word_count_] = value;
     ++first_word_count_;
@@ -86,17 +163,11 @@ void GpuCommandStream::writeGp1(std::uint32_t value) noexcept {
     status_ = reset_status;
     display_state_ = {};
     ++command_buffer_epoch_;
-    frame_words_.clear();
-    frame_projections_.clear();
-    frame_projection_identities_.clear();
-    frame_dma_sources_.clear();
+    resetFrameCapture();
     break;
   case 0x01U:
     ++command_buffer_epoch_;
-    frame_words_.clear();
-    frame_projections_.clear();
-    frame_projection_identities_.clear();
-    frame_dma_sources_.clear();
+    resetFrameCapture();
     break;
   case 0x02U:
     status_ &= ~(1U << 24U);
