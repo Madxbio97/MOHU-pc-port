@@ -920,15 +920,8 @@ void PsyX_Sys_DoPollEvent()
 
 char begin_scene_flag = 0;
 
-char PsyX_BeginScene()
+static void PsyX_UpdatePresentationSync()
 {
-	PsyX_Sys_DoPollEvent();
-
-	if (begin_scene_flag)
-		return 0;
-
-	assert(!begin_scene_flag);
-
 	{
 		int swapInterval =
 			(g_cfg_swapInterval && g_enableSwapInterval && !g_skipSwapInterval)
@@ -949,6 +942,18 @@ char PsyX_BeginScene()
 			PsyX_ResetFrameLimiter();
 		}
 	}
+}
+
+char PsyX_BeginScene()
+{
+	PsyX_Sys_DoPollEvent();
+
+	if (begin_scene_flag)
+		return 0;
+
+	assert(!begin_scene_flag);
+
+	PsyX_UpdatePresentationSync();
 
 	GR_BeginScene();
 
@@ -991,6 +996,21 @@ void PsyX_EndScene()
 
 	GR_SwapWindow();
 	PsyX_PaceCompletedFrame();
+}
+
+char PsyX_PresentCachedFrame()
+{
+	PsyX_Sys_DoPollEvent();
+
+	if (begin_scene_flag)
+		return 0;
+
+	assert(!begin_scene_flag);
+	PsyX_UpdatePresentationSync();
+	GR_SwapWindow();
+	PsyX_PaceCompletedFrame();
+	PsyX_Log_Flush();
+	return 1;
 }
 
 #if !defined(__EMSCRIPTEN__) && !defined(__ANDROID__)

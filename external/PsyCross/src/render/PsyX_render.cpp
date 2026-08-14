@@ -3894,6 +3894,7 @@ void GR_UpdateVRAM() {
 }
 
 void GR_SwapWindow() {
+  PsyX_CommitDrawableSize();
 #if defined(RENDERER_OGL) || defined(RENDERER_OGLES)
   PsyX_PresentNativeFramebuffer();
   SDL_GL_SwapWindow(g_window);

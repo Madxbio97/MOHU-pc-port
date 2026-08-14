@@ -449,14 +449,15 @@ private:
   std::uint8_t maximum_step_{1U};
 };
 
-struct RuntimeHostIterationPolicy final {
-  bool present_runtime_frame{true};
-  bool refresh_retained_display{};
+enum class RuntimeHostPresentationMode : std::uint8_t {
+  render,
+  cached,
 };
 
-[[nodiscard]] inline constexpr RuntimeHostIterationPolicy
-runtimeHostIterationPolicy(std::size_t guest_steps) noexcept {
-  return RuntimeHostIterationPolicy{true, guest_steps == 0U};
+[[nodiscard]] inline constexpr RuntimeHostPresentationMode
+runtimeHostPresentationMode(std::size_t guest_steps) noexcept {
+  return guest_steps == 0U ? RuntimeHostPresentationMode::cached
+                           : RuntimeHostPresentationMode::render;
 }
 
 // OpenAL consumes a 44.1 kHz stream in wall-clock time, while an overloaded

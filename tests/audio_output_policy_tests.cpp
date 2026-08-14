@@ -405,15 +405,14 @@ void testRuntimeGuestCadenceIsPresentationIndependent() {
 }
 
 void testRuntimePresentationIsGuestIndependent() {
-  const auto idle = sf::platform::runtimeHostIterationPolicy(0U);
-  require(idle.present_runtime_frame && idle.refresh_retained_display,
+  const auto idle = sf::platform::runtimeHostPresentationMode(0U);
+  require(idle == sf::platform::RuntimeHostPresentationMode::cached,
           "High-refresh presentation did not reuse an idle guest frame");
 
-  const auto stepped = sf::platform::runtimeHostIterationPolicy(1U);
-  const auto catch_up = sf::platform::runtimeHostIterationPolicy(4U);
-  require(stepped.present_runtime_frame && !stepped.refresh_retained_display &&
-              catch_up.present_runtime_frame &&
-              !catch_up.refresh_retained_display,
+  const auto stepped = sf::platform::runtimeHostPresentationMode(1U);
+  const auto catch_up = sf::platform::runtimeHostPresentationMode(4U);
+  require(stepped == sf::platform::RuntimeHostPresentationMode::render &&
+              catch_up == sf::platform::RuntimeHostPresentationMode::render,
           "A runtime iteration with new guest work suppressed presentation");
 
   require(

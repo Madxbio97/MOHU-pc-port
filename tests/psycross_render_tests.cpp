@@ -938,6 +938,23 @@ int main() {
     PsyX_Shutdown();
     return 60;
   }
+
+  const auto cached_clear_serial = GR_GetDepthClearSerial(0);
+  GR_QueueDrawableSize(drawable_before_w + 9, drawable_before_h + 7);
+  const auto cached_present = PsyX_PresentCachedFrame();
+  int cached_drawable_w{};
+  int cached_drawable_h{};
+  GR_GetCommittedDrawableSize(&cached_drawable_w, &cached_drawable_h);
+  GR_QueueDrawableSize(drawable_before_w, drawable_before_h);
+  const auto restored_cached_present = PsyX_PresentCachedFrame();
+  if (cached_present == 0 || restored_cached_present == 0 ||
+      cached_drawable_w != drawable_before_w + 9 ||
+      cached_drawable_h != drawable_before_h + 7 ||
+      GR_GetDepthClearSerial(0) != cached_clear_serial) {
+    std::cerr << "Cached present reran scene work or ignored drawable resize\n";
+    PsyX_Shutdown();
+    return 103;
+  }
   // Catch-up submits can queue vertices decoded under different display modes
   // before their shared DrawSync. Each split must preserve the dimensions used
   // for both vertex normalization and projection replay.

@@ -586,6 +586,7 @@ bool waitVideoFrame(
         clock.start();
         audio.start();
     }
+    auto presented_fade = std::optional<std::uint8_t>{};
     do {
         const auto pressed = updateInput(pad, previous_buttons);
         audio.update();
@@ -596,7 +597,12 @@ bool waitVideoFrame(
                 ? std::clamp<long>(
                       std::lround((1.0 - fade_progress) * 255.0), 0L, 255L)
                 : 0L);
-        presentMovieFrame(video_texture, {}, fade_intensity);
+        if (!presented_fade || *presented_fade != fade_intensity) {
+            presentMovieFrame(video_texture, {}, fade_intensity);
+            presented_fade = fade_intensity;
+        } else if (PsyX_PresentCachedFrame() == 0) {
+            presentMovieFrame(video_texture, {}, fade_intensity);
+        }
         if (allow_skip && (pressed & skip_buttons) != 0) {
             return false;
         }
@@ -642,10 +648,14 @@ bool holdVideoFrame(
     video_texture.upload(frame);
     const auto frequency = SDL_GetPerformanceFrequency();
     const auto started = SDL_GetPerformanceCounter();
+    auto presented = false;
     do {
         const auto pressed = updateInput(pad, previous_buttons);
         audio.update();
-        presentMovieFrame(video_texture, {}, fade_intensity);
+        if (!presented || PsyX_PresentCachedFrame() == 0) {
+            presentMovieFrame(video_texture, {}, fade_intensity);
+            presented = true;
+        }
         if (allow_skip && (pressed & skip_buttons) != 0) {
             return false;
         }

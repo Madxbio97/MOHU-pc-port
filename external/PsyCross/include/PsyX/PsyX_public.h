@@ -169,6 +169,10 @@ extern char PsyX_BeginScene(void);
 /* Usually called after DrawOTag/DrawOTagEnv */
 extern void PsyX_EndScene(void);
 
+/* Presents the completed native framebuffer without rerunning scene work or
+ * postprocessing. Returns zero while a scene is still open. */
+extern char PsyX_PresentCachedFrame(void);
+
 /* Counts calls and returns the most recent one-second frame-rate sample. */
 extern unsigned int PsyX_CalcFPS(void);
 

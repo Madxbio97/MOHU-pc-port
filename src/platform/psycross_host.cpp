@@ -221,6 +221,7 @@ public:
     auto runtime_previous_counter = SDL_GetPerformanceCounter();
     const auto runtime_counter_frequency = SDL_GetPerformanceFrequency();
     std::uint64_t guest_projection_epoch{};
+    auto runtime_frame_ready = false;
 
     RuntimePresentationPolicy runtime_presentation;
     const auto prepareRuntimeDisplay =
@@ -332,16 +333,20 @@ public:
           }
           runtime_audio->update();
         }
-        const auto iteration_policy = runtimeHostIterationPolicy(guest_steps);
-        if (iteration_policy.refresh_retained_display && gpu_frame_) {
-          const auto gpu_frame = gpu_frame_();
-          prepareRuntimeDisplay(gpu_frame);
-          presentRuntimeDisplay(gpu_frame);
+        const auto presentation_mode =
+            runtimeHostPresentationMode(guest_steps);
+        if (presentation_mode == RuntimeHostPresentationMode::cached &&
+            runtime_frame_ready && gpu_frame_ &&
+            PsyX_PresentCachedFrame() != 0) {
+          continue;
         }
       }
       static_cast<void>(PsyX_BeginScene());
       DrawSync(0);
       PsyX_EndScene();
+      if (gpu_frame_) {
+        runtime_frame_ready = true;
+      }
     }
   }
 
