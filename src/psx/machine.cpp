@@ -1459,6 +1459,7 @@ bool PsxMachine::executeLinearDma(DmaChannel channel) noexcept {
 
   auto *port = dma_ports_[index];
   auto address = dma_.madr(channel) & 0x00fffffcU;
+  const auto transfer_root = address & ram_address_mask & ~3U;
   const auto control = dma_.chcr(channel);
   const auto from_ram = (control & 1U) != 0U;
   const auto reverse = (control & 2U) != 0U;
@@ -1481,7 +1482,10 @@ bool PsxMachine::executeLinearDma(DmaChannel channel) noexcept {
         const auto provenance =
             cpu_.projectedVertexProvenanceAt(ram_address, value);
         written = gpu_port_->writeGp0FromRam(
-            value, ram_address, provenance.projected, provenance.identity);
+            value,
+            GpuDmaWordSource{ram_address, transfer_root,
+                             GpuDmaSourceKind::linear},
+            provenance.projected, provenance.identity);
       } else {
         written = port->writeDmaWord(value);
       }
@@ -1511,6 +1515,7 @@ bool PsxMachine::executeLinkedListDma(DmaChannel channel) noexcept {
   }
 
   auto address = dma_.madr(channel) & ram_address_mask & ~3U;
+  const auto transfer_root = address;
   std::uint64_t transferred_words{};
   for (std::uint64_t node = 0U; node < maximum_linked_list_nodes; ++node) {
     std::uint32_t header{};
@@ -1533,7 +1538,10 @@ bool PsxMachine::executeLinkedListDma(DmaChannel channel) noexcept {
         const auto provenance =
             cpu_.projectedVertexProvenanceAt(word_address, value);
         written = gpu_port_->writeGp0FromRam(
-            value, word_address, provenance.projected, provenance.identity);
+            value,
+            GpuDmaWordSource{word_address, transfer_root,
+                             GpuDmaSourceKind::linked_list},
+            provenance.projected, provenance.identity);
       } else {
         written = port->writeDmaWord(value);
       }

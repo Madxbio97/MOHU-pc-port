@@ -131,6 +131,10 @@ public:
   gpuProjectionIdentities() const noexcept {
     return gpu_.frameProjectionIdentities();
   }
+  [[nodiscard]] std::span<const sf::psx::GpuDmaWordSource>
+  gpuDmaSources() const noexcept {
+    return gpu_.frameDmaSources();
+  }
   [[nodiscard]] std::span<const sf::psx::GteProjectedVertex>
   gpuProjectionCatalog() const noexcept {
     return cpu_.gpuProjectionCatalog();

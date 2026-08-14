@@ -447,7 +447,8 @@ int main(int argc, char **argv) {
               display.enabled,
               geometry.rgb24,
               geometry.interlaced,
-              runtime->gpuCommandBufferEpoch()};
+              runtime->gpuCommandBufferEpoch(),
+              runtime->gpuDmaSources()};
         },
         graphics, input, runtime_actions,
         [&runtime](std::span<sf::psx::SpuPcmFrame> destination) noexcept {

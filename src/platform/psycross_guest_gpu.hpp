@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sf/psx/gpu_dma_source.hpp"
 #include "sf/psx/gte_runtime.hpp"
 
 #include <array>
@@ -29,7 +30,8 @@ public:
               std::span<const psx::GteProjectedVertex> projections = {},
               std::span<const std::uint64_t> projection_identities = {},
               std::uint64_t command_buffer_epoch = 0U,
-              std::span<const psx::GteProjectedVertex> projection_catalog = {});
+              std::span<const psx::GteProjectedVertex> projection_catalog = {},
+              std::span<const psx::GpuDmaWordSource> dma_sources = {});
 
   void setCoherenceEdgeSnapping(bool enabled) noexcept {
     coherence_edge_snapping_enabled_ = enabled;
@@ -314,6 +316,7 @@ private:
   std::vector<std::uint32_t> pending_;
   std::vector<psx::GteProjectedVertex> pending_projections_;
   std::vector<std::uint64_t> pending_projection_identities_;
+  std::vector<psx::GpuDmaWordSource> pending_dma_sources_;
   std::vector<CanonicalProjectionEntry> canonical_projection_table_;
   std::uint32_t canonical_projection_generation_{};
   bool canonical_projection_overflow_{};

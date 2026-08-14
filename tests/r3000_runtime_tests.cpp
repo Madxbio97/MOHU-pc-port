@@ -292,6 +292,14 @@ public:
     projection_identities.push_back(source_identity);
     return true;
   }
+  [[nodiscard]] bool
+  writeGp0FromRam(std::uint32_t value, sf::psx::GpuDmaWordSource source,
+                  const sf::psx::GteProjectedVertex *projected,
+                  std::uint64_t source_identity) noexcept override {
+    dma_sources.push_back(source);
+    return writeGp0FromRam(value, source.word_address, projected,
+                           source_identity);
+  }
   void writeGp1(std::uint32_t) noexcept override {}
   [[nodiscard]] bool readGp0(std::uint32_t &value) noexcept override {
     value = 0U;
@@ -303,6 +311,7 @@ public:
 
   std::vector<std::uint32_t> words;
   std::vector<std::uint32_t> source_addresses;
+  std::vector<sf::psx::GpuDmaWordSource> dma_sources;
   std::vector<sf::psx::GteProjectedVertex> projections;
   std::vector<std::uint64_t> projection_identities;
 };
@@ -664,8 +673,8 @@ void testMachineLinkedListDma() {
 
   sf::psx::R3000Runtime runtime;
   sf::psx::PsxMachine machine{runtime};
-  RecordingDmaPort gpu;
-  machine.attachDmaPort(sf::psx::DmaChannel::gpu, &gpu);
+  RecordingGpuPort gpu;
+  machine.attachGpuPort(&gpu);
   require(runtime.write32(0x1000U, 0x02002000U) &&
               runtime.write32(0x1004U, payloads[0]) &&
               runtime.write32(0x1008U, payloads[1]) &&
@@ -676,14 +685,22 @@ void testMachineLinkedListDma() {
               runtime.write32(gpu_dma + 8U, 0x01000401U),
           "Could not start linked-list GPU DMA");
   machine.advanceTicks(30U);
-  require(gpu.written_words.empty(),
+  require(gpu.words.empty(),
           "Linked-list GPU DMA completed before its 31-tick deadline");
   machine.advanceTicks(1U);
   require(
-      gpu.written_words ==
+      gpu.words ==
               std::vector<std::uint32_t>(payloads.begin(), payloads.end()) &&
+          gpu.dma_sources ==
+              std::vector<sf::psx::GpuDmaWordSource>{
+                  {0x1004U, 0x1000U,
+                   sf::psx::GpuDmaSourceKind::linked_list},
+                  {0x1008U, 0x1000U,
+                   sf::psx::GpuDmaSourceKind::linked_list},
+                  {0x2004U, 0x1000U,
+                   sf::psx::GpuDmaSourceKind::linked_list}} &&
           (machine.dma().chcr(sf::psx::DmaChannel::gpu) & 0x01000000U) == 0U,
-      "Linked-list GPU DMA payload order or completion mismatch");
+      "Linked-list GPU DMA provenance or completion mismatch");
 }
 
 void testMachineCdRomDmaAndSnapshot() {
@@ -1552,6 +1569,10 @@ void testGteGameplayMath() {
   require(projected_gpu.words == std::vector<std::uint32_t>{32U} &&
               projected_gpu.source_addresses ==
                   std::vector<std::uint32_t>{0x00010200U} &&
+              projected_gpu.dma_sources ==
+                  std::vector<sf::psx::GpuDmaWordSource>{
+                      {0x00010200U, 0x00010200U,
+                       sf::psx::GpuDmaSourceKind::linear}} &&
               projected_gpu.projections.size() == 1U &&
               projected_gpu.projections.front().valid &&
               projected_gpu.projections.front().screen_x == precise->screen_x &&

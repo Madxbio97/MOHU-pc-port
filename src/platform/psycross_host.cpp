@@ -313,7 +313,8 @@ public:
               guest_gpu_.submit(gpu_frame.words, gpu_frame.projections,
                                 gpu_frame.projection_identities,
                                 gpu_frame.command_buffer_epoch,
-                                gpu_frame.projection_catalog);
+                                gpu_frame.projection_catalog,
+                                gpu_frame.dma_sources);
             }
           }
           if (!runtime_running) {

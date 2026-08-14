@@ -3,6 +3,7 @@
 #include "sf/game/controller_bindings.hpp"
 #include "sf/game/retail_cheats.hpp"
 #include "sf/platform/player_input.hpp"
+#include "sf/psx/gpu_dma_source.hpp"
 #include "sf/psx/gte_runtime.hpp"
 
 #include <array>
@@ -207,6 +208,7 @@ struct RuntimeGpuFrame {
   bool display_rgb24{};
   bool display_interlaced{};
   std::uint64_t command_buffer_epoch{};
+  std::span<const psx::GpuDmaWordSource> dma_sources;
 };
 
 using RuntimeGpuFrameCallback = std::function<RuntimeGpuFrame()>;

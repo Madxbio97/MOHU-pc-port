@@ -18,7 +18,8 @@ void require(bool condition, const char *message) {
 [[nodiscard]] bool aligned(const mohu::GpuCommandStream &stream) noexcept {
   return stream.frameWords().size() == stream.frameProjections().size() &&
          stream.frameWords().size() ==
-             stream.frameProjectionIdentities().size();
+             stream.frameProjectionIdentities().size() &&
+         stream.frameWords().size() == stream.frameDmaSources().size();
 }
 
 void testCommandCapture() {
@@ -31,10 +32,13 @@ void testCommandCapture() {
           "GP0 command vectors diverged");
   require(gpu.frameProjectionIdentities()[0U] == 0U,
           "Direct GP0 provenance mismatch");
+  require(!gpu.frameDmaSources()[0U].valid(),
+          "Direct GP0 acquired DMA provenance");
 
   gpu.beginFrame();
   require(gpu.frameWords().empty() && gpu.frameProjections().empty() &&
-              gpu.frameProjectionIdentities().empty() && aligned(gpu),
+              gpu.frameProjectionIdentities().empty() &&
+              gpu.frameDmaSources().empty() && aligned(gpu),
           "Frame boundary retained command data");
   require(gpu.firstWords().size() == 2U,
           "Frame boundary discarded lifetime diagnostics");
@@ -49,16 +53,19 @@ void testProjectionSidecars() {
   projected.view_z = 1000.0F;
   projected.valid = true;
   constexpr std::uint64_t source_identity = 0x123456789abcdef0ULL;
+  constexpr sf::psx::GpuDmaWordSource dma_source{
+      0x1234U, 0x1000U, sf::psx::GpuDmaSourceKind::linked_list};
 
   require(gpu.writeGp0(0xe1000000U) &&
-              gpu.writeGp0FromRam(projected.packed_sxy, 0x1234U, &projected,
+              gpu.writeGp0FromRam(projected.packed_sxy, dma_source, &projected,
                                   source_identity),
           "Projected GP0 capture failed");
   require(!gpu.frameProjections()[0U].valid &&
               gpu.frameProjections()[1U] == projected &&
               gpu.frameProjectionIdentities()[0U] == 0U &&
               gpu.frameProjectionIdentities()[1U] == source_identity &&
-              aligned(gpu),
+              !gpu.frameDmaSources()[0U].valid() &&
+              gpu.frameDmaSources()[1U] == dma_source && aligned(gpu),
           "Projection sidecar detached from GP0 words");
 
   constexpr std::array<std::size_t, 2U> word_indices{0U, 1U};
@@ -104,7 +111,8 @@ void testControlCommands() {
 
   require(gpu.writeGp0(0x20000000U), "GP0 setup failed");
   gpu.writeGp1(0x01000000U);
-  require(gpu.commandBufferEpoch() == 1U && gpu.frameWords().empty(),
+  require(gpu.commandBufferEpoch() == 1U && gpu.frameWords().empty() &&
+              gpu.frameDmaSources().empty(),
           "GP1 command-buffer reset mismatch");
   gpu.writeGp1(0x00000000U);
   require(gpu.commandBufferEpoch() == 2U &&

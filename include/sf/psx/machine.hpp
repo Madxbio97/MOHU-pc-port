@@ -3,6 +3,7 @@
 #include "sf/psx/cdrom.hpp"
 #include "sf/psx/dma.hpp"
 #include "sf/psx/event_scheduler.hpp"
+#include "sf/psx/gpu_dma_source.hpp"
 #include "sf/psx/interrupt_controller.hpp"
 #include "sf/psx/mdec.hpp"
 #include "sf/psx/r3000_runtime.hpp"
@@ -66,6 +67,13 @@ public:
                   std::uint64_t source_identity) noexcept {
     static_cast<void>(source_identity);
     return writeGp0FromRam(value, source_address, projected);
+  }
+  [[nodiscard]] virtual bool
+  writeGp0FromRam(std::uint32_t value, GpuDmaWordSource source,
+                  const GteProjectedVertex *projected,
+                  std::uint64_t source_identity) noexcept {
+    return writeGp0FromRam(value, source.word_address, projected,
+                           source_identity);
   }
 
   [[nodiscard]] bool readDmaWord(std::uint32_t &value) noexcept final {

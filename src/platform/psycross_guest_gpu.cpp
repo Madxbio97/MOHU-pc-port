@@ -1667,11 +1667,13 @@ void PsyCrossGuestGpu::submit(
     std::span<const psx::GteProjectedVertex> projections,
     std::span<const std::uint64_t> projection_identities,
     std::uint64_t command_buffer_epoch,
-    std::span<const psx::GteProjectedVertex> projection_catalog) {
+    std::span<const psx::GteProjectedVertex> projection_catalog,
+    std::span<const psx::GpuDmaWordSource> dma_sources) {
   if (command_buffer_epoch != command_buffer_epoch_) {
     pending_.clear();
     pending_projections_.clear();
     pending_projection_identities_.clear();
+    pending_dma_sources_.clear();
     command_buffer_epoch_ = command_buffer_epoch;
   }
   const auto pending_words_before_append = pending_.size();
@@ -1708,6 +1710,22 @@ void PsyCrossGuestGpu::submit(
     }
     if (pending_projection_identities_.size() != pending_.size()) {
       pending_projection_identities_.resize(pending_.size());
+    }
+  }
+  const auto dma_source_transport_active =
+      !pending_dma_sources_.empty() || !dma_sources.empty();
+  if (dma_source_transport_active) {
+    if (pending_dma_sources_.empty() && pending_words_before_append != 0U) {
+      pending_dma_sources_.resize(pending_words_before_append);
+    }
+    if (dma_sources.size() == words.size()) {
+      pending_dma_sources_.insert(pending_dma_sources_.end(),
+                                  dma_sources.begin(), dma_sources.end());
+    } else {
+      pending_dma_sources_.resize(pending_.size());
+    }
+    if (pending_dma_sources_.size() != pending_.size()) {
+      pending_dma_sources_.resize(pending_.size());
     }
   }
   const auto catalog_handle_active =
@@ -2741,12 +2759,19 @@ void PsyCrossGuestGpu::submit(
           pending_projection_identities_.begin() +
               static_cast<std::ptrdiff_t>(consumed));
     }
+    if (!pending_dma_sources_.empty()) {
+      pending_dma_sources_.erase(
+          pending_dma_sources_.begin(),
+          pending_dma_sources_.begin() +
+              static_cast<std::ptrdiff_t>(consumed));
+    }
   }
   if (pending_.size() > maximum_buffered_words) {
     unsupported_commands_ += pending_.size();
     pending_.clear();
     pending_projections_.clear();
     pending_projection_identities_.clear();
+    pending_dma_sources_.clear();
   }
 }
 

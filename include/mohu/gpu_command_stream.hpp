@@ -50,6 +50,10 @@ public:
   writeGp0FromRam(std::uint32_t value, std::uint32_t source_address,
                   const sf::psx::GteProjectedVertex *projected,
                   std::uint64_t source_identity = 0U) noexcept override;
+  [[nodiscard]] bool
+  writeGp0FromRam(std::uint32_t value, sf::psx::GpuDmaWordSource source,
+                  const sf::psx::GteProjectedVertex *projected,
+                  std::uint64_t source_identity) noexcept override;
   void writeGp1(std::uint32_t value) noexcept override;
   [[nodiscard]] bool readGp0(std::uint32_t &value) noexcept override;
   [[nodiscard]] std::uint32_t readStatus() const noexcept override;
@@ -63,6 +67,10 @@ public:
   [[nodiscard]] std::span<const std::uint64_t>
   frameProjectionIdentities() const noexcept {
     return frame_projection_identities_;
+  }
+  [[nodiscard]] std::span<const sf::psx::GpuDmaWordSource>
+  frameDmaSources() const noexcept {
+    return frame_dma_sources_;
   }
   [[nodiscard]] bool overrideFrameProjectionIdentities(
       std::span<const std::size_t> word_indices,
@@ -105,11 +113,13 @@ public:
 private:
   [[nodiscard]] bool appendGp0(std::uint32_t value,
                                const sf::psx::GteProjectedVertex *projected,
-                               std::uint64_t source_identity) noexcept;
+                               std::uint64_t source_identity,
+                               sf::psx::GpuDmaWordSource dma_source) noexcept;
   static constexpr std::uint32_t reset_status = 0x14802000U;
   std::vector<std::uint32_t> frame_words_;
   std::vector<sf::psx::GteProjectedVertex> frame_projections_;
   std::vector<std::uint64_t> frame_projection_identities_;
+  std::vector<sf::psx::GpuDmaWordSource> frame_dma_sources_;
   bool projection_tracking_{true};
   bool projection_identity_tracking_{true};
   std::array<std::uint32_t, 16U> first_words_{};
