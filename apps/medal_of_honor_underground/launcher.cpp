@@ -12,13 +12,7 @@
 // clang-format off
 #include <windows.h>
 #include <commdlg.h>
-#include <objidl.h>
 // clang-format on
-#ifndef GDIPVER
-#define GDIPVER 0x0110
-#endif
-#include <gdiplus.h>
-
 #include <SDL.h>
 
 #include <algorithm>
@@ -29,7 +23,6 @@
 #include <cwctype>
 #include <filesystem>
 #include <limits>
-#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -44,7 +37,6 @@ namespace {
 constexpr wchar_t launcher_class_name[] = L"MedalOfHonorUndergroundPCLauncher";
 constexpr wchar_t controls_class_name[] = L"MedalOfHonorUndergroundPCControls";
 constexpr wchar_t notice_class_name[] = L"MedalOfHonorUndergroundPCNotice";
-constexpr wchar_t dossier_class_name[] = L"MedalOfHonorUndergroundPCArchive";
 constexpr int resolution_control_id = 1001;
 constexpr int aspect_control_id = 1002;
 constexpr int filtering_control_id = 1004;
@@ -55,7 +47,6 @@ constexpr int cancel_control_id = 1007;
 constexpr int controls_control_id = 1009;
 constexpr int game_image_control_id = 1012;
 constexpr int browse_image_control_id = 1013;
-constexpr int dossier_control_id = 1014;
 constexpr int vsync_control_id = 1016;
 constexpr int frame_limit_control_id = 1017;
 constexpr int controller_protocol_control_id = 1021;
@@ -71,10 +62,6 @@ constexpr int default_bindings_control_id = 2004;
 constexpr int close_bindings_control_id = 2005;
 constexpr int input_device_control_id = 2006;
 constexpr int mouse_sensitivity_control_id = 2007;
-constexpr int previous_dossier_control_id = 3001;
-constexpr int next_dossier_control_id = 3002;
-constexpr int close_dossier_control_id = 3003;
-constexpr int dossier_page_control_id = 3004;
 constexpr int minimum_resolution_width = 320;
 constexpr int minimum_resolution_height = 240;
 constexpr int maximum_resolution_width = 3840;
@@ -83,8 +70,6 @@ constexpr int launcher_client_width = 980;
 constexpr int launcher_client_height = 680;
 constexpr int controls_client_width = 760;
 constexpr int controls_client_height = 520;
-constexpr int dossier_client_width = 1240;
-constexpr int dossier_client_height = 790;
 constexpr COLORREF launcher_background_color = RGB(214, 204, 174);
 constexpr COLORREF launcher_panel_color = RGB(232, 223, 193);
 constexpr COLORREF launcher_grid_color = RGB(194, 183, 149);
@@ -92,7 +77,7 @@ constexpr COLORREF launcher_border_color = RGB(75, 70, 52);
 constexpr COLORREF launcher_text_color = RGB(39, 37, 29);
 constexpr COLORREF launcher_muted_text_color = RGB(103, 94, 70);
 constexpr COLORREF launcher_launch_color = RGB(134, 37, 30);
-constexpr COLORREF dossier_accent_color = RGB(78, 91, 66);
+constexpr COLORREF launcher_accent_color = RGB(78, 91, 66);
 
 constexpr UINT controller_capture_timer_id = 1U;
 constexpr std::size_t controller_stick_layout_row =
@@ -573,22 +558,6 @@ struct ControlsState {
   bool controller_mode{};
   LauncherControllerCapture controller_capture;
   bool accepted{};
-  bool finished{};
-};
-
-struct DossierState {
-  std::array<std::filesystem::path, 4U> files;
-  std::unique_ptr<Gdiplus::Bitmap> image;
-  std::size_t page{};
-  HWND previous_button{};
-  HWND next_button{};
-  HWND close_button{};
-  HWND page_label{};
-  HFONT title_font{};
-  HFONT heading_font{};
-  HFONT ui_font{};
-  HBRUSH background_brush{};
-  HBRUSH panel_brush{};
   bool finished{};
 };
 
@@ -2034,377 +2003,6 @@ void showControlsWindow(HWND owner, KeyboardMouseBindings &input,
   SetForegroundWindow(owner);
 }
 
-std::array<std::filesystem::path, 4U> dossierFiles() {
-  auto directory = executableDirectory() / L"assets" / L"dossiers" / L"screens";
-  std::error_code error;
-  if (!std::filesystem::is_directory(directory, error) || error) {
-    directory = std::filesystem::current_path(error) / L"assets" / L"dossiers" /
-                L"screens";
-  }
-  return {
-      directory / L"dossier_01.png",
-      directory / L"dossier_02.png",
-      directory / L"dossier_03.png",
-      directory / L"dossier_04.png",
-  };
-}
-
-RECT dossierImagePanel(HWND window) {
-  RECT client{};
-  GetClientRect(window, &client);
-  return RECT{24, 82, std::max(25L, client.right - 24),
-              std::max(83L, client.bottom - 70)};
-}
-
-void layoutDossierControls(HWND window, DossierState &state) {
-  RECT client{};
-  GetClientRect(window, &client);
-  const auto button_y = std::max(0L, client.bottom - 52);
-  MoveWindow(state.previous_button, 24, button_y, 126, 34, TRUE);
-  MoveWindow(state.next_button, 162, button_y, 96, 34, TRUE);
-  MoveWindow(state.page_label, std::max(270L, client.right / 2 - 90),
-             button_y + 2, 180, 30, TRUE);
-  MoveWindow(state.close_button, std::max(282L, client.right - 150), button_y,
-             126, 34, TRUE);
-}
-
-void updateDossierNavigation(DossierState &state) {
-  const auto label = L"FILE " + std::to_wstring(state.page + 1U) + L" / " +
-                     std::to_wstring(state.files.size());
-  SetWindowTextW(state.page_label, label.c_str());
-  EnableWindow(state.previous_button, state.page > 0U ? TRUE : FALSE);
-  EnableWindow(state.next_button,
-               state.page + 1U < state.files.size() ? TRUE : FALSE);
-}
-
-bool loadDossierPage(DossierState &state, std::size_t page) {
-  if (page >= state.files.size()) {
-    return false;
-  }
-  auto image = std::make_unique<Gdiplus::Bitmap>(state.files[page].c_str());
-  if (image->GetLastStatus() != Gdiplus::Ok || image->GetWidth() == 0U ||
-      image->GetHeight() == 0U) {
-    return false;
-  }
-  // The source pages contain fine terminal text and are normally downscaled
-  // in the viewer. A restrained GDI+ 1.1 sharpen pass keeps that text crisp
-  // without changing the artwork or introducing visible halos.
-  Gdiplus::Sharpen sharpen;
-  const Gdiplus::SharpenParams parameters{1.0F, 14.0F};
-  if (sharpen.SetParameters(&parameters) == Gdiplus::Ok) {
-    RECT region{0, 0, static_cast<LONG>(image->GetWidth()),
-                static_cast<LONG>(image->GetHeight())};
-    static_cast<void>(image->ApplyEffect(&sharpen, &region));
-  }
-  state.image = std::move(image);
-  state.page = page;
-  if (state.page_label != nullptr) {
-    updateDossierNavigation(state);
-  }
-  return true;
-}
-
-void drawDossierFrame(HWND window, DossierState &state) {
-  PAINTSTRUCT paint{};
-  const auto dc = BeginPaint(window, &paint);
-  RECT client{};
-  GetClientRect(window, &client);
-  FillRect(dc, &client, state.background_brush);
-
-  const auto grid_pen = CreatePen(PS_SOLID, 1, launcher_grid_color);
-  const auto old_pen = SelectObject(dc, grid_pen);
-  for (auto x = 0; x < client.right; x += 32) {
-    MoveToEx(dc, x, 70, nullptr);
-    LineTo(dc, x, client.bottom);
-  }
-  for (auto y = 70; y < client.bottom; y += 32) {
-    MoveToEx(dc, 0, y, nullptr);
-    LineTo(dc, client.right, y);
-  }
-
-  const auto panel = dossierImagePanel(window);
-  FillRect(dc, &panel, state.panel_brush);
-  const auto border_pen = CreatePen(PS_SOLID, 2, dossier_accent_color);
-  SelectObject(dc, border_pen);
-  SelectObject(dc, GetStockObject(NULL_BRUSH));
-  Rectangle(dc, panel.left, panel.top, panel.right, panel.bottom);
-
-  SetBkMode(dc, TRANSPARENT);
-  SetTextColor(dc, dossier_accent_color);
-  SelectObject(dc, state.title_font);
-  RECT title{28, 12, client.right - 28, 50};
-  DrawTextW(dc, L"ARCHIVES", -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-  SetTextColor(dc, launcher_text_color);
-  SelectObject(dc, state.ui_font);
-  RECT subtitle{216, 17, client.right - 28, 49};
-  DrawTextW(dc, L"OSS  /  CLASSIFIED ARCHIVE", -1, &subtitle,
-            DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-  const auto accent_pen = CreatePen(PS_SOLID, 1, dossier_accent_color);
-  SelectObject(dc, accent_pen);
-  MoveToEx(dc, 28, 59, nullptr);
-  LineTo(dc, client.right - 28, 59);
-
-  if (state.image != nullptr) {
-    constexpr int padding = 10;
-    const auto available_width = static_cast<int>(
-        std::max<LONG>(1L, panel.right - panel.left - padding * 2));
-    const auto available_height = static_cast<int>(
-        std::max<LONG>(1L, panel.bottom - panel.top - padding * 2));
-    const auto image_width = static_cast<double>(state.image->GetWidth());
-    const auto image_height = static_cast<double>(state.image->GetHeight());
-    const auto scale =
-        std::min(static_cast<double>(available_width) / image_width,
-                 static_cast<double>(available_height) / image_height);
-    const auto width =
-        std::max(1, static_cast<int>(std::lround(image_width * scale)));
-    const auto height =
-        std::max(1, static_cast<int>(std::lround(image_height * scale)));
-    const auto x = panel.left + (panel.right - panel.left - width) / 2;
-    const auto y = panel.top + (panel.bottom - panel.top - height) / 2;
-    Gdiplus::Graphics graphics{dc};
-    graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
-    graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-    graphics.DrawImage(state.image.get(), x, y, width, height);
-  }
-
-  SetTextColor(dc, launcher_muted_text_color);
-  SelectObject(dc, state.ui_font);
-  RECT hint{276, client.bottom - 52, client.right - 168, client.bottom - 18};
-  DrawTextW(dc, L"A / D  OR  LEFT / RIGHT  //  CHANGE FILE", -1, &hint,
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-
-  SelectObject(dc, old_pen);
-  DeleteObject(accent_pen);
-  DeleteObject(border_pen);
-  DeleteObject(grid_pen);
-  EndPaint(window, &paint);
-}
-
-LRESULT CALLBACK dossierWindowProc(HWND window, UINT message, WPARAM w_param,
-                                   LPARAM l_param) {
-  auto *state = reinterpret_cast<DossierState *>(
-      GetWindowLongPtrW(window, GWLP_USERDATA));
-  if (message == WM_NCCREATE) {
-    const auto *create = reinterpret_cast<const CREATESTRUCTW *>(l_param);
-    state = static_cast<DossierState *>(create->lpCreateParams);
-    SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
-  }
-  if (state == nullptr) {
-    return DefWindowProcW(window, message, w_param, l_param);
-  }
-
-  switch (message) {
-  case WM_CREATE:
-    state->previous_button = createControl(
-        window, L"BUTTON", L"PREVIOUS", WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0,
-        previous_dossier_control_id, state->heading_font);
-    state->next_button =
-        createControl(window, L"BUTTON", L"NEXT", WS_TABSTOP | BS_OWNERDRAW, 0,
-                      0, 0, 0, next_dossier_control_id, state->heading_font);
-    state->close_button =
-        createControl(window, L"BUTTON", L"CLOSE", WS_TABSTOP | BS_OWNERDRAW, 0,
-                      0, 0, 0, close_dossier_control_id, state->heading_font);
-    state->page_label =
-        createControl(window, L"STATIC", L"", SS_CENTER, 0, 0, 0, 0,
-                      dossier_page_control_id, state->heading_font);
-    layoutDossierControls(window, *state);
-    updateDossierNavigation(*state);
-    return 0;
-  case WM_PAINT:
-    drawDossierFrame(window, *state);
-    return 0;
-  case WM_ERASEBKGND:
-    return 1;
-  case WM_SIZE:
-    layoutDossierControls(window, *state);
-    InvalidateRect(window, nullptr, FALSE);
-    return 0;
-  case WM_GETMINMAXINFO: {
-    auto *limits = reinterpret_cast<MINMAXINFO *>(l_param);
-    limits->ptMinTrackSize.x = 760;
-    limits->ptMinTrackSize.y = 520;
-    return 0;
-  }
-  case WM_CTLCOLORSTATIC: {
-    const auto dc = reinterpret_cast<HDC>(w_param);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, dossier_accent_color);
-    return reinterpret_cast<LRESULT>(state->background_brush);
-  }
-  case WM_DRAWITEM: {
-    const auto *item = reinterpret_cast<const DRAWITEMSTRUCT *>(l_param);
-    if (item != nullptr && item->CtlType == ODT_BUTTON) {
-      drawTerminalButton(*item, state->heading_font, dossier_accent_color);
-      return TRUE;
-    }
-    break;
-  }
-  case WM_COMMAND:
-    if (HIWORD(w_param) != BN_CLICKED) {
-      return 0;
-    }
-    if (LOWORD(w_param) == previous_dossier_control_id && state->page > 0U) {
-      if (loadDossierPage(*state, state->page - 1U)) {
-        InvalidateRect(window, nullptr, FALSE);
-      }
-      return 0;
-    }
-    if (LOWORD(w_param) == next_dossier_control_id &&
-        state->page + 1U < state->files.size()) {
-      if (loadDossierPage(*state, state->page + 1U)) {
-        InvalidateRect(window, nullptr, FALSE);
-      }
-      return 0;
-    }
-    if (LOWORD(w_param) == close_dossier_control_id) {
-      DestroyWindow(window);
-      return 0;
-    }
-    break;
-  case WM_KEYDOWN:
-    if ((w_param == VK_LEFT || w_param == 'A') && state->page > 0U) {
-      if (loadDossierPage(*state, state->page - 1U)) {
-        InvalidateRect(window, nullptr, FALSE);
-      }
-      return 0;
-    }
-    if ((w_param == VK_RIGHT || w_param == 'D') &&
-        state->page + 1U < state->files.size()) {
-      if (loadDossierPage(*state, state->page + 1U)) {
-        InvalidateRect(window, nullptr, FALSE);
-      }
-      return 0;
-    }
-    if (w_param == VK_ESCAPE) {
-      DestroyWindow(window);
-      return 0;
-    }
-    break;
-  case WM_CLOSE:
-    DestroyWindow(window);
-    return 0;
-  case WM_DESTROY:
-    state->finished = true;
-    return 0;
-  default:
-    break;
-  }
-  return DefWindowProcW(window, message, w_param, l_param);
-}
-
-void showDossierWindow(HWND owner) {
-  Gdiplus::GdiplusStartupInputEx startup_input{};
-  ULONG_PTR gdiplus_token{};
-  if (Gdiplus::GdiplusStartup(&gdiplus_token, &startup_input, nullptr) !=
-      Gdiplus::Ok) {
-    showStyledNotice(
-        owner, L"DOSSIER ARCHIVE UNAVAILABLE",
-        L"Windows could not initialize the dossier image decoder.");
-    return;
-  }
-
-  DossierState state{};
-  state.files = dossierFiles();
-  const auto missing = std::ranges::find_if(state.files, [](const auto &path) {
-    std::error_code error;
-    return !std::filesystem::is_regular_file(path, error) || error;
-  });
-  if (missing != state.files.end() || !loadDossierPage(state, 0U)) {
-    Gdiplus::GdiplusShutdown(gdiplus_token);
-    showStyledNotice(owner, L"DOSSIER ARCHIVE UNAVAILABLE",
-                     L"The dossier image files are missing or damaged.");
-    return;
-  }
-
-  const auto instance = GetModuleHandleW(nullptr);
-  WNDCLASSW window_class{};
-  window_class.lpfnWndProc = dossierWindowProc;
-  window_class.hInstance = instance;
-  window_class.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
-  window_class.hbrBackground = nullptr;
-  window_class.lpszClassName = dossier_class_name;
-  if (RegisterClassW(&window_class) == 0 &&
-      GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-    state.image.reset();
-    Gdiplus::GdiplusShutdown(gdiplus_token);
-    showStyledNotice(owner, L"DOSSIER ARCHIVE UNAVAILABLE",
-                     L"Windows could not create the dossier viewer.");
-    return;
-  }
-
-  state.title_font =
-      CreateFontW(-30, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                  FF_DONTCARE, L"Georgia");
-  state.heading_font =
-      CreateFontW(-17, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                  FF_DONTCARE, L"Courier New");
-  state.ui_font =
-      CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                  FF_DONTCARE, L"Segoe UI");
-  state.background_brush = CreateSolidBrush(launcher_background_color);
-  state.panel_brush = CreateSolidBrush(launcher_panel_color);
-
-  RECT work_area{};
-  SystemParametersInfoW(SPI_GETWORKAREA, 0, &work_area, 0);
-  const auto work_width = static_cast<int>(work_area.right - work_area.left);
-  const auto work_height = static_cast<int>(work_area.bottom - work_area.top);
-  const auto client_width =
-      std::min(dossier_client_width, std::max(760, work_width - 48));
-  const auto client_height =
-      std::min(dossier_client_height, std::max(520, work_height - 48));
-  constexpr DWORD style =
-      WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX;
-  constexpr DWORD extended_style = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT;
-  RECT bounds{0, 0, client_width, client_height};
-  AdjustWindowRectEx(&bounds, style, FALSE, extended_style);
-  const auto window = CreateWindowExW(
-      extended_style, dossier_class_name, L"MOH Underground PC - Archives",
-      style, CW_USEDEFAULT, CW_USEDEFAULT, bounds.right - bounds.left,
-      bounds.bottom - bounds.top, owner, nullptr, instance, &state);
-  if (window != nullptr) {
-    RECT window_bounds{};
-    GetWindowRect(window, &window_bounds);
-    const auto width = window_bounds.right - window_bounds.left;
-    const auto height = window_bounds.bottom - window_bounds.top;
-    SetWindowPos(
-        window, HWND_TOP,
-        work_area.left + (work_area.right - work_area.left - width) / 2,
-        work_area.top + (work_area.bottom - work_area.top - height) / 2, 0, 0,
-        SWP_NOSIZE);
-    EnableWindow(owner, FALSE);
-    ShowWindow(window, SW_SHOW);
-    UpdateWindow(window);
-    MSG message{};
-    while (!state.finished && GetMessageW(&message, nullptr, 0, 0) > 0) {
-      if (message.message == WM_KEYDOWN &&
-          (message.wParam == VK_LEFT || message.wParam == VK_RIGHT ||
-           message.wParam == VK_ESCAPE || message.wParam == 'A' ||
-           message.wParam == 'D')) {
-        SendMessageW(window, WM_KEYDOWN, message.wParam, message.lParam);
-        continue;
-      }
-      if (IsDialogMessageW(window, &message) == FALSE) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
-      }
-    }
-    EnableWindow(owner, TRUE);
-    SetForegroundWindow(owner);
-  }
-
-  state.image.reset();
-  DeleteObject(state.panel_brush);
-  DeleteObject(state.background_brush);
-  DeleteObject(state.ui_font);
-  DeleteObject(state.heading_font);
-  DeleteObject(state.title_font);
-  Gdiplus::GdiplusShutdown(gdiplus_token);
-}
-
 std::optional<int> parseResolutionDimension(std::wstring_view text) noexcept {
   if (text.empty()) {
     return std::nullopt;
@@ -2844,8 +2442,8 @@ void drawLauncherFrame(HWND window, LauncherState &state) {
 bool isLauncherOwnerDrawButton(UINT id) noexcept {
   return id == controls_control_id || id == launch_control_id ||
          id == cancel_control_id || id == browse_image_control_id ||
-         id == dossier_control_id || id == deployment_page_control_id ||
-         id == graphics_page_control_id || id == input_page_control_id;
+         id == deployment_page_control_id || id == graphics_page_control_id ||
+         id == input_page_control_id;
 }
 
 void drawLauncherButton(const DRAWITEMSTRUCT &item,
@@ -2859,13 +2457,11 @@ void drawLauncherButton(const DRAWITEMSTRUCT &item,
                       (item.CtlID == input_page_control_id &&
                        state.page == LauncherPage::input);
   const auto primary = item.CtlID == launch_control_id;
-  const auto archive = item.CtlID == dossier_control_id;
-  const auto accent = primary             ? launcher_launch_color
-                      : archive || active ? dossier_accent_color
-                                          : launcher_border_color;
+  const auto accent = primary  ? launcher_launch_color
+                      : active ? launcher_accent_color
+                               : launcher_border_color;
   const auto fill = primary   ? launcher_launch_color
-                    : archive ? dossier_accent_color
-                    : active  ? dossier_accent_color
+                    : active  ? launcher_accent_color
                     : pressed ? RGB(197, 186, 151)
                               : launcher_panel_color;
   const auto fill_brush = CreateSolidBrush(fill);
@@ -2884,7 +2480,7 @@ void drawLauncherButton(const DRAWITEMSTRUCT &item,
   std::array<wchar_t, 128U> label{};
   GetWindowTextW(item.hwndItem, label.data(), static_cast<int>(label.size()));
   SetBkMode(item.hDC, TRANSPARENT);
-  const auto reversed = primary || archive || active;
+  const auto reversed = primary || active;
   SetTextColor(item.hDC, disabled   ? launcher_muted_text_color
                          : reversed ? launcher_panel_color
                                     : launcher_text_color);
@@ -2956,10 +2552,6 @@ LRESULT CALLBACK launcherWindowProc(HWND window, UINT message, WPARAM w_param,
     createPageControl(window, *state, LauncherPage::deployment, L"STATIC",
                       L"SLUS-01270\nREGION: USA\nCLEARANCE: OSS", SS_LEFT, 646,
                       370, 240, 70, 0, state->ui_font);
-    createPageControl(window, *state, LauncherPage::deployment, L"BUTTON",
-                      L"OPEN DOSSIER ARCHIVE", WS_TABSTOP | BS_OWNERDRAW, 54,
-                      452, 286, 42, dossier_control_id, state->heading_font);
-
     createPageControl(window, *state, LauncherPage::graphics, L"STATIC",
                       L"DISPLAY OUTPUT", 0, 54, 204, 360, 28, 0,
                       state->heading_font);
@@ -3160,10 +2752,6 @@ LRESULT CALLBACK launcherWindowProc(HWND window, UINT message, WPARAM w_param,
                          state->settings.controller_bindings_player_2,
                          state->settings.controller_device_indices, protocol,
                          state->settings.mouse_sensitivity_percent);
-      return 0;
-    }
-    if (LOWORD(w_param) == dossier_control_id) {
-      showDossierWindow(window);
       return 0;
     }
     if (LOWORD(w_param) == browse_image_control_id) {

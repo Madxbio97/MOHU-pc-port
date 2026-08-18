@@ -26,7 +26,7 @@ sf::platform::RuntimeMenuState menu(std::uint32_t selected) {
   };
 }
 
-void testHoverSelectsAndClickActivates() {
+void testHoverNavigatesAndClickActivates() {
   sf::platform::detail::RuntimeMenuPointerController controller;
   sf::platform::detail::MenuPointerSample pointer{
       .x = 30.0F,
@@ -35,23 +35,35 @@ void testHoverSelectsAndClickActivates() {
       .moved = true,
   };
   auto action = controller.update(menu(0U), pointer);
-  require(action.active_low_buttons == 0xffffU && action.selection_valid &&
-              action.screen_id == 1U && action.selection == 2U,
-          "Hover did not select the authored option directly");
+  require(action.active_low_buttons == 0xffbfU && !action.selection_valid,
+          "Hover did not navigate down toward the authored option");
   pointer.moved = false;
+  action = controller.update(menu(1U), pointer);
+  require(action.active_low_buttons == 0xffffU && !action.selection_valid,
+          "Directional navigation was not released");
+  action = controller.update(menu(1U), pointer);
+  require(action.active_low_buttons == 0xffbfU && !action.selection_valid,
+          "Hover did not continue toward the authored option");
   action = controller.update(menu(2U), pointer);
   require(action.active_low_buttons == 0xffffU && !action.selection_valid,
-          "Stationary cursor kept rewriting the menu selection");
+          "Final directional navigation was not released");
+  action = controller.update(menu(2U), pointer);
+  require(action.active_low_buttons == 0xffffU && !action.selection_valid,
+          "Stationary cursor kept driving the selected option");
+  action = controller.update(menu(1U), pointer);
+  require(action.active_low_buttons == 0xffffU && !action.selection_valid,
+          "Stationary cursor fought later guest navigation");
 
   pointer.primary_pressed = true;
-  action = controller.update(menu(2U), pointer);
-  require(action.active_low_buttons == 0xffffU && action.selection_valid &&
-              action.selection == 2U,
-          "Click did not stage the hovered option");
+  action = controller.update(menu(1U), pointer);
+  require(action.active_low_buttons == 0xffbfU && !action.selection_valid,
+          "Click did not navigate toward the hovered option");
   pointer.primary_pressed = false;
   action = controller.update(menu(2U), pointer);
-  require(action.active_low_buttons == 0xbfffU && action.selection_valid &&
-              action.selection == 2U,
+  require(action.active_low_buttons == 0xffffU && !action.selection_valid,
+          "Click navigation was not released before activation");
+  action = controller.update(menu(2U), pointer);
+  require(action.active_low_buttons == 0xbfffU && !action.selection_valid,
           "Staged click did not activate the selected option");
   action = controller.update(menu(2U), pointer);
   require(action.active_low_buttons == 0xffffU && !action.selection_valid,
@@ -70,8 +82,7 @@ void testBackAndOverlappingAuthoredZones() {
       .moved = true,
   };
   auto action = controller.update(overlapping, pointer);
-  require(action.active_low_buttons == 0xffffU && action.selection_valid &&
-              action.selection == 1U,
+  require(action.active_low_buttons == 0xffffU && !action.selection_valid,
           "An overlapping conditional option displaced the active one");
   pointer.moved = false;
   pointer.secondary_pressed = true;
@@ -100,9 +111,8 @@ void testGridHoverDoesNotUseGuestDirections() {
       .moved = true,
   };
   const auto action = controller.update(grid, pointer);
-  require(action.active_low_buttons == 0xffffU && action.selection_valid &&
-              action.selection == 1U,
-          "A grid option fell back to guest directional navigation");
+  require(action.active_low_buttons == 0xffdfU && !action.selection_valid,
+          "A grid option did not navigate in its authored direction");
 }
 
 void testPointerOutsideOptionsDoesNothing() {
@@ -123,7 +133,7 @@ void testPointerOutsideOptionsDoesNothing() {
 
 int main() {
   try {
-    testHoverSelectsAndClickActivates();
+    testHoverNavigatesAndClickActivates();
     testBackAndOverlappingAuthoredZones();
     testGridHoverDoesNotUseGuestDirections();
     testPointerOutsideOptionsDoesNothing();

@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <utility>
 
 namespace sf::platform::detail {
 
@@ -202,6 +204,41 @@ namespace {
          y < static_cast<float>(target.y) + target.height;
 }
 
+[[nodiscard]] const RuntimeMenuTarget *
+findTarget(const RuntimeMenuState &menu, std::uint32_t selection) noexcept {
+  const auto match = std::ranges::find_if(
+      menu.targets, [selection](const RuntimeMenuTarget &target) {
+        return target.selection == selection;
+      });
+  return match == menu.targets.end() ? nullptr : &*match;
+}
+
+[[nodiscard]] std::uint16_t
+directionButton(const RuntimeMenuTarget &current,
+                const RuntimeMenuTarget &target) noexcept {
+  constexpr auto up = std::uint16_t{0x0010U};
+  constexpr auto right = std::uint16_t{0x0020U};
+  constexpr auto down = std::uint16_t{0x0040U};
+  constexpr auto left = std::uint16_t{0x0080U};
+  const auto center = [](const RuntimeMenuTarget &item) {
+    return std::pair{static_cast<std::int32_t>(item.x) +
+                         static_cast<std::int32_t>(item.width) / 2,
+                     static_cast<std::int32_t>(item.y) +
+                         static_cast<std::int32_t>(item.height) / 2};
+  };
+  const auto [current_x, current_y] = center(current);
+  const auto [target_x, target_y] = center(target);
+  const auto delta_x = target_x - current_x;
+  const auto delta_y = target_y - current_y;
+  if (delta_x == 0 && delta_y == 0) {
+    return target.selection < current.selection ? up : down;
+  }
+  if (std::abs(delta_y) >= std::abs(delta_x)) {
+    return delta_y < 0 ? up : down;
+  }
+  return delta_x < 0 ? left : right;
+}
+
 } // namespace
 
 RuntimeMenuPointerAction RuntimeMenuPointerController::update(
@@ -221,10 +258,71 @@ RuntimeMenuPointerAction RuntimeMenuPointerController::update(
     screen_id_ = menu.screen_id;
     screen_initialized_ = true;
     pending_activation_ = false;
+    target_pending_ = false;
+    directional_release_pending_ = false;
   }
   if (pointer.secondary_pressed) {
     pending_activation_ = false;
+    target_pending_ = false;
+    directional_release_pending_ = false;
     result.active_low_buttons = static_cast<std::uint16_t>(neutral & ~triangle);
+    return result;
+  }
+
+  const RuntimeMenuTarget *target{};
+  if ((pointer.moved || screen_changed || pointer.primary_pressed) &&
+      pointer.inside) {
+    for (const auto &candidate : menu.targets) {
+      if (!contains(candidate, pointer.x, pointer.y)) {
+        continue;
+      }
+      if (candidate.selection == menu.selected) {
+        target = &candidate;
+        break;
+      }
+      if (target == nullptr) {
+        target = &candidate;
+      }
+    }
+  }
+  if (target != nullptr) {
+    target_screen_id_ = menu.screen_id;
+    target_selection_ = target->selection;
+    target_pending_ = target_selection_ != menu.selected;
+    if (pointer.primary_pressed) {
+      pending_screen_id_ = menu.screen_id;
+      pending_selection_ = target->selection;
+      pending_activation_ = true;
+    }
+  }
+
+  if (target_pending_) {
+    if (target_screen_id_ != menu.screen_id) {
+      target_pending_ = false;
+      directional_release_pending_ = false;
+    } else if (menu.selected == target_selection_) {
+      target_pending_ = false;
+    } else if (directional_release_pending_) {
+      directional_release_pending_ = false;
+      return result;
+    } else {
+      const auto *current = findTarget(menu, menu.selected);
+      const auto *destination = findTarget(menu, target_selection_);
+      if (current == nullptr || destination == nullptr) {
+        target_pending_ = false;
+        pending_activation_ = false;
+        return result;
+      }
+      const auto direction = directionButton(*current, *destination);
+      result.active_low_buttons =
+          static_cast<std::uint16_t>(neutral & ~direction);
+      directional_release_pending_ = true;
+      return result;
+    }
+  }
+
+  if (directional_release_pending_) {
+    directional_release_pending_ = false;
     return result;
   }
 
@@ -233,44 +331,14 @@ RuntimeMenuPointerAction RuntimeMenuPointerController::update(
       pending_activation_ = false;
       return result;
     }
-    result.selection_valid = true;
-    result.screen_id = pending_screen_id_;
-    result.selection = pending_selection_;
-    if (menu.selected == pending_selection_) {
-      pending_activation_ = false;
-      result.active_low_buttons = static_cast<std::uint16_t>(neutral & ~cross);
+    if (menu.selected != pending_selection_) {
+      target_screen_id_ = pending_screen_id_;
+      target_selection_ = pending_selection_;
+      target_pending_ = true;
+      return result;
     }
-    return result;
-  }
-
-  if (!(pointer.moved || screen_changed || pointer.primary_pressed) ||
-      !pointer.inside) {
-    return result;
-  }
-  const RuntimeMenuTarget *target{};
-  for (const auto &candidate : menu.targets) {
-    if (!contains(candidate, pointer.x, pointer.y)) {
-      continue;
-    }
-    if (candidate.selection == menu.selected) {
-      target = &candidate;
-      break;
-    }
-    if (target == nullptr) {
-      target = &candidate;
-    }
-  }
-  if (target == nullptr) {
-    return result;
-  }
-
-  result.selection_valid = true;
-  result.screen_id = menu.screen_id;
-  result.selection = target->selection;
-  if (pointer.primary_pressed) {
-    pending_screen_id_ = menu.screen_id;
-    pending_selection_ = target->selection;
-    pending_activation_ = true;
+    pending_activation_ = false;
+    result.active_low_buttons = static_cast<std::uint16_t>(neutral & ~cross);
   }
   return result;
 }
@@ -278,6 +346,8 @@ RuntimeMenuPointerAction RuntimeMenuPointerController::update(
 void RuntimeMenuPointerController::reset() noexcept {
   screen_initialized_ = false;
   pending_activation_ = false;
+  target_pending_ = false;
+  directional_release_pending_ = false;
 }
 
 RelativeMouseCapture::~RelativeMouseCapture() { set(false); }

@@ -689,7 +689,7 @@ static int g_guestPresentationReplayFailed{};
 static int g_guestPresentationReplayValid{};
 #endif
 
-static constexpr std::size_t high_resolution_vram_cache_capacity = 2U;
+static constexpr std::size_t high_resolution_vram_cache_capacity = 4U;
 
 struct GrHighResolutionVRAMPage {
   GLuint texture{};
@@ -3703,11 +3703,144 @@ int GR_HasHighResolutionVRAM(int x, int y, int width, int height) {
   return GR_FindHighResolutionVRAMPage(x, y, width, height) != nullptr;
 }
 
+#if defined(RENDERER_OGL)
+static int GR_PresentTiledHighResolutionVRAM(int x, int y, int width,
+                                             int height) {
+  if (x < 0 || y < 0 || width <= 0 || height <= 0 ||
+      x + width > VRAM_WIDTH || y + height > VRAM_HEIGHT ||
+      g_nativeFramebufferWidth <= 0 || g_nativeFramebufferHeight <= 0) {
+    return 0;
+  }
+
+  std::array<const GrHighResolutionVRAMPage *,
+             high_resolution_vram_cache_capacity>
+      candidates{};
+  std::size_t candidate_count{};
+  for (auto &candidate : g_highResolutionVRAMPages) {
+    if (!candidate.valid ||
+        !GR_RectanglesOverlap(candidate.rect.x, candidate.rect.y,
+                              candidate.rect.w, candidate.rect.h, x, y,
+                              width, height) ||
+        !GR_SynchronizeHighResolutionVRAMPage(candidate)) {
+      continue;
+    }
+    candidates[candidate_count++] = &candidate;
+  }
+  if (candidate_count == 0U)
+    return 0;
+
+  constexpr auto maximum_edges =
+      high_resolution_vram_cache_capacity * 2U + 2U;
+  std::array<int, maximum_edges> x_edges{};
+  std::array<int, maximum_edges> y_edges{};
+  std::size_t x_count{2U};
+  std::size_t y_count{2U};
+  x_edges[0] = x;
+  x_edges[1] = x + width;
+  y_edges[0] = y;
+  y_edges[1] = y + height;
+  for (std::size_t index{}; index < candidate_count; ++index) {
+    const auto &rect = candidates[index]->rect;
+    x_edges[x_count++] = std::min(std::max<int>(rect.x, x), x + width);
+    x_edges[x_count++] =
+        std::min(std::max<int>(rect.x + rect.w, x), x + width);
+    y_edges[y_count++] = std::min(std::max<int>(rect.y, y), y + height);
+    y_edges[y_count++] =
+        std::min(std::max<int>(rect.y + rect.h, y), y + height);
+  }
+  const auto sort_unique = [](auto &edges, std::size_t count) {
+    std::sort(edges.begin(), edges.begin() + count);
+    return static_cast<std::size_t>(std::unique(edges.begin(),
+                                                edges.begin() + count) -
+                                    edges.begin());
+  };
+  x_count = sort_unique(x_edges, x_count);
+  y_count = sort_unique(y_edges, y_count);
+
+  const auto page_for_cell = [&](int left, int top, int right, int bottom) {
+    const GrHighResolutionVRAMPage *best = nullptr;
+    for (std::size_t index{}; index < candidate_count; ++index) {
+      const auto *candidate = candidates[index];
+      const auto &rect = candidate->rect;
+      if (left >= rect.x && top >= rect.y && right <= rect.x + rect.w &&
+          bottom <= rect.y + rect.h &&
+          (best == nullptr || candidate->generation > best->generation)) {
+        best = candidate;
+      }
+    }
+    return best;
+  };
+  for (std::size_t row{}; row + 1U < y_count; ++row) {
+    for (std::size_t column{}; column + 1U < x_count; ++column) {
+      if (page_for_cell(x_edges[column], y_edges[row], x_edges[column + 1U],
+                        y_edges[row + 1U]) == nullptr) {
+        return 0;
+      }
+    }
+  }
+
+  const PsyXPresentationViewport destination = PsyX_GetRenderViewport();
+  const int scissor_enabled = g_PreviousScissorState;
+  glDisable(GL_SCISSOR_TEST);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_glNativeFramebuffer);
+  GR_ClearNativePresentationMargins(destination);
+  const auto filter =
+      (g_cfg_bilinearFiltering || g_cfg_trilinearFiltering ||
+       g_cfg_anisotropicFiltering)
+          ? GL_LINEAR
+          : GL_NEAREST;
+  for (std::size_t row{}; row + 1U < y_count; ++row) {
+    for (std::size_t column{}; column + 1U < x_count; ++column) {
+      const int left = x_edges[column];
+      const int right = x_edges[column + 1U];
+      const int top = y_edges[row];
+      const int bottom = y_edges[row + 1U];
+      const auto *page = page_for_cell(left, top, right, bottom);
+      const int source_x0 = GR_MapGuestEdge(
+          left - page->rect.x, page->rect.w, page->pixel_width);
+      const int source_x1 = GR_MapGuestEdge(
+          right - page->rect.x, page->rect.w, page->pixel_width);
+      const int source_y0 = GR_MapGuestEdge(
+          page->rect.y + page->rect.h - bottom, page->rect.h,
+          page->pixel_height);
+      const int source_y1 = GR_MapGuestEdge(
+          page->rect.y + page->rect.h - top, page->rect.h,
+          page->pixel_height);
+      const int destination_x0 =
+          destination.x + GR_MapGuestEdge(left - x, width, destination.w);
+      const int destination_x1 =
+          destination.x + GR_MapGuestEdge(right - x, width, destination.w);
+      const int destination_y0 = destination.y +
+                                 GR_MapGuestEdge(y + height - bottom, height,
+                                                 destination.h);
+      const int destination_y1 = destination.y +
+                                 GR_MapGuestEdge(y + height - top, height,
+                                                 destination.h);
+      glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                        g_glHighResolutionVRAMFramebuffer);
+      glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                             GL_TEXTURE_2D, page->texture, 0);
+      glReadBuffer(GL_COLOR_ATTACHMENT0);
+      glBlitFramebuffer(source_x0, source_y0, source_x1, source_y1,
+                        destination_x0, destination_y0, destination_x1,
+                        destination_y1, GL_COLOR_BUFFER_BIT, filter);
+    }
+  }
+  g_nativeFramePostprocessed = 1;
+  glBindFramebuffer(GL_FRAMEBUFFER, g_glNativeFramebuffer);
+  if (scissor_enabled)
+    glEnable(GL_SCISSOR_TEST);
+  return 1;
+}
+#endif
+
 int GR_PresentHighResolutionVRAM(int x, int y, int width, int height) {
 #if defined(RENDERER_OGL)
   const auto *page = GR_FindHighResolutionVRAMPage(x, y, width, height);
   if (page == nullptr || g_nativeFramebufferWidth <= 0 ||
       g_nativeFramebufferHeight <= 0) {
+    if (page == nullptr)
+      return GR_PresentTiledHighResolutionVRAM(x, y, width, height);
     return 0;
   }
 
@@ -4133,6 +4266,10 @@ void GR_SetOffscreenState(const RECT16 *offscreenRect, int enable) {
 #endif
   int offscreen_pixel_width = requested_extent.width;
   int offscreen_pixel_height = requested_extent.height;
+  const bool split_viewport =
+      enable && !presentation_replay &&
+      offscreenRect->w >= g_guestDisplayWidth &&
+      offscreenRect->h * 2 == g_guestDisplayHeight;
 
 #if USE_PGXP
   constexpr float perspectiveFOV = 0.9265f;
@@ -4173,6 +4310,8 @@ void GR_SetOffscreenState(const RECT16 *offscreenRect, int enable) {
   // resolution. World primitives outside the original 4:3 aperture become
   // visible; authored HUD and movies remain centred, while explicitly marked
   // fullscreen clears still cover the complete target.
+  // A horizontal split already has an 8:3 authored viewport, so the complete
+  // framebuffer's 4:3 -> output ratio is also the correct delta per player.
   g_presentationScale =
       enable ? PsyX_CalculatePresentationScale(
                    renderViewport.w, renderViewport.h, g_cfg_aspectMode)
@@ -4204,7 +4343,7 @@ void GR_SetOffscreenState(const RECT16 *offscreenRect, int enable) {
   g_PreviousOffscreenState = enable;
 #if defined(RENDERER_OGL)
   g_activeOffscreenIsRoot =
-      enable && (presentation_replay || requested_extent.root);
+      enable && (presentation_replay || requested_extent.root || split_viewport);
 #endif
 
 #if USE_OPENGL

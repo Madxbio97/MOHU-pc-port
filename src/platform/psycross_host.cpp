@@ -919,8 +919,7 @@ public:
           // Frontend and loading overlays can carry valid GTE tuples even
           // though they are screen-space artwork. Never let those tuples
           // inherit gameplay depth and reject a full-screen background.
-          g_cfg_pgxpZBuffer =
-              content == PresentationContent::gameplay ? 1 : 0;
+          g_cfg_pgxpZBuffer = content == PresentationContent::gameplay ? 1 : 0;
 
           if (g_cfg_aspectMode != next_aspect) {
             PsyX_Log_Info(
@@ -1201,7 +1200,8 @@ public:
                         static_cast<unsigned int>(active_display.display_x),
                         static_cast<unsigned int>(active_display.display_y),
                         static_cast<unsigned int>(active_display.display_width),
-                        static_cast<unsigned int>(active_display.display_height),
+                        static_cast<unsigned int>(
+                            active_display.display_height),
                         static_cast<unsigned int>(inherited_page.x),
                         static_cast<unsigned int>(inherited_page.y),
                         static_cast<unsigned int>(inherited_page.width),

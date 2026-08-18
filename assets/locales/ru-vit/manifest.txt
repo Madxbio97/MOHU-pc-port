@@ -1,6 +1,8 @@
 SFLANG=1
 Locale=ru-RU
 Source=SCES-01913 ViT Co.
-TextOnly=1
+TextOnly=0
 Audio=Original
 FMV=Original
+MOHU_MOPTION=pilot
+MOHU_MOPTION_SHA256=71f3af191163d705a7532a1129e8428f12b4c28974d464f45050a70e49b7c4aa

@@ -25,6 +25,7 @@ enum class RuntimePcAction : std::uint8_t {
   bios_call_vector,
   disc_search_return,
   directory_scan_entry,
+  multiplayer_renderer_boundary,
   frustum_bsp_upper_x,
   frustum_bsp_lower_x,
   frustum_object_upper_x,
@@ -32,31 +33,69 @@ enum class RuntimePcAction : std::uint8_t {
   frustum_slus_triangle_outcode,
 };
 
+enum class RuntimePcScope : std::uint8_t {
+  none,
+  any,
+  singleplayer,
+  multiplayer,
+};
+
 namespace detail {
 
 struct RuntimePcActionEntry {
   std::uint32_t pc{};
   RuntimePcAction action{};
+  RuntimePcScope scope{};
 };
 
+[[nodiscard]] constexpr std::size_t
+runtimePcActionIndex(std::uint32_t pc) noexcept {
+  const auto word_pc = pc >> 2U;
+  return (word_pc ^ (word_pc >> 9U)) & 63U;
+}
+
 inline constexpr auto runtime_pc_actions = [] {
-  std::array<RuntimePcActionEntry, 32U> result{};
-  result[1U] = {0x80000080U, RuntimePcAction::exception_vector};
-  result[3U] = {sf::psx::R3000Runtime::return_sentinel,
-                RuntimePcAction::return_sentinel};
-  result[5U] = {0x8009cd7cU, RuntimePcAction::frustum_bsp_lower_x};
-  result[9U] = {0x000000a0U, RuntimePcAction::bios_call_vector};
-  result[13U] = {0x000000b0U, RuntimePcAction::bios_call_vector};
-  result[16U] = {0x80099dacU, RuntimePcAction::frustum_bsp_lower_x};
-  result[17U] = {0x000000c0U, RuntimePcAction::bios_call_vector};
-  result[22U] = {0x80037b00U, RuntimePcAction::disc_search_return};
-  result[23U] = {0x8009a2c8U, RuntimePcAction::frustum_bsp_lower_x};
-  result[24U] = {0x80010c00U, RuntimePcAction::frustum_slus_triangle_outcode};
-  result[25U] = {0x80039064U, RuntimePcAction::directory_scan_entry};
-  result[26U] = {0x800115c4U, RuntimePcAction::frustum_slus_triangle_outcode};
-  result[27U] = {0x8009ce1cU, RuntimePcAction::frustum_object_upper_x};
-  result[29U] = {0x8009a8b0U, RuntimePcAction::frustum_level_triangle_outcode};
-  result[30U] = {0x80099a28U, RuntimePcAction::frustum_bsp_upper_x};
+  std::array<RuntimePcActionEntry, 64U> result{};
+  const auto put = [&result](std::uint32_t pc, RuntimePcAction action,
+                             RuntimePcScope scope = RuntimePcScope::any) {
+    result[runtimePcActionIndex(pc)] = {pc, action, scope};
+  };
+  put(0x80000080U, RuntimePcAction::exception_vector);
+  put(sf::psx::R3000Runtime::return_sentinel,
+      RuntimePcAction::return_sentinel);
+  put(0x000000a0U, RuntimePcAction::bios_call_vector);
+  put(0x000000b0U, RuntimePcAction::bios_call_vector);
+  put(0x000000c0U, RuntimePcAction::bios_call_vector);
+  put(0x80037b00U, RuntimePcAction::disc_search_return);
+  put(0x80039064U, RuntimePcAction::directory_scan_entry);
+  put(0x80097084U, RuntimePcAction::multiplayer_renderer_boundary,
+      RuntimePcScope::multiplayer);
+  put(0x80099a28U, RuntimePcAction::frustum_bsp_upper_x,
+      RuntimePcScope::singleplayer);
+  put(0x80099dacU, RuntimePcAction::frustum_bsp_lower_x,
+      RuntimePcScope::singleplayer);
+  put(0x8009a2c8U, RuntimePcAction::frustum_bsp_lower_x,
+      RuntimePcScope::singleplayer);
+  put(0x8009a8b0U, RuntimePcAction::frustum_level_triangle_outcode,
+      RuntimePcScope::singleplayer);
+  put(0x8009cd7cU, RuntimePcAction::frustum_bsp_lower_x,
+      RuntimePcScope::singleplayer);
+  put(0x8009ce1cU, RuntimePcAction::frustum_object_upper_x,
+      RuntimePcScope::singleplayer);
+  put(0x800941a8U, RuntimePcAction::frustum_bsp_upper_x,
+      RuntimePcScope::multiplayer);
+  put(0x800942f8U, RuntimePcAction::frustum_bsp_lower_x,
+      RuntimePcScope::multiplayer);
+  put(0x80094428U, RuntimePcAction::frustum_bsp_lower_x,
+      RuntimePcScope::multiplayer);
+  put(0x80094ad0U, RuntimePcAction::frustum_level_triangle_outcode,
+      RuntimePcScope::multiplayer);
+  put(0x80096cc8U, RuntimePcAction::frustum_bsp_lower_x,
+      RuntimePcScope::multiplayer);
+  put(0x80096d68U, RuntimePcAction::frustum_object_upper_x,
+      RuntimePcScope::multiplayer);
+  put(0x80010c00U, RuntimePcAction::frustum_slus_triangle_outcode);
+  put(0x800115c4U, RuntimePcAction::frustum_slus_triangle_outcode);
   return result;
 }();
 
@@ -64,9 +103,16 @@ inline constexpr auto runtime_pc_actions = [] {
 
 [[nodiscard]] constexpr RuntimePcAction
 runtimePcAction(std::uint32_t pc) noexcept {
-  const auto &entry =
-      detail::runtime_pc_actions[((pc >> 2U) ^ (pc >> 7U)) & 31U];
+  const auto &entry = detail::runtime_pc_actions[
+      detail::runtimePcActionIndex(pc)];
   return entry.pc == pc ? entry.action : RuntimePcAction::none;
+}
+
+[[nodiscard]] constexpr RuntimePcScope
+runtimePcScope(std::uint32_t pc) noexcept {
+  const auto &entry = detail::runtime_pc_actions[
+      detail::runtimePcActionIndex(pc)];
+  return entry.pc == pc ? entry.scope : RuntimePcScope::none;
 }
 
 enum class RuntimeStatus {
@@ -175,7 +221,7 @@ public:
 
   [[nodiscard]] bool gameplayPresentationReady() const noexcept;
   [[nodiscard]] std::uint8_t activeCampaignLevel() const noexcept {
-    if (!gameplayPresentationReady())
+    if (!gameplayPresentationReady() || multiplayerOverlayLoaded())
       return 0U;
     return active_campaign_level_ >= 1U && active_campaign_level_ <= 24U
                ? active_campaign_level_
@@ -249,6 +295,7 @@ private:
 
   void applyAdaptiveWorldFrustumHook(AdaptiveWorldFrustumHook hook) noexcept;
   [[nodiscard]] bool gameplayOverlayLoaded() const noexcept;
+  [[nodiscard]] bool multiplayerOverlayLoaded() const noexcept;
   [[nodiscard]] AdaptiveWorldFrustumState
   validateAdaptiveWorldFrustum() const noexcept;
 
@@ -286,6 +333,7 @@ private:
   std::uint64_t instruction_debt_{};
   RuntimeStats stats_{};
   std::int32_t adaptive_world_x_margin_{};
+  std::int32_t adaptive_multiplayer_world_x_margin_{};
   AdaptiveWorldFrustumState adaptive_world_frustum_state_{};
   bool gameplay_presentation_ready_{};
   struct LevelExtent {

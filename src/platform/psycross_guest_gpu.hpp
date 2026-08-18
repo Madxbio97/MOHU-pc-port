@@ -161,9 +161,7 @@ public:
     setPresentationInterpolationEnabled(enabled);
   }
 
-  void resetPresentationHistory() noexcept {
-    resetPresentationReplayHistory();
-  }
+  void resetPresentationHistory() noexcept { resetPresentationReplayHistory(); }
 
   void setCoherenceEdgeSnapping(bool enabled) noexcept {
     coherence_edge_snapping_enabled_ = enabled;

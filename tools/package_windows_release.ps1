@@ -59,6 +59,10 @@ foreach ($file in $skyboxFiles) {
         throw "Required skybox is missing: $source"
     }
 }
+$localeSource = Join-Path $repoRoot "assets\locales\ru-vit"
+if (-not (Test-Path -LiteralPath $localeSource -PathType Container)) {
+    throw "Required Russian localization pack is missing: $localeSource"
+}
 
 $vcRedistRoots = [Collections.Generic.List[string]]::new()
 if ($env:VCToolsRedistDir) {
@@ -95,6 +99,7 @@ $vcFiles = @(
 New-Item -ItemType Directory -Path $packageDir | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $packageDir "assets\skyboxes") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $packageDir "licenses") | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $packageDir "locales") | Out-Null
 
 foreach ($file in $runtimeFiles) {
     Copy-Item -LiteralPath (Join-Path $buildDir $file) -Destination $packageDir
@@ -102,6 +107,8 @@ foreach ($file in $runtimeFiles) {
 foreach ($file in $skyboxFiles) {
     Copy-Item -LiteralPath (Join-Path $skyboxSource $file) -Destination (Join-Path $packageDir "assets\skyboxes")
 }
+Copy-Item -LiteralPath $localeSource -Destination (Join-Path $packageDir "locales") -Recurse
+
 foreach ($file in $vcFiles) {
     $source = Join-Path $vcRuntimeDir $file
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {

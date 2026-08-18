@@ -17,42 +17,58 @@ namespace sf::disc {
 // stream into memory.
 class RawSectorSource final {
 public:
-    static constexpr std::size_t raw_sector_size = 2352;
-    using Sector = std::array<std::byte, raw_sector_size>;
+  static constexpr std::size_t raw_sector_size = 2352;
+  using Sector = std::array<std::byte, raw_sector_size>;
 
-    [[nodiscard]] static RawSectorSource open(const std::filesystem::path& cue_path);
+  [[nodiscard]] static RawSectorSource
+  open(const std::filesystem::path &cue_path);
 
-    RawSectorSource(RawSectorSource&&) noexcept = default;
-    RawSectorSource& operator=(RawSectorSource&&) noexcept = default;
-    RawSectorSource(const RawSectorSource&) = delete;
-    RawSectorSource& operator=(const RawSectorSource&) = delete;
+  RawSectorSource(RawSectorSource &&) noexcept = default;
+  RawSectorSource &operator=(RawSectorSource &&) noexcept = default;
+  RawSectorSource(const RawSectorSource &) = delete;
+  RawSectorSource &operator=(const RawSectorSource &) = delete;
 
-    [[nodiscard]] std::uint32_t sectorCount() const noexcept { return sector_count_; }
-    [[nodiscard]] const std::filesystem::path& binaryPath() const noexcept {
-        return track_.binary_path;
-    }
+  [[nodiscard]] std::uint32_t sectorCount() const noexcept {
+    return sector_count_;
+  }
+  [[nodiscard]] const std::filesystem::path &binaryPath() const noexcept {
+    return track_.binary_path;
+  }
 
-    [[nodiscard]] Sector readSector(std::uint32_t lba);
-    void readSectors(std::uint32_t first_lba, std::span<std::byte> destination);
+  [[nodiscard]] Sector readSector(std::uint32_t lba);
+  void readSectors(std::uint32_t first_lba, std::span<std::byte> destination);
+  [[nodiscard]] bool addUserDataOverlay(std::uint32_t first_lba,
+                                        std::span<const std::byte> bytes);
 
 private:
-    RawSectorSource(DataTrack track, std::ifstream stream, std::uint32_t sector_count);
+  RawSectorSource(DataTrack track, std::ifstream stream,
+                  std::uint32_t sector_count);
 
-    [[nodiscard]] std::uint64_t byteOffset(std::uint32_t lba) const;
-    void readTrackSectors(std::uint32_t first_lba, std::span<std::byte> destination);
-    void refillReadAhead(std::uint32_t first_lba);
-    [[nodiscard]] bool readAheadContains(std::uint32_t lba) const noexcept;
+  [[nodiscard]] std::uint64_t byteOffset(std::uint32_t lba) const;
+  void readTrackSectors(std::uint32_t first_lba,
+                        std::span<std::byte> destination);
+  void refillReadAhead(std::uint32_t first_lba);
+  [[nodiscard]] bool readAheadContains(std::uint32_t lba) const noexcept;
+  void applyUserDataOverlays(std::uint32_t first_lba,
+                             std::span<std::byte> destination) const;
 
-    static constexpr std::size_t read_ahead_sector_count = 64U;
+  static constexpr std::size_t read_ahead_sector_count = 64U;
+  static constexpr std::size_t user_data_offset = 24U;
+  static constexpr std::size_t user_data_size = 2048U;
+  struct UserDataOverlay {
+    std::uint32_t first_lba{};
+    std::vector<std::byte> bytes;
+  };
 
-    DataTrack track_;
-    std::ifstream stream_;
-    std::uint32_t sector_count_{};
-    std::vector<std::byte> read_ahead_;
-    std::uint32_t read_ahead_first_lba_{};
-    std::uint32_t read_ahead_count_{};
-    std::uint32_t next_stream_lba_{};
-    bool stream_position_valid_{};
+  DataTrack track_;
+  std::ifstream stream_;
+  std::uint32_t sector_count_{};
+  std::vector<UserDataOverlay> user_data_overlays_;
+  std::vector<std::byte> read_ahead_;
+  std::uint32_t read_ahead_first_lba_{};
+  std::uint32_t read_ahead_count_{};
+  std::uint32_t next_stream_lba_{};
+  bool stream_position_valid_{};
 };
 
 } // namespace sf::disc

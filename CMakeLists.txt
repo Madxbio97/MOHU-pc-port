@@ -296,7 +296,7 @@ if(SF_ENABLE_PSYCROSS)
     endif()
     if(WIN32)
         target_link_libraries(medal_of_honor_underground
-            PRIVATE user32 comdlg32 gdiplus)
+            PRIVATE user32 comdlg32)
     endif()
     sf_set_project_warnings(medal_of_honor_underground)
     set(mohu_skybox_assets
@@ -312,12 +312,22 @@ if(SF_ENABLE_PSYCROSS)
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/french_mountains_night.tga"
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/french_mountains_morning.tga"
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/paris_outskirts_night.tga")
+    file(GLOB_RECURSE mohu_localization_assets CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/locales/ru-vit/*")
+    set_source_files_properties(${mohu_localization_assets}
+        PROPERTIES HEADER_FILE_ONLY TRUE)
+    target_sources(medal_of_honor_underground PRIVATE ${mohu_localization_assets})
     add_custom_command(TARGET medal_of_honor_underground POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory
             "$<TARGET_FILE_DIR:medal_of_honor_underground>/assets/skyboxes"
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:medal_of_honor_underground>/locales"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${mohu_skybox_assets}
             "$<TARGET_FILE_DIR:medal_of_honor_underground>/assets/skyboxes"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/locales/ru-vit"
+            "$<TARGET_FILE_DIR:medal_of_honor_underground>/locales/ru-vit"
         COMMAND_EXPAND_LISTS VERBATIM)
 
 endif()

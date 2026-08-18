@@ -1156,9 +1156,19 @@ PsyXPresentationViewport PsyX_CalculateGuestRenderExtent(
   // Root identity comes from the guest-submit boundary, never a transient GP1
   // width heuristic. Contained pages are resolved against their retained
   // parent before this helper is called.
-  if (rootPage != 0)
+  if (rootPage != 0) {
+    // Horizontal split-screen submits its upper 512x120 viewport first, so it
+    // is a semantic root but still occupies exactly half the selected target.
+    // Width-only guest mode changes (256/320/512) remain full-screen roots.
+    const auto root_height =
+        logicalHeight < canonicalHeight
+            ? (static_cast<long long>(target.h) * logicalHeight +
+               canonicalHeight / 2) /
+                  canonicalHeight
+            : target.h;
     return {0, 0, std::max(target.w, logicalWidth),
-            std::max(target.h, logicalHeight)};
+            std::max<int>(static_cast<int>(root_height), logicalHeight)};
+  }
 
   const auto scaled_width =
       (static_cast<long long>(target.w) * logicalWidth + canonicalWidth / 2) /

@@ -72,6 +72,10 @@ private:
   std::uint32_t pending_screen_id_{};
   std::uint32_t pending_selection_{};
   bool pending_activation_{};
+  std::uint32_t target_screen_id_{};
+  std::uint32_t target_selection_{};
+  bool target_pending_{};
+  bool directional_release_pending_{};
 };
 
 class RelativeMouseCapture final {

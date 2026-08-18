@@ -131,6 +131,11 @@ void testAdaptiveWorldFrustumMatchesPresentation() {
   require(near(left_ndc, -1.0F) && near(right_ndc, 1.0F),
           "World frustum and PresentationScale disagree at 16:9 edges");
 
+  const auto split_margin =
+      mohu::adaptiveWorldXMargin(3840U, 2160U / 2U, true);
+  require(split_margin == 450,
+          "Split-screen frustum ignored the half-height player viewport");
+
   require(mohu::adaptiveWorldXMargin(1280U, 960U, true) == 0,
           "4:3 unexpectedly enabled world widening");
   require(mohu::adaptiveWorldXMargin(1920U, 1080U, false) == 0,
@@ -200,6 +205,13 @@ void testRuntimePcDispatchIsExact() {
       Expected{0x000000c0U, Action::bios_call_vector},
       Expected{0x80037b00U, Action::disc_search_return},
       Expected{0x80039064U, Action::directory_scan_entry},
+      Expected{0x80097084U, Action::multiplayer_renderer_boundary},
+      Expected{0x800941a8U, Action::frustum_bsp_upper_x},
+      Expected{0x800942f8U, Action::frustum_bsp_lower_x},
+      Expected{0x80094428U, Action::frustum_bsp_lower_x},
+      Expected{0x80094ad0U, Action::frustum_level_triangle_outcode},
+      Expected{0x80096cc8U, Action::frustum_bsp_lower_x},
+      Expected{0x80096d68U, Action::frustum_object_upper_x},
       Expected{0x80099a28U, Action::frustum_bsp_upper_x},
       Expected{0x80099dacU, Action::frustum_bsp_lower_x},
       Expected{0x8009a2c8U, Action::frustum_bsp_lower_x},
@@ -223,6 +235,18 @@ void testRuntimePcDispatchIsExact() {
               "Runtime PC dispatcher accepted a neighbouring instruction");
     }
   }
+  require(mohu::runtimePcScope(0x80094ad0U) ==
+                  mohu::RuntimePcScope::multiplayer &&
+              mohu::runtimePcScope(0x800942f8U) ==
+                  mohu::RuntimePcScope::multiplayer &&
+              mohu::runtimePcScope(0x8009a8b0U) ==
+                  mohu::RuntimePcScope::singleplayer,
+          "LEVEL and LEVEL2P hooks lost overlay provenance");
+  require(mohu::runtimePcScope(0x80010c00U) ==
+                  mohu::RuntimePcScope::any &&
+              mohu::runtimePcScope(0x80010c04U) ==
+                  mohu::RuntimePcScope::none,
+          "Resident hook scope is not exact");
   for (std::uint32_t slot{}; slot < 32U; ++slot) {
     const auto collision = 0x80100000U + slot * 4U;
     require(mohu::runtimePcAction(collision) == Action::none,
@@ -313,6 +337,11 @@ void testGuestRenderExtentUsesSelectedResolution() {
   require(menu.w == 1280 && menu.h == 720 && gameplay.w == 1280 &&
               gameplay.h == 720,
           "Menu and gameplay roots did not share the selected pixel target");
+
+  const auto split = PsyX_CalculateGuestRenderExtent(
+      3840, 2160, PSYX_ASPECT_ADAPTIVE, 512, 120, 512, 240, 1);
+  require(split.w == 3840 && split.h == 1080,
+          "Split-screen root did not map to half the selected target");
 
   const auto original = PsyX_CalculateGuestRenderExtent(
       1920, 1080, PSYX_ASPECT_ORIGINAL_4_3, 512, 240, 512, 240, 1);

@@ -129,9 +129,7 @@ public:
     GR_SetPrimitiveOrderingDepth(enabled ? 1 : 0, depth, span);
   }
 
-  ~PrimitiveOrderingDepthScope() {
-    GR_SetPrimitiveOrderingDepth(0, 0U, 0U);
-  }
+  ~PrimitiveOrderingDepthScope() { GR_SetPrimitiveOrderingDepth(0, 0U, 0U); }
 
   PrimitiveOrderingDepthScope(const PrimitiveOrderingDepthScope &) = delete;
   PrimitiveOrderingDepthScope &
@@ -1594,8 +1592,7 @@ void PsyCrossGuestGpu::rebuildPresentationReplayPlan() {
 
   // MOHU alternates two packet arenas. Probe the same arena two frames back
   // before running the edit-distance matcher against the adjacent arena.
-  if (!model_animation_interpolation_enabled_ &&
-      !has_stable_majority(report)) {
+  if (!model_animation_interpolation_enabled_ && !has_stable_majority(report)) {
     const auto &ancestor_frame = ancestor_presentation_replay_frame_;
     const auto ancestor_page_index = replayPageIndex(ancestor_frame);
     if (ancestor_frame.generation != 0U && ancestor_frame.display_enabled &&
@@ -1640,14 +1637,12 @@ void PsyCrossGuestGpu::rebuildPresentationReplayPlan() {
                 current_page.dma_source_storage},
             current_page.target.x, current_page.target.y});
   };
-  if (model_animation_interpolation_enabled_ &&
-      !has_stable_majority(report)) {
+  if (model_animation_interpolation_enabled_ && !has_stable_majority(report)) {
     auto sequence_report = match_sequence(previous_page);
     consider_report(std::move(sequence_report), previous_page_index,
                     &previous_page, 1U);
   }
-  if (!model_animation_interpolation_enabled_ &&
-      !has_stable_majority(report)) {
+  if (!model_animation_interpolation_enabled_ && !has_stable_majority(report)) {
     auto sequence_report = match_sequence(*selected_previous_page);
     consider_report(std::move(sequence_report), selected_previous_page_index,
                     selected_previous_page, previous_frame_age);
@@ -1699,8 +1694,7 @@ void PsyCrossGuestGpu::rebuildPresentationReplayPlan() {
   last_presentation_replay_relative_matches_ = report.relative_match_count;
   last_presentation_replay_total_matches_ = report.matches.size();
   const auto model_match_input_valid =
-      !model_animation_interpolation_enabled_ ||
-      has_stable_majority(report);
+      !model_animation_interpolation_enabled_ || has_stable_majority(report);
   if (!report.input_valid || report.matches.empty() ||
       !model_match_input_valid) {
     last_presentation_replay_reject_reason_ = 4U;
@@ -1748,8 +1742,8 @@ void PsyCrossGuestGpu::rebuildPresentationReplayPlan() {
   auto lineage_groups = std::vector<ReplayLineageGroup>{};
   if (model_animation_interpolation_enabled_) {
     for (const auto &match : report.matches) {
-      const auto *previous_event = replayEventAt(
-          interpolation_previous_page, match.previous_command_word);
+      const auto *previous_event = replayEventAt(interpolation_previous_page,
+                                                 match.previous_command_word);
       const auto *current_event =
           replayEventAt(current_page, match.current_command_word);
       if (previous_event == nullptr || current_event == nullptr ||
@@ -3373,7 +3367,7 @@ void PsyCrossGuestGpu::dispatch(
             : static_cast<u_short>(0xffffU);
     const PrimitiveLightingScope lighting_scope{lighting};
     const PrimitiveOrderingDepthScope ordering_depth_scope{ordering_depth,
-                                                            ordering_span};
+                                                           ordering_span};
     if (pgxp_index != static_cast<u_short>(0xffffU)) {
       DrawPrimPGXP(tag, pgxp_index);
       if (allow_precise) {
@@ -4526,8 +4520,7 @@ void PsyCrossGuestGpu::submit(
           std::span<const psx::GpuDmaWordSource>{pending_dma_sources_}.subspan(
               consumed, length);
     }
-    auto command_ordering_depth =
-        psx::GpuDmaWordSource::invalid_ordering_depth;
+    auto command_ordering_depth = psx::GpuDmaWordSource::invalid_ordering_depth;
     if (!command_dma_sources.empty() &&
         command_dma_sources.front().hasOrderingDepth()) {
       const auto &first_source = command_dma_sources.front();

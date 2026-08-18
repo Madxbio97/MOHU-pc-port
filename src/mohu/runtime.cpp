@@ -4,7 +4,9 @@
 #include "mohu/campaign_level.hpp"
 #include "mohu/frontend_menu.hpp"
 #include "sf/core/error.hpp"
+#include "sf/core/sha256.hpp"
 #include "sf/disc/raw_sector_source.hpp"
+#include "sf/game/localization.hpp"
 #include "sf/psx/gp0_command.hpp"
 #include "sf/psx/memory_card_image.hpp"
 
@@ -29,23 +31,47 @@ static_assert(guest_instructions_per_frame ==
               sf::psx::PsxMachine::cpu_clock_hz / 60U);
 constexpr std::uint32_t disc_search_attempt_register = 17U;
 
+constexpr std::string_view moption_disc_path = "DATA/SCR1/MOPTION.RSC";
+constexpr std::string_view moption_localized_path =
+    "mohu/DATA/SCR1/MOPTION.RSC";
+constexpr std::string_view moption_source_sha256 =
+    "98573dded0b56986bf7f04581f6f7e2a6310d7146b44598f72232c2708b232ef";
+constexpr std::string_view moption_localized_sha256 =
+    "71f3af191163d705a7532a1129e8428f12b4c28974d464f45050a70e49b7c4aa";
+
 struct OpcodeWitness {
   std::uint32_t address;
   std::uint32_t instruction;
 };
 
-// SLUS-01270 LEVEL.BIN is loaded at 0x8003b600. SHELL.BIN replaces the first
-// word with 7, so this marker also rejects stale LEVEL code left above the
-// smaller frontend overlay.
-constexpr OpcodeWitness gameplay_overlay_marker{0x8003b600U, 0x00000005U};
+// SLUS-01270 gameplay overlays are loaded at 0x8003b600. SHELL.BIN replaces
+// the first word with 7, so these exact markers reject stale gameplay code
+// left above the smaller frontend overlay.
+constexpr OpcodeWitness singleplayer_overlay_marker{0x8003b600U,
+                                                     0x00000005U};
+constexpr OpcodeWitness multiplayer_overlay_marker{0x8003b600U,
+                                                    0x00000006U};
 constexpr OpcodeWitness frontend_overlay_marker{0x8003b600U, 0x00000007U};
-constexpr std::array gameplay_overlay_witnesses{
+constexpr std::array singleplayer_overlay_witnesses{
     OpcodeWitness{0x80099a28U, 0xafa300ccU}, // sw v1,0xcc(sp)
     OpcodeWitness{0x80099dacU, 0x04400033U}, // bltz v0,0x80099e7c
     OpcodeWitness{0x8009a2c8U, 0x04400033U}, // bltz v0,0x8009a398
     OpcodeWitness{0x8009a8b0U, 0x04410003U}, // bgez v0,0x8009a8c0
     OpcodeWitness{0x8009cd7cU, 0x04400088U}, // bltz v0,0x8009cfa0
     OpcodeWitness{0x8009ce1cU, 0x0043102aU}, // slt v0,v0,v1
+};
+
+// LEVEL2P.BIN has its own verified world-renderer layout. These opcodes bind
+// marker 6 to the split-screen renderer instead of treating any resident
+// multiplayer overlay or menu as a gameplay frame.
+constexpr std::array multiplayer_overlay_witnesses{
+    OpcodeWitness{0x800941a8U, 0xafa300ccU}, // sw v1,0xcc(sp)
+    OpcodeWitness{0x800942f8U, 0x044000b3U}, // bltz v0,0x800945c8
+    OpcodeWitness{0x80094428U, 0x04400067U}, // bltz v0,0x800945c8
+    OpcodeWitness{0x80094ad0U, 0x04410003U}, // bgez v0,0x80094ae0
+    OpcodeWitness{0x80096cc8U, 0x04400088U}, // bltz v0,0x80096eec
+    OpcodeWitness{0x80096d68U, 0x0043102aU}, // slt v0,v0,v1
+    OpcodeWitness{0x80097084U, 0x0c01a0e1U}, // jal 0x80068384
 };
 
 // SLUS-01270 static-TSP outcode paths. Both read the retail horizontal bound
@@ -107,7 +133,7 @@ RuntimeAtmosphereState Runtime::activeAtmosphere() const noexcept {
   std::uint32_t raw_dqa{};
   std::uint32_t raw_dqb{};
   std::uint32_t raw_rgb{};
-  if (!gameplayOverlayLoaded() ||
+  if (!gameplayOverlayLoaded() || multiplayerOverlayLoaded() ||
       !cpu_.read32(camera_controller_pointer, controller) || controller == 0U ||
       !cpu_.read32(controller, renderer) || renderer == 0U ||
       !cpu_.read32(renderer + renderer_projection_flags_offset,
@@ -288,6 +314,28 @@ Runtime::Runtime(sf::game::GameDisc disc,
   machine_.attachGpuPort(&gpu_);
   auto source = std::make_unique<sf::disc::RawSectorSource>(
       sf::disc::RawSectorSource::open(disc_.cuePath()));
+  if (sf::game::russianLanguageActive()) {
+    const auto localized = sf::game::readLocalizedAsset(moption_localized_path);
+    if (!localized) {
+      throw sf::core::Error{sf::core::ErrorCode::io,
+                            "Russian MOPTION localization asset is missing"};
+    }
+    const auto path = std::string{moption_disc_path};
+    const auto entry = disc_.image().find(path);
+    const auto original = disc_.image().readFile(path);
+    if (entry.is_directory || entry.size != original.size() ||
+        localized->size() != original.size() ||
+        sf::core::toHex(sf::core::sha256(original)) != moption_source_sha256 ||
+        sf::core::toHex(sf::core::sha256(*localized)) !=
+            moption_localized_sha256) {
+      throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                            "Russian MOPTION source provenance mismatch"};
+    }
+    if (!source->addUserDataOverlay(entry.extent_lba, *localized)) {
+      throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                            "Russian MOPTION sector overlay is invalid"};
+    }
+  }
   const auto sector_count = source->sectorCount();
   if (!media_.attachRawSectorSource(std::move(source), 0U, sector_count)) {
     throw sf::core::Error{sf::core::ErrorCode::unsupported,
@@ -304,9 +352,24 @@ void Runtime::configureAdaptiveWorldFrustum(std::uint32_t output_width,
                                             bool adaptive) noexcept {
   adaptive_world_x_margin_ =
       adaptiveWorldXMargin(output_width, output_height, adaptive);
-  adaptive_world_frustum_state_ = adaptive_world_x_margin_ > 0
+  // LEVEL2P renders two 512x120 viewports. Each player therefore sees the
+  // full output width but only half its height, so its culling aspect is twice
+  // the single-player aspect.
+  adaptive_multiplayer_world_x_margin_ = adaptiveWorldXMargin(
+      output_width, std::max(output_height / 2U, 1U), adaptive);
+  adaptive_world_frustum_state_ = adaptive_multiplayer_world_x_margin_ > 0
                                       ? AdaptiveWorldFrustumState::pending
                                       : AdaptiveWorldFrustumState::disabled;
+}
+
+bool Runtime::multiplayerOverlayLoaded() const noexcept {
+  const auto matches = [this](const OpcodeWitness &witness) noexcept {
+    std::uint32_t value{};
+    return cpu_.read32(witness.address, value) && value == witness.instruction;
+  };
+  return matches(multiplayer_overlay_marker) &&
+         std::all_of(multiplayer_overlay_witnesses.begin(),
+                     multiplayer_overlay_witnesses.end(), matches);
 }
 
 bool Runtime::gameplayOverlayLoaded() const noexcept {
@@ -314,11 +377,12 @@ bool Runtime::gameplayOverlayLoaded() const noexcept {
     std::uint32_t value{};
     return cpu_.read32(witness.address, value) && value == witness.instruction;
   };
-  if (!matches(gameplay_overlay_marker)) {
-    return false;
-  }
-  return std::all_of(gameplay_overlay_witnesses.begin(),
-                     gameplay_overlay_witnesses.end(), matches);
+  const auto matches_all = [&matches](const auto &witnesses) noexcept {
+    return std::all_of(witnesses.begin(), witnesses.end(), matches);
+  };
+  return (matches(singleplayer_overlay_marker) &&
+          matches_all(singleplayer_overlay_witnesses)) ||
+         multiplayerOverlayLoaded();
 }
 
 bool Runtime::gameplayPresentationReady() const noexcept {
@@ -371,6 +435,10 @@ Runtime::validateAdaptiveWorldFrustum() const noexcept {
       return AdaptiveWorldFrustumState::rejected;
     }
   }
+  // The exact LEVEL2P marker and five renderer witnesses already prove its
+  // split-screen viewport. Its globals live at a different overlay address.
+  if (multiplayerOverlayLoaded())
+    return AdaptiveWorldFrustumState::active;
 
   std::uint32_t horizontal_bound{};
   std::uint32_t vertical_bound{};
@@ -387,6 +455,13 @@ Runtime::validateAdaptiveWorldFrustum() const noexcept {
 
 void Runtime::applyAdaptiveWorldFrustumHook(
     AdaptiveWorldFrustumHook hook) noexcept {
+  const auto scope = runtimePcScope(cpu_.state().pc);
+  const auto multiplayer = multiplayerOverlayLoaded();
+  if ((scope == RuntimePcScope::singleplayer && multiplayer) ||
+      (scope == RuntimePcScope::multiplayer && !multiplayer)) {
+    return;
+  }
+
   // These addresses are opcode-witnessed LEVEL renderer entry points. They
   // are a semantic gameplay boundary, unlike overlay residency or a guessed
   // primitive shape, and are reached before the frame is published to host.
@@ -406,7 +481,12 @@ void Runtime::applyAdaptiveWorldFrustumHook(
     }
   }
 
-  const auto margin = static_cast<std::uint32_t>(adaptive_world_x_margin_);
+  const auto selected_margin = multiplayer
+                                   ? adaptive_multiplayer_world_x_margin_
+                                   : adaptive_world_x_margin_;
+  const auto margin = static_cast<std::uint32_t>(selected_margin);
+  if (margin == 0U)
+    return;
   const auto add_to_register = [this](std::uint8_t reg,
                                       std::uint32_t delta) noexcept {
     cpu_.setRegister(reg, cpu_.state().gpr[reg] + delta);
@@ -739,6 +819,11 @@ Runtime::runFrame(const RuntimeControllerInputs &controllers) {
       }
       break;
     }
+    case RuntimePcAction::multiplayer_renderer_boundary:
+      if (multiplayerOverlayLoaded()) {
+        gameplay_presentation_ready_ = true;
+      }
+      break;
     case RuntimePcAction::frustum_bsp_upper_x:
       applyAdaptiveWorldFrustumHook(AdaptiveWorldFrustumHook::bsp_upper_x);
       break;
