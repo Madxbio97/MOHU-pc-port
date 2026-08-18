@@ -1,6 +1,8 @@
 #include "sf/psx/bios_hle.hpp"
 #include "sf/psx/machine.hpp"
+#include "sf/psx/memory_card_image.hpp"
 
+#include <limits>
 #include <memory>
 #include <new>
 
@@ -35,6 +37,21 @@ constexpr std::uint32_t event_ready = 0x4000U;
 constexpr std::uint32_t event_callback_mode = 0x1000U;
 constexpr std::uint32_t event_mark_mode = 0x2000U;
 
+constexpr std::uint32_t c0_card_driver_stub = 0x0000c000U;
+constexpr std::uint32_t b0_card_driver_stub = 0x0000c100U;
+constexpr std::uint32_t c0_card_hook_table = 0x0000db00U;
+constexpr std::uint32_t mips_jr_ra = 0x03e00008U;
+
+[[nodiscard]] constexpr std::uint8_t
+memoryCardSlotForChannel(std::uint32_t channel) noexcept {
+  if (channel == 0x00U) {
+    return 0U;
+  }
+  if (channel == 0x10U) {
+    return 1U;
+  }
+  return memory_card_invalid_slot;
+}
 } // namespace
 
 bool BiosHle::atCallBoundary() const noexcept {
@@ -254,7 +271,25 @@ void BiosHle::completeCall(std::uint32_t result) noexcept {
   runtime_.completeHostCall();
 }
 
-bool BiosHle::restoreMemoryCardState(const MemoryCardHleState &state) noexcept {
+MemoryCardHleState &BiosHle::memoryCard(std::uint8_t slot) noexcept {
+  return slot == 0U ? state_.memory_card : state_.memory_card_slot_2;
+}
+
+const MemoryCardHleState &
+BiosHle::memoryCard(std::uint8_t slot) const noexcept {
+  return slot == 0U ? state_.memory_card : state_.memory_card_slot_2;
+}
+
+std::uint32_t &BiosHle::memoryCardStatus(std::uint8_t slot) noexcept {
+  return slot == 0U ? state_.memory_card_status
+                    : state_.memory_card_slot_2_status;
+}
+
+bool BiosHle::restoreMemoryCardState(const MemoryCardHleState &state,
+                                     std::uint8_t slot) noexcept {
+  if (slot >= memory_card_slot_count) {
+    return false;
+  }
   auto persistent = std::unique_ptr<MemoryCardHleState>{
       new (std::nothrow) MemoryCardHleState{state}};
   if (!persistent) {
@@ -263,19 +298,19 @@ bool BiosHle::restoreMemoryCardState(const MemoryCardHleState &state) noexcept {
   persistent->descriptors = {};
   persistent->find = {};
   persistent->pending = {};
-  if (!MemoryCardHle::validateState(*persistent)) {
+  if (!MemoryCardHle::validateState(*persistent, slot)) {
     return false;
   }
-  state_.memory_card = std::move(*persistent);
+  memoryCard(slot) = std::move(*persistent);
   return true;
 }
 
-bool BiosHle::commitMemoryCard() noexcept {
-  if (!memory_card_commit_) {
+bool BiosHle::commitMemoryCard(std::uint8_t slot) noexcept {
+  if (slot >= memory_card_slot_count || !memory_card_commits_[slot]) {
     return true;
   }
   try {
-    return memory_card_commit_(state_.memory_card);
+    return memory_card_commits_[slot](memoryCard(slot));
   } catch (...) {
     return false;
   }
@@ -304,6 +339,46 @@ bool BiosHle::eventTable(std::uint32_t &table, std::uint32_t &count) noexcept {
   }
   return runtime_.write32(event_table_anchor, table) &&
          runtime_.write32(event_table_size_anchor, count * event_stride);
+}
+
+bool BiosHle::ensureCardKernelTables() noexcept {
+  if (card_kernel_tables_initialized_) {
+    return true;
+  }
+
+  // Retail libcard patches these regions in place. GetB0Table may be called
+  // again immediately afterwards, so initialization must never overwrite the
+  // installed trampoline. Card completion remains owned by the HLE events.
+  constexpr std::uint32_t c0_hook_lui =
+      0x3c080000U | (c0_card_hook_table >> 16U);
+  constexpr std::uint32_t c0_hook_addiu =
+      0x25080000U | (c0_card_hook_table & 0xffffU);
+  constexpr std::uint32_t c0_card_driver_entry = 0x18U;
+  constexpr std::uint32_t c0_hook_upper_instruction = 0x70U;
+  constexpr std::uint32_t c0_hook_lower_instruction = 0x74U;
+  constexpr std::uint32_t b0_card_driver_entry = 0x16cU;
+  constexpr std::uint32_t b0_hook_code = 0x9c8U;
+  constexpr std::uint32_t b0_hook_code_words = 5U;
+  constexpr std::uint32_t b0_clear_pad_flag = 0x1988U;
+
+  auto initialized =
+      runtime_.write32(c0_table + c0_card_driver_entry, c0_card_driver_stub) &&
+      runtime_.write32(c0_card_driver_stub, mips_jr_ra) &&
+      runtime_.write32(c0_card_driver_stub + 4U, 0U) &&
+      runtime_.write32(c0_card_driver_stub + c0_hook_upper_instruction,
+                       c0_hook_lui) &&
+      runtime_.write32(c0_card_driver_stub + c0_hook_lower_instruction,
+                       c0_hook_addiu) &&
+      runtime_.write32(b0_table + b0_card_driver_entry, b0_card_driver_stub) &&
+      runtime_.write32(b0_card_driver_stub, mips_jr_ra) &&
+      runtime_.write32(b0_card_driver_stub + 4U, 0U) &&
+      runtime_.write32(b0_card_driver_stub + b0_clear_pad_flag, 0U);
+  for (std::uint32_t word{}; initialized && word < b0_hook_code_words; ++word) {
+    initialized = runtime_.write32(
+        b0_card_driver_stub + b0_hook_code + word * sizeof(std::uint32_t), 0U);
+  }
+  card_kernel_tables_initialized_ = initialized;
+  return initialized;
 }
 
 bool BiosHle::queueEventCallback(std::uint32_t handler) noexcept {
@@ -369,7 +444,62 @@ bool BiosHle::completeEventCallback() noexcept {
                            event_callback_resume_pgxp_);
   event_callback_resume_pgxp_ = {};
   event_callback_active_ = false;
+  ++state_.event_callbacks_completed;
   return true;
+}
+
+std::uint64_t
+BiosHle::memoryCardOperationTicks(BiosMemoryCardOperation operation) noexcept {
+  // DuckStation clocks every card byte at JOY_BAUD*8, then waits 170
+  // master-clock ticks for the card ACK. The retail BIOS programs 0x88.
+  constexpr std::uint64_t byte_ticks = 0x88U * 8U + 170U;
+  constexpr std::uint64_t probe_bytes = 10U;
+  constexpr std::uint64_t sector_transaction_bytes = 139U;
+  switch (operation) {
+  case BiosMemoryCardOperation::info:
+    return probe_bytes * byte_ticks;
+  case BiosMemoryCardOperation::load:
+  case BiosMemoryCardOperation::raw_read:
+  case BiosMemoryCardOperation::raw_write:
+    return sector_transaction_bytes * byte_ticks;
+  case BiosMemoryCardOperation::none:
+    return 0U;
+  }
+  return 0U;
+}
+
+bool BiosHle::beginMemoryCardOperation(BiosMemoryCardOperation operation,
+                                       std::uint8_t slot,
+                                       std::uint32_t event_class,
+                                       std::uint32_t sector,
+                                       std::uint32_t guest_buffer) noexcept {
+  if (operation == BiosMemoryCardOperation::none ||
+      slot >= memory_card_slot_count ||
+      state_.memory_card_operation != BiosMemoryCardOperation::none) {
+    return false;
+  }
+  state_.memory_card_operation = operation;
+  memory_card_operation_slot_ = slot;
+  memory_card_event_class_ = event_class;
+  memory_card_sector_ = sector;
+  memory_card_buffer_ = guest_buffer;
+  const auto start = machine_ != nullptr ? machine_->currentTick() : 0U;
+  const auto delay = memoryCardOperationTicks(operation);
+  constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+  memory_card_completion_tick_ =
+      delay > maximum - start ? maximum : start + delay;
+  ++state_.memory_card_submissions;
+  return true;
+}
+
+std::uint64_t BiosHle::asyncServiceTicksRemaining() const noexcept {
+  if (state_.memory_card_operation == BiosMemoryCardOperation::none ||
+      machine_ == nullptr) {
+    return 0U;
+  }
+  const auto now = machine_->currentTick();
+  return now < memory_card_completion_tick_ ? memory_card_completion_tick_ - now
+                                            : 0U;
 }
 
 BiosAsyncServiceResult BiosHle::serviceAsync() noexcept {
@@ -377,35 +507,116 @@ BiosAsyncServiceResult BiosHle::serviceAsync() noexcept {
     return BiosAsyncServiceResult::idle;
   }
 
-  if (state_.memory_card.pending.kind != MemoryCardPendingKind::none) {
+  if (state_.memory_card_operation != BiosMemoryCardOperation::none) {
+    if (asyncServiceTicksRemaining() != 0U) {
+      return BiosAsyncServiceResult::idle;
+    }
+
+    constexpr std::uint32_t sector_size = 0x80U;
+    const auto operation = state_.memory_card_operation;
+    const auto slot = memory_card_operation_slot_;
+    if (slot >= memory_card_slot_count) {
+      return BiosAsyncServiceResult::failed;
+    }
+    auto &card = memoryCard(slot);
+    const auto is_raw = operation == BiosMemoryCardOperation::raw_read ||
+                        operation == BiosMemoryCardOperation::raw_write;
+    const auto write = operation == BiosMemoryCardOperation::raw_write;
+    const auto sector = memory_card_sector_;
+    const auto guest_buffer = memory_card_buffer_;
+    auto success = state_.memory_card_initialized &&
+                   state_.memory_card_started && card.present && card.formatted;
+    auto image = is_raw ? std::unique_ptr<MemoryCardRawImage>{new (
+                              std::nothrow) MemoryCardRawImage{}}
+                        : nullptr;
+    if (is_raw &&
+        (!image || !static_cast<bool>(MemoryCardImage::encode(card, *image)))) {
+      success = false;
+    }
+
+    const auto offset = static_cast<std::size_t>(sector) * sector_size;
+    if (is_raw && success && write && guest_buffer == 0U) {
+      success = sector == 0x3fU;
+    } else if (is_raw && success && write) {
+      for (std::uint32_t index{}; index < sector_size; ++index) {
+        std::uint8_t value{};
+        if (!runtime_.read8(guest_buffer + index, value)) {
+          success = false;
+          break;
+        }
+        (*image)[offset + index] = value;
+      }
+      if (success) {
+        auto decoded = std::unique_ptr<MemoryCardHleState>{
+            new (std::nothrow) MemoryCardHleState{}};
+        success =
+            decoded && static_cast<bool>(MemoryCardImage::decode(
+                           std::span<const std::uint8_t>{*image}, *decoded));
+        if (success) {
+          decoded->descriptors = card.descriptors;
+          decoded->find = card.find;
+          decoded->pending = card.pending;
+          decoded->dirty_generation = card.dirty_generation + 1U;
+          const auto before = std::unique_ptr<MemoryCardHleState>{
+              new (std::nothrow) MemoryCardHleState{card}};
+          if (!before) {
+            success = false;
+          } else {
+            card = std::move(*decoded);
+            if (!commitMemoryCard(slot)) {
+              card = std::move(*before);
+              success = false;
+            }
+          }
+        }
+      }
+    } else if (is_raw && success) {
+      for (std::uint32_t index{}; index < sector_size; ++index) {
+        if (!runtime_.write8(guest_buffer + index, (*image)[offset + index])) {
+          success = false;
+          break;
+        }
+      }
+    }
+
+    memoryCardStatus(slot) = success ? 1U : 0x21U;
+    const auto spec = success ? 0x00000004U : 0x00008000U;
+    state_.memory_card_last_event_class = memory_card_event_class_;
+    state_.memory_card_last_event_spec = spec;
+    if (!deliverEvent(memory_card_event_class_, spec)) {
+      return BiosAsyncServiceResult::failed;
+    }
+    state_.memory_card_operation = BiosMemoryCardOperation::none;
+    memory_card_operation_slot_ = memory_card_invalid_slot;
+    memory_card_completion_tick_ = 0U;
+    memory_card_event_class_ = 0U;
+    ++state_.memory_card_completions;
+    return BiosAsyncServiceResult::progressed;
+  }
+
+  for (std::uint8_t slot{}; slot < memory_card_slot_count; ++slot) {
+    auto &card = memoryCard(slot);
+    if (card.pending.kind == MemoryCardPendingKind::none) {
+      continue;
+    }
     const auto before = std::unique_ptr<MemoryCardHleState>{
-        new (std::nothrow) MemoryCardHleState{state_.memory_card}};
+        new (std::nothrow) MemoryCardHleState{card}};
     if (!before) {
       return BiosAsyncServiceResult::failed;
     }
-    auto completion =
-        MemoryCardHle::servicePending(runtime_, state_.memory_card);
+    auto completion = MemoryCardHle::servicePending(runtime_, card);
     if (!completion.completed) {
       return BiosAsyncServiceResult::failed;
     }
-    if (completion.success && completion.write && !commitMemoryCard()) {
-      state_.memory_card = *before;
-      state_.memory_card.pending = {};
+    if (completion.success && completion.write && !commitMemoryCard(slot)) {
+      card = *before;
+      card.pending = {};
       completion.success = false;
     }
     const auto spec = completion.success ? 0x00000004U : 0x00008000U;
-    constexpr std::uint32_t low_level_card = 0xf0000011U;
     constexpr std::uint32_t backup_unit = 0xf4000001U;
-    if (!deliverEvent(low_level_card, spec)) {
-      return BiosAsyncServiceResult::failed;
-    }
-    if (completion.write) {
-      if (!deliverEvent(completion.descriptor, spec) ||
-          !deliverEvent(backup_unit, spec)) {
-        return BiosAsyncServiceResult::failed;
-      }
-    } else if (!deliverEvent(backup_unit, spec) ||
-               !deliverEvent(completion.descriptor, spec)) {
+    if (!deliverEvent(backup_unit, spec) ||
+        !deliverEvent(completion.descriptor, spec)) {
       return BiosAsyncServiceResult::failed;
     }
     return BiosAsyncServiceResult::progressed;
@@ -432,6 +643,7 @@ BiosAsyncServiceResult BiosHle::serviceAsync() noexcept {
       (event_callback_head_ + 1U) % event_callback_queue_.size());
   --event_callback_count_;
   event_callback_active_ = true;
+  ++state_.event_callbacks_started;
   return BiosAsyncServiceResult::progressed;
 }
 
@@ -531,6 +743,10 @@ bool BiosHle::handleCall() noexcept {
       if (!runtime_.read32(event + event_status_offset, status)) {
         return false;
       }
+      if (call == 0x0aU && status == event_disabled) {
+        completeCall(0U);
+        return true;
+      }
       if (call == 0x0aU && status != event_ready && machine_ != nullptr) {
         std::uint32_t event_class{};
         std::uint32_t spec{};
@@ -544,16 +760,10 @@ bool BiosHle::handleCall() noexcept {
         constexpr std::uint32_t command_completed = 0x0020U;
         if (event_class == hardware_spu && spec == command_completed &&
             mode == event_mark_mode) {
-          if (const auto deadline =
-                  machine_->dmaCompletionTick(DmaChannel::spu)) {
-            const auto now = machine_->currentTick();
-            if (*deadline > now) {
-              machine_->advanceTicks(*deadline - now);
-            }
+          if (!machine_->advanceToDmaCompletion(DmaChannel::spu)) {
+            return false;
           }
-          if (machine_->dma().scheduledToken(DmaChannel::spu) == 0U) {
-            status = event_ready;
-          }
+          status = event_ready;
         }
       }
       if (status == event_ready) {
@@ -607,11 +817,44 @@ bool BiosHle::handleCall() noexcept {
     return true;
   }
   if (vector == a0_vector && call == 0x70U) {
+    if (!MemoryCardHle::installBackupUnitDevice(runtime_)) {
+      return false;
+    }
     state_.memory_card_filesystem_initialized = true;
     completeCall(0U);
     return true;
   }
   if (vector == a0_vector && call == 0x72U) {
+    completeCall(0U);
+    return true;
+  }
+  if (vector == a0_vector && (call == 0xabU || call == 0xacU)) {
+    const auto driver_ready =
+        state_.memory_card_initialized && state_.memory_card_started;
+    const auto channel = cpu.gpr[4U];
+    const auto slot = memoryCardSlotForChannel(channel);
+    state_.memory_card_channel = channel;
+    if (!driver_ready || slot >= memory_card_slot_count) {
+      if (slot < memory_card_slot_count) {
+        memoryCardStatus(slot) = 0x11U;
+      }
+      completeCall(0U);
+      return true;
+    }
+
+    constexpr std::uint32_t backup_unit = 0xf4000001U;
+    const auto operation = call == 0xabU ? BiosMemoryCardOperation::info
+                                         : BiosMemoryCardOperation::load;
+    if (!beginMemoryCardOperation(operation, slot, backup_unit)) {
+      completeCall(0U);
+      return true;
+    }
+    memoryCardStatus(slot) = 2U;
+    completeCall(1U);
+    return true;
+  }
+  if (vector == a0_vector && call == 0xadU) {
+    state_.memory_card_auto_format = cpu.gpr[4U] != 0U;
     completeCall(0U);
     return true;
   }
@@ -638,22 +881,45 @@ bool BiosHle::handleCall() noexcept {
     return true;
   }
   if (MemoryCardHle::handlesCall(vector, call)) {
+    const auto slot = MemoryCardHle::resolveCallSlot(runtime_, vector, call,
+                                                     memory_card_find_slot_);
+    if (slot >= memory_card_slot_count) {
+      completeCall(call == 0x41U || call == 0x45U ? 0U : 0xffffffffU);
+      return true;
+    }
+    auto &card = memoryCard(slot);
+    const auto reports_card_hardware_event =
+        vector == b0_vector &&
+        (call == 0x41U || call == 0x42U || call == 0x43U || call == 0x45U);
     const auto memory_card_before = std::unique_ptr<MemoryCardHleState>{
-        new (std::nothrow) MemoryCardHleState{state_.memory_card}};
+        new (std::nothrow) MemoryCardHleState{card}};
     if (!memory_card_before) {
       return false;
     }
     const auto memory_card =
-        MemoryCardHle::handleCall(runtime_, state_.memory_card, vector, call);
+        MemoryCardHle::handleCall(runtime_, card, vector, call, slot);
     if (!memory_card.handled) {
       return false;
     }
     auto result = memory_card.result;
-    if (state_.memory_card.dirty_generation !=
-            memory_card_before->dirty_generation &&
-        !commitMemoryCard()) {
-      state_.memory_card = *memory_card_before;
+    if (card.dirty_generation != memory_card_before->dirty_generation &&
+        !commitMemoryCard(slot)) {
+      card = *memory_card_before;
       result = memory_card.failure_result;
+    }
+    if (vector == b0_vector && call == 0x42U) {
+      memory_card_find_slot_ = slot;
+    }
+    if (reports_card_hardware_event) {
+      constexpr std::uint32_t low_level_card = 0xf0000011U;
+      const auto event_spec =
+          !card.present ? 0x00008000U
+                        : (!card.formatted ? 0x00002000U : 0x00000004U);
+      state_.memory_card_last_event_class = low_level_card;
+      state_.memory_card_last_event_spec = event_spec;
+      if (!deliverEvent(low_level_card, event_spec)) {
+        return false;
+      }
     }
     completeCall(result);
     return true;
@@ -675,11 +941,87 @@ bool BiosHle::handleCall() noexcept {
     completeCall(1U);
     return true;
   }
+  if (vector == b0_vector && call == 0x4dU) {
+    // _card_info starts an asynchronous presence check. The file operations
+    // are HLE-completed, but libcard still waits on the HwCARD event.
+    const auto driver_ready =
+        state_.memory_card_initialized && state_.memory_card_started;
+    const auto channel = cpu.gpr[4U];
+    const auto slot = memoryCardSlotForChannel(channel);
+    state_.memory_card_channel = channel;
+    if (!driver_ready || slot >= memory_card_slot_count) {
+      if (slot < memory_card_slot_count) {
+        memoryCardStatus(slot) = 0x11U;
+      }
+      completeCall(0U);
+      return true;
+    }
+    constexpr std::uint32_t low_level_card = 0xf0000011U;
+    if (!beginMemoryCardOperation(BiosMemoryCardOperation::info, slot,
+                                  low_level_card)) {
+      completeCall(0U);
+      return true;
+    }
+    memoryCardStatus(slot) = 2U;
+    completeCall(1U);
+    return true;
+  }
+  if (vector == b0_vector && call == 0x50U) {
+    completeCall(0U);
+    return true;
+  }
+  if (vector == b0_vector && (call == 0x4eU || call == 0x4fU)) {
+    constexpr std::uint32_t sector_count =
+        static_cast<std::uint32_t>(memory_card_raw_image_size / 0x80U);
+    const auto channel = cpu.gpr[4U];
+    const auto slot = memoryCardSlotForChannel(channel);
+    const auto sector = cpu.gpr[5U];
+    const auto guest_buffer = cpu.gpr[6U];
+    const auto write = call == 0x4eU;
+    state_.memory_card_channel = channel;
+
+    if (slot >= memory_card_slot_count || sector >= sector_count) {
+      if (slot < memory_card_slot_count) {
+        memoryCardStatus(slot) = 0x21U;
+      }
+      completeCall(0U);
+      return true;
+    }
+    const auto operation = write ? BiosMemoryCardOperation::raw_write
+                                 : BiosMemoryCardOperation::raw_read;
+    constexpr std::uint32_t low_level_card = 0xf0000011U;
+    if (!beginMemoryCardOperation(operation, slot, low_level_card, sector,
+                                  guest_buffer)) {
+      completeCall(0U);
+      return true;
+    }
+
+    memoryCardStatus(slot) = write ? 4U : 2U;
+    completeCall(1U);
+    return true;
+  }
+  if (vector == b0_vector && call == 0x58U) {
+    completeCall(state_.memory_card_channel);
+    return true;
+  }
+  if (vector == b0_vector && (call == 0x5cU || call == 0x5dU)) {
+    const auto slot = cpu.gpr[4U];
+    completeCall(slot < memory_card_slot_count
+                     ? memoryCardStatus(static_cast<std::uint8_t>(slot))
+                     : 0x11U);
+    return true;
+  }
   if (vector == b0_vector && call == 0x56U) {
+    if (!ensureCardKernelTables()) {
+      return false;
+    }
     completeCall(c0_table);
     return true;
   }
   if (vector == b0_vector && call == 0x57U) {
+    if (!ensureCardKernelTables()) {
+      return false;
+    }
     completeCall(b0_table);
     return true;
   }

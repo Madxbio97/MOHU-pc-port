@@ -1,8 +1,8 @@
 1 ICON DISCARDABLE "@MOHU_LAUNCHER_ICON_PATH@"
 
 1 VERSIONINFO
- FILEVERSION 0,1,0,28
- PRODUCTVERSION 0,1,0,28
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -15,11 +15,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Medal of Honor Underground PC community project\0"
       VALUE "FileDescription", "Medal of Honor: Underground PC Launcher\0"
-      VALUE "FileVersion", "0.1.0 foundation\0"
+      VALUE "FileVersion", "0.1.0\0"
       VALUE "InternalName", "medal_of_honor_underground\0"
       VALUE "OriginalFilename", "medal_of_honor_underground.exe\0"
       VALUE "ProductName", "Medal of Honor: Underground PC\0"
-      VALUE "ProductVersion", "0.1.0 foundation\0"
+      VALUE "ProductVersion", "0.1.0\0"
     END
   END
   BLOCK "VarFileInfo"

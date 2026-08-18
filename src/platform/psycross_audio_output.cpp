@@ -62,11 +62,7 @@ void requireAl(const char *operation) {
 bool psyCrossAudioDiagnosticsEnabled() noexcept {
   static const auto enabled = [] {
     const auto *value = SDL_getenv("SF_AUDIO_DIAGNOSTICS");
-    // Keep the one-second clock/SPU/sink trace enabled in public builds.  The
-    // log is bounded by presentation time rather than callback count and is
-    // the only reliable way to distinguish guest under-production, host
-    // scheduling stalls and device underruns after a long play session.
-    return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
   }();
   return enabled;
 }
@@ -129,8 +125,12 @@ PsyCrossAudioOutput::PsyCrossAudioOutput(std::size_t minimum_start_buffers,
   buffers_.reserve(maximum_queued_buffers);
   available_.reserve(maximum_queued_buffers);
   staged_frames_.reserve(maximum_staged_frames);
-  tempo_scratch_.reserve(maximum_staged_frames);
   upload_scratch_.reserve(frames_per_buffer);
+
+  if (stream_kind_ == PsyCrossAudioStreamKind::continuous &&
+      openRealtimeDevice()) {
+    return;
+  }
 
   alGetError();
   alGenSources(1, &source_);
@@ -225,6 +225,12 @@ PsyCrossAudioOutput::PsyCrossAudioOutput(std::size_t minimum_start_buffers,
 }
 
 PsyCrossAudioOutput::~PsyCrossAudioOutput() {
+  if (realtime_device_ != 0U) {
+    reset("destroy");
+    SDL_CloseAudioDevice(realtime_device_);
+    realtime_device_ = 0U;
+    return;
+  }
   if (source_ == 0U) {
     return;
   }
@@ -252,20 +258,13 @@ void PsyCrossAudioOutput::queue(std::span<const psx::SpuPcmFrame> frames) {
   }
 
   input_frames_ += frames.size();
-  auto queued_frames = frames;
-  if (stream_kind_ == PsyCrossAudioStreamKind::continuous &&
-      tempo_control_enabled_) {
-    tempo_scratch_.clear();
-    tempo_stretcher_.process(frames, playback_rate_, tempo_scratch_);
-    queued_frames = tempo_scratch_;
-  }
-  if (queued_frames.empty()) {
-    if (buffer_callback_ != nullptr) {
-      fillCallbackRing();
-      startIfNeeded();
-    }
+  if (realtime_device_ != 0U) {
+    queueRealtime(frames);
+    applyGainStep();
+    startIfNeeded();
     return;
   }
+  const auto queued_frames = frames;
 
   compactStaging();
   const auto staged_count = staged_frames_.size() - staged_offset_;
@@ -303,6 +302,12 @@ void PsyCrossAudioOutput::queue(std::span<const psx::SpuPcmFrame> frames) {
 }
 
 void PsyCrossAudioOutput::flush() {
+  if (realtime_device_ != 0U) {
+    fillCallbackRing();
+    applyGainStep();
+    startIfNeeded();
+    return;
+  }
   if (buffer_callback_ != nullptr) {
     fillCallbackRing();
     applyGainStep();
@@ -313,6 +318,139 @@ void PsyCrossAudioOutput::flush() {
   uploadReadyBuffers(true);
   applyGainStep();
   startIfNeeded();
+}
+
+bool PsyCrossAudioOutput::openRealtimeDevice() noexcept {
+  if ((SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO) == 0U &&
+      SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+    PsyX_Log_Warning("[AudioDiag][open] role=%s sink=sdl failed=\"%s\"; "
+                     "falling back to OpenAL\n",
+                     diagnostic_name_.c_str(), SDL_GetError());
+    return false;
+  }
+
+  SDL_AudioSpec requested{};
+  requested.freq = static_cast<int>(psx::Spu::sample_rate);
+  requested.format = AUDIO_S16SYS;
+  requested.channels = 2U;
+  requested.samples = static_cast<Uint16>(frames_per_buffer);
+  requested.callback = &PsyCrossAudioOutput::realtimeCallback;
+  requested.userdata = this;
+
+  SDL_AudioSpec obtained{};
+  const auto device = SDL_OpenAudioDevice(nullptr, 0, &requested, &obtained, 0);
+  if (device == 0U) {
+    PsyX_Log_Warning("[AudioDiag][open] role=%s sink=sdl failed=\"%s\"; "
+                     "falling back to OpenAL\n",
+                     diagnostic_name_.c_str(), SDL_GetError());
+    return false;
+  }
+  if (obtained.freq != requested.freq || obtained.format != requested.format ||
+      obtained.channels != requested.channels || obtained.samples == 0U) {
+    PsyX_Log_Warning(
+        "[AudioDiag][open] role=%s sink=sdl incompatible=%d/%u/%u/%u; "
+        "falling back to OpenAL\n",
+        diagnostic_name_.c_str(), obtained.freq,
+        static_cast<unsigned int>(obtained.format),
+        static_cast<unsigned int>(obtained.channels),
+        static_cast<unsigned int>(obtained.samples));
+    SDL_CloseAudioDevice(device);
+    return false;
+  }
+
+  realtime_device_ = device;
+  realtime_spec_ = obtained;
+  minimum_start_frames_ = std::max<std::size_t>(
+      minimum_start_frames_, static_cast<std::size_t>(obtained.samples) * 2U);
+  callback_request_frames_.store(obtained.samples, std::memory_order_relaxed);
+  const auto *driver = SDL_GetCurrentAudioDriver();
+  PsyX_Log_Info(
+      "[AudioDiag][open] role=%s device=\"%s\" sample_hz=%d channels=%u "
+      "callback_frames=%u start_frames=%zu ring_frames=%zu sink=sdl-pull\n",
+      diagnostic_name_.c_str(), driver != nullptr ? driver : "unknown",
+      obtained.freq, static_cast<unsigned int>(obtained.channels),
+      static_cast<unsigned int>(obtained.samples), minimum_start_frames_,
+      stream_frames_.capacity());
+  return true;
+}
+
+void PsyCrossAudioOutput::queueRealtime(
+    std::span<const psx::SpuPcmFrame> frames) noexcept {
+  // Publish older backlog first. Preallocated staging absorbs short guest
+  // catch-up bursts without replacing PCM already ordered in the SDL ring.
+  fillCallbackRing();
+  const auto pending = staged_frames_.size() - staged_offset_;
+  const auto writable = maximum_staged_frames -
+                        std::min(staged_frames_.size(), maximum_staged_frames);
+  const auto accepted = std::min(frames.size(), writable);
+  if (accepted != 0U) {
+    staged_frames_.insert(staged_frames_.end(), frames.begin(),
+                          frames.begin() +
+                              static_cast<std::ptrdiff_t>(accepted));
+    submitted_frames_ += accepted;
+  }
+  if (accepted != frames.size()) {
+    const auto dropped = frames.size() - accepted;
+    stale_frames_dropped_ += dropped;
+    PsyX_Log_Warning("[AudioDiag][overflow] role=%s staged=%zu incoming=%zu "
+                     "capacity=%zu dropped_newest=%zu; FIFO retained\n",
+                     diagnostic_name_.c_str(), pending, frames.size(),
+                     maximum_staged_frames, dropped);
+  }
+  fillCallbackRing();
+}
+
+void SDLCALL PsyCrossAudioOutput::realtimeCallback(void *user, Uint8 *stream,
+                                                   int byte_count) noexcept {
+  if (user == nullptr) {
+    if (stream != nullptr && byte_count > 0) {
+      std::memset(stream, 0, static_cast<std::size_t>(byte_count));
+    }
+    return;
+  }
+  static_cast<PsyCrossAudioOutput *>(user)->fillRealtime(stream, byte_count);
+}
+
+void PsyCrossAudioOutput::fillRealtime(Uint8 *stream, int byte_count) noexcept {
+  if (stream == nullptr || byte_count <= 0) {
+    return;
+  }
+  std::memset(stream, 0, static_cast<std::size_t>(byte_count));
+  const auto requested =
+      static_cast<std::size_t>(byte_count) / sizeof(psx::SpuPcmFrame);
+  auto destination = std::span<psx::SpuPcmFrame>{
+      reinterpret_cast<psx::SpuPcmFrame *>(stream), requested};
+  const auto supplied = stream_frames_.pop(destination);
+  callback_frames_read_.fetch_add(supplied, std::memory_order_relaxed);
+  if (supplied < requested) {
+    callback_silence_frames_.fetch_add(requested - supplied,
+                                       std::memory_order_relaxed);
+    if (!callback_starved_.exchange(true, std::memory_order_relaxed)) {
+      callback_underruns_.fetch_add(1U, std::memory_order_relaxed);
+    }
+  } else {
+    callback_starved_.store(false, std::memory_order_relaxed);
+  }
+
+  auto fade_remaining =
+      fade_in_frames_remaining_.load(std::memory_order_relaxed);
+  const auto gain = software_gain_q16_.load(std::memory_order_relaxed);
+  for (std::size_t index{}; index < supplied; ++index) {
+    auto scale = gain;
+    if (fade_remaining != 0U) {
+      const auto completed = restart_fade_frames - fade_remaining + 1U;
+      scale = static_cast<std::uint32_t>(static_cast<std::uint64_t>(scale) *
+                                         completed / restart_fade_frames);
+      --fade_remaining;
+    }
+    destination[index].left = static_cast<std::int16_t>(
+        static_cast<std::int64_t>(destination[index].left) * scale /
+        (1U << 16U));
+    destination[index].right = static_cast<std::int16_t>(
+        static_cast<std::int64_t>(destination[index].right) * scale /
+        (1U << 16U));
+  }
+  fade_in_frames_remaining_.store(fade_remaining, std::memory_order_relaxed);
 }
 
 void PsyCrossAudioOutput::fillCallbackRing() {
@@ -397,6 +535,12 @@ void PsyCrossAudioOutput::uploadBuffer(
 }
 
 void PsyCrossAudioOutput::update() {
+  if (realtime_device_ != 0U) {
+    fillCallbackRing();
+    applyGainStep();
+    startIfNeeded();
+    return;
+  }
   if (buffer_callback_ != nullptr) {
     fillCallbackRing();
     applyGainStep();
@@ -482,17 +626,36 @@ void PsyCrossAudioOutput::setGainPercent(std::uint8_t percent) {
   applyGainStep();
 }
 
-void PsyCrossAudioOutput::setPlaybackRate(double rate) {
-  if (stream_kind_ != PsyCrossAudioStreamKind::continuous ||
-      !std::isfinite(rate)) {
-    return;
-  }
-  tempo_control_enabled_ = true;
-  playback_rate_ = std::clamp(rate, 0.5, 1.0);
-}
-
 void PsyCrossAudioOutput::logDiagnostics(
     std::string_view context) const noexcept {
+  if (realtime_device_ != 0U) {
+    const auto status = SDL_GetAudioDeviceStatus(realtime_device_);
+    PsyX_Log_Info(
+        "[AudioDiag][host] role=%s context=%.*s sink=sdl-pull status=%d "
+        "ring=%zu/%zu staged=%zu callback_frames=%u start_frames=%zu gain=%u "
+        "input=%llu submitted=%llu read=%llu silence=%llu underruns=%llu "
+        "stale_dropped=%llu resets=%llu\n",
+        diagnostic_name_.c_str(), static_cast<int>(context.size()),
+        context.data(), static_cast<int>(status), stream_frames_.size(),
+        stream_frames_.capacity(),
+        staged_frames_.size() >= staged_offset_
+            ? staged_frames_.size() - staged_offset_
+            : 0U,
+        static_cast<unsigned int>(realtime_spec_.samples),
+        minimum_start_frames_,
+        static_cast<unsigned int>(gain_policy_.currentPercent()),
+        static_cast<unsigned long long>(input_frames_),
+        static_cast<unsigned long long>(submitted_frames_),
+        static_cast<unsigned long long>(
+            callback_frames_read_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            callback_silence_frames_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            callback_underruns_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(stale_frames_dropped_),
+        static_cast<unsigned long long>(source_resets_));
+    return;
+  }
   ALint state{AL_STOPPED};
   ALint queued{};
   ALint processed{};
@@ -520,7 +683,7 @@ void PsyCrossAudioOutput::logDiagnostics(
       "sink=%s state=%s(%d) queued=%d processed=%d sample_offset=%d "
       "sec_offset=%.6f staged_frames=%zu buffers=%zu free=%zu "
       "prebuffer=%u gain=%.3f target_gain=%u pitch=%.3f submitted=%llu "
-      "tempo=%.3f input=%llu uploaded=%llu producer_staged=%zu "
+      "input=%llu uploaded=%llu producer_staged=%zu "
       "recycled=%llu starts=%llu underruns=%llu "
       "resets=%llu callback_read=%llu callback_silence=%llu "
       "callback_starvations=%llu\n",
@@ -534,7 +697,7 @@ void PsyCrossAudioOutput::logDiagnostics(
       static_cast<double>(gain),
       static_cast<unsigned int>(gain_policy_.targetPercent()),
       static_cast<double>(pitch),
-      static_cast<unsigned long long>(submitted_frames_), playback_rate_,
+      static_cast<unsigned long long>(submitted_frames_),
       static_cast<unsigned long long>(input_frames_),
       static_cast<unsigned long long>(uploaded_frames_), producer_staged,
       static_cast<unsigned long long>(recycled_buffers_),
@@ -550,13 +713,27 @@ void PsyCrossAudioOutput::logDiagnostics(
 }
 
 void PsyCrossAudioOutput::reset(std::string_view reason) noexcept {
-  if (source_ == 0U) {
+  if (source_ == 0U && realtime_device_ == 0U) {
     return;
   }
   ++source_resets_;
   PsyX_Log_Info("[AudioDiag][reset] role=%s reason=%.*s sequence=%llu\n",
                 diagnostic_name_.c_str(), static_cast<int>(reason.size()),
                 reason.data(), static_cast<unsigned long long>(source_resets_));
+  if (realtime_device_ != 0U) {
+    SDL_PauseAudioDevice(realtime_device_, 1);
+    SDL_LockAudioDevice(realtime_device_);
+    stream_frames_.clear();
+    SDL_UnlockAudioDevice(realtime_device_);
+    staged_frames_.clear();
+    staged_offset_ = 0U;
+    realtime_started_.store(false, std::memory_order_relaxed);
+    fade_in_frames_remaining_.store(restart_fade_frames,
+                                    std::memory_order_relaxed);
+    callback_starved_.store(false, std::memory_order_relaxed);
+    start_policy_.reset();
+    return;
+  }
   // Silence the device before detaching a live queue. Mission/checkpoint
   // restore is a real stream discontinuity; stopping a non-zero OpenAL sample
   // at full source gain is emitted as a loud click by several backends.
@@ -570,7 +747,6 @@ void PsyCrossAudioOutput::reset(std::string_view reason) noexcept {
     stream_frames_.clear();
     staged_frames_.clear();
     staged_offset_ = 0U;
-    tempo_stretcher_.reset();
     fade_in_frames_remaining_.store(restart_fade_frames,
                                     std::memory_order_relaxed);
     callback_starved_.store(false, std::memory_order_relaxed);
@@ -592,7 +768,6 @@ void PsyCrossAudioOutput::reset(std::string_view reason) noexcept {
   }
   staged_frames_.clear();
   staged_offset_ = 0U;
-  tempo_stretcher_.reset();
   fade_in_frames_remaining_.store(restart_fade_frames,
                                   std::memory_order_relaxed);
   underrun_latched_ = false;
@@ -650,6 +825,14 @@ void PsyCrossAudioOutput::recycleProcessedBuffers(ALint processed) {
 }
 
 void PsyCrossAudioOutput::applyGainStep() {
+  if (realtime_device_ != 0U) {
+    static_cast<void>(gain_policy_.advance(
+        realtime_started_.load(std::memory_order_relaxed)));
+    software_gain_q16_.store(
+        static_cast<std::uint32_t>(gain_policy_.gain() * (1U << 16U)),
+        std::memory_order_relaxed);
+    return;
+  }
   ALint state{AL_STOPPED};
   alGetSourcei(source_, AL_SOURCE_STATE, &state);
   requireAl("Cannot query gameplay audio gain state");
@@ -659,6 +842,15 @@ void PsyCrossAudioOutput::applyGainStep() {
 }
 
 void PsyCrossAudioOutput::startIfNeeded() {
+  if (realtime_device_ != 0U) {
+    if (!realtime_started_.load(std::memory_order_relaxed) &&
+        stream_frames_.size() >= minimum_start_frames_) {
+      realtime_started_.store(true, std::memory_order_relaxed);
+      ++source_starts_;
+      SDL_PauseAudioDevice(realtime_device_, 0);
+    }
+    return;
+  }
   ALint queued{};
   ALint processed{};
   ALint state{AL_STOPPED};

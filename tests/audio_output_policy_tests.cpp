@@ -321,6 +321,16 @@ void testRuntimeGuestCadenceIsPresentationIndependent() {
           "A fractional 70 ms overrun reset or discarded current audio "
           "without a complete overdue guest frame");
 
+  sf::platform::RuntimeGuestCadencePolicy transient_stall;
+  require(transient_stall.advance(0.0) == 1U &&
+              transient_stall.advance(0.1) == 4U &&
+              transient_stall.advance(0.0) == 2U &&
+              !transient_stall.lateRecoveryStartedForLastAdvance() &&
+              !transient_stall.suppressAudioForLastAdvance() &&
+              transient_stall.lateRecoveryCount() == 0U &&
+              transient_stall.backlogSeconds() < 1.0e-9,
+          "A recoverable host stall discarded ordered gameplay audio");
+
   sf::platform::RuntimeGuestCadencePolicy low_latency{60.0, 1U, 1U};
   require(low_latency.advance(0.0) == 1U &&
               low_latency.advance(1.0 / 15.0) == 1U &&
@@ -452,6 +462,25 @@ void testRuntimePresentationIsGuestIndependent() {
       "Presentation FPS changed the 60 Hz guest batching policy");
 }
 
+void testRuntimeAtomicFrameSequence() {
+  sf::platform::RuntimeAtomicFrameTracker frames;
+  const auto initial = frames.observe(1U, 4U);
+  const auto commands_only = frames.observe(2U, 4U);
+  const auto published = frames.observe(3U, 5U);
+  const auto stale = frames.observe(3U, 6U);
+  const auto recovered = frames.observe(4U, 5U);
+  require(initial.valid && initial.publication && commands_only.valid &&
+              !commands_only.publication && published.valid &&
+              published.publication && !stale.valid && !stale.publication &&
+              recovered.valid && !recovered.publication,
+          "Atomic runtime frame sequencing accepted a stale or split frame");
+
+  frames.reset();
+  const auto reset = frames.observe(1U, 5U);
+  require(reset.valid && reset.publication,
+          "Atomic runtime frame reset did not republish scanout state");
+}
+
 void testRuntimePresentationInterpolationClock() {
   const auto verify_cadence = [](std::uint32_t presentation_fps,
                                  std::span<const double> expected) {
@@ -496,6 +525,22 @@ void testRuntimePresentationInterpolationClock() {
   sf::platform::RuntimePresentationInterpolationClock invalid{0.0};
   require(!invalid.valid() && invalid.advance(1.0 / 60.0) == 1.0,
           "Invalid authored cadence produced a partial presentation frame");
+
+  sf::platform::RuntimePresentationInterpolationClock adaptive;
+  adaptive.publishAuthoredFrame();
+  require(std::abs(adaptive.advance(1.0 / 60.0) - 0.5) < 1.0e-9,
+          "Initial 30 Hz interpolation phase changed");
+  adaptive.publishAuthoredFrame();
+  require(std::abs(adaptive.authoredFrameSeconds() - 1.0 / 60.0) < 1.0e-9 &&
+              std::abs(adaptive.advance(1.0 / 120.0) - 0.5) < 1.0e-9,
+          "Interpolation clock did not adapt to a 60 Hz authored stream");
+  static_cast<void>(adaptive.advance(1.0 / 120.0));
+  adaptive.publishAuthoredFrame();
+  static_cast<void>(adaptive.advance(1.0 / 30.0));
+  adaptive.publishAuthoredFrame();
+  require(adaptive.authoredFrameSeconds() > 1.0 / 60.0 &&
+              adaptive.authoredFrameSeconds() < 1.0 / 30.0,
+          "Interpolation clock did not smooth a variable authored cadence");
 }
 
 void testRuntimeAudioPlaybackRateTracksGuestClock() {
@@ -792,6 +837,7 @@ int main() {
     testRetailVolumeMapping();
     testRuntimeGuestCadenceIsPresentationIndependent();
     testRuntimePresentationIsGuestIndependent();
+    testRuntimeAtomicFrameSequence();
     testRuntimePresentationInterpolationClock();
     testRuntimeAudioPlaybackRateTracksGuestClock();
     testTempoStretchPreservesPitchAndDuration();

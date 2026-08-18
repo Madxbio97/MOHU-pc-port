@@ -1,14 +1,15 @@
 #include "sf/platform/host.hpp"
 
+#include "mohu/display_presentation.hpp"
 #include "psycross_audio_output.hpp"
 #include "psycross_guest_gpu.hpp"
 #include "psycross_mission_start.hpp"
 #include "psycross_movie_player.hpp"
 #include "psycross_runtime_guards.hpp"
 #include "psycross_scene_viewer.hpp"
+#include "psycross_skybox.hpp"
 #include "psycross_video_mode.hpp"
 #include "psycross_window_mode.hpp"
-#include "sf/platform/runtime_presentation_policy.hpp"
 #include "volumetric_atlas_texture.hpp"
 
 #include "sf/core/error.hpp"
@@ -18,6 +19,9 @@
 #include "sf/game/retail_cheats.hpp"
 #include "sf/game/title.hpp"
 #include "sf/platform/audio_output_policy.hpp"
+#include "sf/psx/bios_hle.hpp"
+#include "sf/psx/r3000_runtime.hpp"
+#include "sf/psx/spu.hpp"
 
 #include <PsyX/PsyX_globals.h>
 #include <PsyX/PsyX_public.h>
@@ -30,7 +34,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -103,6 +109,23 @@ void configureControllerProtocol(ControllerProtocol protocol) noexcept {
   set(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, true);
 }
 
+void configureControllerDevices(const GraphicsSettings &settings) noexcept {
+  constexpr std::array default_devices{0, 1};
+  constexpr auto disabled_psycross_slot = -2;
+  const auto &devices =
+      areControllerDeviceRoutesValid(settings.controller_device_indices)
+          ? settings.controller_device_indices
+          : default_devices;
+  for (std::size_t slot{}; slot < devices.size(); ++slot) {
+    const auto device = devices[slot];
+    g_cfg_controllerToSlotMapping[slot] =
+        isValidControllerDeviceIndex(device) &&
+                device != disabled_controller_device
+            ? device
+            : disabled_psycross_slot;
+  }
+}
+
 void configurePresentation(const GraphicsSettings &settings) noexcept {
   // SDL's high-resolution timer and GL context both exist only after
   // PsyX_Initialise. Apply the two independent presentation controls here:
@@ -146,37 +169,667 @@ void configureInput() {
 
 std::uint16_t readHostButtons(const PADRAW &pad) noexcept;
 struct RuntimePadSample {
-  RuntimePadInput pad;
+  RuntimePadInputs pads;
   std::int32_t mouse_delta_x{};
   std::int32_t mouse_delta_y{};
   bool mouse_look_active{};
-  double movement_camera_yaw{};
 };
 
 RuntimePadSample sampleRuntimePadInput(
     const KeyboardMouseBindings &bindings,
+    const ControllerButtonBindings &controller_bindings,
+    const ControllerButtonBindings &controller_bindings_player_2,
     const MohUndergroundRuntimeActionBindings &runtime_actions,
-    detail::RelativeMouseCapture &mouse_capture) noexcept;
+    detail::RelativeMouseCapture &mouse_capture, bool menu_active) noexcept;
+
+enum class RuntimePerfPresentation {
+  interpolated,
+  cached,
+  full,
+};
+
+struct RuntimeGeometryTraceCounters {
+  std::uint64_t polygons{};
+  std::uint64_t precise{};
+  std::uint64_t exact{};
+  std::uint64_t integer{};
+  std::uint64_t missing{};
+  std::uint64_t nonfinite{};
+  std::uint64_t packet_mismatch{};
+  std::uint64_t hazard{};
+  std::uint64_t depth_saturation{};
+  std::uint64_t divide_overflow{};
+  std::uint64_t screen{};
+  std::uint64_t camera{};
+  std::uint64_t near_plane{};
+  std::uint64_t identity_recovered{};
+  std::uint64_t catalog_recovered{};
+  std::uint64_t plane_recovered{};
+  std::uint64_t high_resolution_presents{};
+  std::uint64_t fallback_presents{};
+  std::uint64_t replay_captured{};
+  std::uint64_t replay_promoted{};
+  std::uint64_t replay_skipped_vram{};
+  std::uint64_t replay_interpolated{};
+  std::uint64_t replay_rejected{};
+};
+
+[[nodiscard]] RuntimeGeometryTraceCounters
+captureGeometryTraceCounters(const detail::PsyCrossGuestGpu &gpu) noexcept {
+  return {
+      .polygons = gpu.polygonPrimitives(),
+      .precise = gpu.precisePrimitives(),
+      .exact = gpu.exactPrecisePrimitives(),
+      .integer = gpu.integerPrecisePrimitives(),
+      .missing = gpu.missingProjectionPrimitives(),
+      .nonfinite = gpu.nonfiniteProjectionPrimitives(),
+      .packet_mismatch = gpu.packetMismatchPrimitives(),
+      .hazard = gpu.projectionHazardPrimitives(),
+      .depth_saturation = gpu.depthSaturationPrimitives(),
+      .divide_overflow = gpu.divideOverflowPrimitives(),
+      .screen =
+          gpu.screenSaturationPrimitives() + gpu.screenMismatchPrimitives(),
+      .camera = gpu.cameraMismatchPrimitives(),
+      .near_plane = gpu.nearPlanePrimitives(),
+      .identity_recovered = gpu.identityRecoveredPrimitives(),
+      .catalog_recovered = gpu.projectionCatalogPrimitives(),
+      .plane_recovered = gpu.planeRecoveredPrimitives(),
+      .high_resolution_presents = gpu.highResolutionPresents(),
+      .fallback_presents = gpu.fallbackPresents(),
+      .replay_captured = gpu.capturedPresentationReplayEvents(),
+      .replay_promoted = gpu.promotedPresentationReplayFrames(),
+      .replay_skipped_vram = gpu.skippedPresentationReplayVramCommands(),
+      .replay_interpolated = gpu.interpolatedPresentationReplayFrames(),
+      .replay_rejected = gpu.rejectedPresentationReplayFrames(),
+  };
+}
+
+class RuntimeGeometryTrace final {
+public:
+  void notePresentation(RuntimePerfPresentation presentation,
+                        float interpolation_alpha = 0.0F) noexcept {
+    if (!enabled()) {
+      return;
+    }
+    const auto code = static_cast<std::uint64_t>(presentation) + 1U;
+    presentation_pattern_ = (presentation_pattern_ << 2U) | code;
+    presentation_pattern_samples_ =
+        std::min<std::uint32_t>(presentation_pattern_samples_ + 1U, 32U);
+    switch (presentation) {
+    case RuntimePerfPresentation::interpolated:
+      ++interpolated_presentations_;
+      if (interpolated_presentations_ == 1U) {
+        minimum_interpolation_alpha_ = interpolation_alpha;
+        maximum_interpolation_alpha_ = interpolation_alpha;
+      } else {
+        minimum_interpolation_alpha_ =
+            std::min(minimum_interpolation_alpha_, interpolation_alpha);
+        maximum_interpolation_alpha_ =
+            std::max(maximum_interpolation_alpha_, interpolation_alpha);
+      }
+      last_interpolation_alpha_ = interpolation_alpha;
+      break;
+    case RuntimePerfPresentation::cached:
+      ++cached_presentations_;
+      break;
+    case RuntimePerfPresentation::full:
+      ++full_presentations_;
+      break;
+    }
+  }
+
+  void logFrame(const RuntimeGpuFrame &frame,
+                const mohu::GuestDisplayGeometry &stable,
+                const RuntimeGpuDisplayPublication &active,
+                const detail::PsyCrossGuestGpu &gpu,
+                const RuntimeGeometryTraceCounters &before,
+                double authored_frame_seconds, std::size_t pending_batches,
+                std::size_t pending_words) noexcept {
+    if (!enabled()) {
+      return;
+    }
+
+    const auto now = SDL_GetPerformanceCounter();
+    if (!initialized_) {
+      initialized_ = true;
+      frequency_ = SDL_GetPerformanceFrequency();
+      origin_ = now;
+      PsyX_Log_Info("[GeometryTrace][start] clock_hz=%llu "
+                    "disable_with=MOHU_GEOMETRY_TRACE=0\n",
+                    static_cast<unsigned long long>(frequency_));
+    }
+    const auto elapsed_ms = frequency_ != 0U
+                                ? static_cast<double>(now - origin_) * 1'000.0 /
+                                      static_cast<double>(frequency_)
+                                : 0.0;
+
+    std::size_t valid_catalog{};
+    std::size_t eligible_catalog{};
+    std::size_t exact_catalog{};
+    std::size_t fractional_catalog{};
+    std::size_t macro_fractional_catalog{};
+    std::size_t unclamped_catalog{};
+    std::size_t depth_le_32{};
+    std::size_t depth_le_64{};
+    std::size_t depth_le_128{};
+    auto minimum_positive_depth = std::numeric_limits<float>::max();
+    for (const auto &projection : frame.projection_catalog) {
+      if (!projection.valid || !std::isfinite(projection.view_z)) {
+        continue;
+      }
+      ++valid_catalog;
+      eligible_catalog += projection.pgxpEligible() ? 1U : 0U;
+      exact_catalog += projection.exact_transform ? 1U : 0U;
+      fractional_catalog += projection.fractional_transform ? 1U : 0U;
+      constexpr auto enhanced_transform_sources =
+          psx::GteProjectedVertex::enhanced_rotation |
+          psx::GteProjectedVertex::enhanced_translation |
+          psx::GteProjectedVertex::enhanced_vector;
+      macro_fractional_catalog +=
+          projection.exact_transform && projection.fractional_transform &&
+                  (projection.enhanced_sources & enhanced_transform_sources) ==
+                      0U
+              ? 1U
+              : 0U;
+      unclamped_catalog += projection.hasUnclampedView() ? 1U : 0U;
+      if (projection.view_z <= 0.0F) {
+        continue;
+      }
+      minimum_positive_depth =
+          std::min(minimum_positive_depth, projection.view_z);
+      depth_le_32 += projection.view_z <= 32.0F ? 1U : 0U;
+      depth_le_64 += projection.view_z <= 64.0F ? 1U : 0U;
+      depth_le_128 += projection.view_z <= 128.0F ? 1U : 0U;
+    }
+    if (minimum_positive_depth == std::numeric_limits<float>::max()) {
+      minimum_positive_depth = 0.0F;
+    }
+
+    const auto after = captureGeometryTraceCounters(gpu);
+    const auto delta = [](std::uint64_t current,
+                          std::uint64_t previous) noexcept {
+      return current >= previous ? current - previous : 0U;
+    };
+    const auto primitive_fallback =
+        delta(after.polygons, before.polygons) >=
+                delta(after.precise, before.precise)
+            ? delta(after.polygons, before.polygons) -
+                  delta(after.precise, before.precise)
+            : 0U;
+
+    const auto &replay = gpu.currentPresentationReplayFrame();
+    auto replay_events = std::size_t{};
+    for (const auto &page : replay.pages) {
+      replay_events += page.events.size();
+    }
+    const auto *first_page = replay.pages.empty() ? nullptr : &replay.pages[0];
+    const auto *first_write =
+        replay.vram_writes.empty() ? nullptr : &replay.vram_writes[0];
+    auto last_clear_sequence = std::uint64_t{};
+    for (const auto &page : replay.pages) {
+      for (const auto &event : page.events) {
+        if (event.kind == detail::PresentationReplayEventKind::clear) {
+          last_clear_sequence = std::max(last_clear_sequence, event.sequence);
+        }
+      }
+    }
+    const auto empty_target = detail::PresentationReplayDrawTarget{};
+    const auto &page_target =
+        first_page != nullptr ? first_page->target : empty_target;
+    const auto &write_target =
+        first_write != nullptr ? first_write->target : empty_target;
+    const auto &write_source =
+        first_write != nullptr ? first_write->source : empty_target;
+
+    PsyX_Log_Info(
+        "[GeometryTrace][frame] t_ms=%.3f seq=%llu pub=%llu epoch=%llu "
+        "words=%zu pubs=%zu content=%u level=%u aspect=%d "
+        "display_raw=%u,%u,%ux%u,%u,%u,%u "
+        "display_stable=%ux%u,%u,%u active=%u,%u,%ux%u,%u,%u,%u "
+        "path_prev(i/c/f/pattern/samples)=%llu/%llu/%llu/0x%016llx/%u "
+        "alpha(min/max/last)=%.3f/%.3f/%.3f authored_ms=%.3f "
+        "atomic(pending_batches/pending_words)=%zu/%zu "
+        "pgxp(poly/precise/exact/integer/fallback/missing)="
+        "%llu/%llu/%llu/%llu/%llu/%llu "
+        "reject(nonfinite/packet/hazard/depth/divide/screen/camera/near)="
+        "%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
+        "recover(identity/catalog/plane)=%llu/%llu/%llu "
+        "catalog(total/valid/eligible/exact/fractional/macro_q12/unclamped/"
+        "min_z/z32/z64/z128)="
+        "%zu/%zu/%zu/%zu/%zu/%zu/%zu/%.3f/%zu/%zu/%zu "
+        "scanout(high/fallback)=%llu/%llu "
+        "replay(delta_capture/promote/skip/interpolate/reject)="
+        "%llu/%llu/%llu/%llu/%llu "
+        "replay_state(ready/reason/gen/pages/events/clears/writes/unknown/"
+        "vram)=%u/%u/%llu/%zu/%zu/%zu/%zu/%zu/%u "
+        "match(valid/proven/prev/current/raw/relative/total)="
+        "%u/%u/%zu/%zu/%zu/%zu/%zu "
+        "relative(prev/current/common/candidate/static/topology)="
+        "%zu/%zu/%zu/%zu/%zu/%zu "
+        "replay_page0=%u,%u,%ux%u "
+        "vram_first(op/source/target/clear_seq/write_seq)="
+        "0x%02x/%u,%u/%u,%u,%ux%u/%llu/%llu\n",
+        elapsed_ms, static_cast<unsigned long long>(frame.sequence),
+        static_cast<unsigned long long>(frame.display_publication_sequence),
+        static_cast<unsigned long long>(frame.command_buffer_epoch),
+        frame.words.size(), frame.display_publications.size(),
+        static_cast<unsigned int>(frame.content),
+        static_cast<unsigned int>(frame.campaign_level), g_cfg_aspectMode,
+        static_cast<unsigned int>(frame.display_x),
+        static_cast<unsigned int>(frame.display_y),
+        static_cast<unsigned int>(frame.display_width),
+        static_cast<unsigned int>(frame.display_height),
+        frame.display_enabled ? 1U : 0U, frame.display_rgb24 ? 1U : 0U,
+        frame.display_interlaced ? 1U : 0U,
+        static_cast<unsigned int>(stable.width),
+        static_cast<unsigned int>(stable.height), stable.rgb24 ? 1U : 0U,
+        stable.interlaced ? 1U : 0U,
+        static_cast<unsigned int>(active.display_x),
+        static_cast<unsigned int>(active.display_y),
+        static_cast<unsigned int>(active.display_width),
+        static_cast<unsigned int>(active.display_height),
+        active.display_enabled ? 1U : 0U, active.display_rgb24 ? 1U : 0U,
+        active.display_interlaced ? 1U : 0U,
+        static_cast<unsigned long long>(interpolated_presentations_),
+        static_cast<unsigned long long>(cached_presentations_),
+        static_cast<unsigned long long>(full_presentations_),
+        static_cast<unsigned long long>(presentation_pattern_),
+        presentation_pattern_samples_, minimum_interpolation_alpha_,
+        maximum_interpolation_alpha_, last_interpolation_alpha_,
+        authored_frame_seconds * 1'000.0, pending_batches, pending_words,
+        static_cast<unsigned long long>(delta(after.polygons, before.polygons)),
+        static_cast<unsigned long long>(delta(after.precise, before.precise)),
+        static_cast<unsigned long long>(delta(after.exact, before.exact)),
+        static_cast<unsigned long long>(delta(after.integer, before.integer)),
+        static_cast<unsigned long long>(primitive_fallback),
+        static_cast<unsigned long long>(delta(after.missing, before.missing)),
+        static_cast<unsigned long long>(
+            delta(after.nonfinite, before.nonfinite)),
+        static_cast<unsigned long long>(
+            delta(after.packet_mismatch, before.packet_mismatch)),
+        static_cast<unsigned long long>(delta(after.hazard, before.hazard)),
+        static_cast<unsigned long long>(
+            delta(after.depth_saturation, before.depth_saturation)),
+        static_cast<unsigned long long>(
+            delta(after.divide_overflow, before.divide_overflow)),
+        static_cast<unsigned long long>(delta(after.screen, before.screen)),
+        static_cast<unsigned long long>(delta(after.camera, before.camera)),
+        static_cast<unsigned long long>(
+            delta(after.near_plane, before.near_plane)),
+        static_cast<unsigned long long>(
+            delta(after.identity_recovered, before.identity_recovered)),
+        static_cast<unsigned long long>(
+            delta(after.catalog_recovered, before.catalog_recovered)),
+        static_cast<unsigned long long>(
+            delta(after.plane_recovered, before.plane_recovered)),
+        frame.projection_catalog.size(), valid_catalog, eligible_catalog,
+        exact_catalog, fractional_catalog, macro_fractional_catalog,
+        unclamped_catalog, minimum_positive_depth, depth_le_32, depth_le_64,
+        depth_le_128,
+        static_cast<unsigned long long>(delta(after.high_resolution_presents,
+                                              before.high_resolution_presents)),
+        static_cast<unsigned long long>(
+            delta(after.fallback_presents, before.fallback_presents)),
+        static_cast<unsigned long long>(
+            delta(after.replay_captured, before.replay_captured)),
+        static_cast<unsigned long long>(
+            delta(after.replay_promoted, before.replay_promoted)),
+        static_cast<unsigned long long>(
+            delta(after.replay_skipped_vram, before.replay_skipped_vram)),
+        static_cast<unsigned long long>(
+            delta(after.replay_interpolated, before.replay_interpolated)),
+        static_cast<unsigned long long>(
+            delta(after.replay_rejected, before.replay_rejected)),
+        gpu.presentationReplayReady() ? 1U : 0U,
+        static_cast<unsigned int>(gpu.lastPresentationReplayRejectReason()),
+        static_cast<unsigned long long>(replay.generation), replay.pages.size(),
+        replay_events, replay.deferred_clears.size(), replay.vram_writes.size(),
+        replay.unknown_vram_write_sequences.size(),
+        replay.contains_vram_commands ? 1U : 0U,
+        gpu.lastPresentationReplayMatchInputValid() ? 1U : 0U,
+        gpu.lastPresentationReplayRelativeProvenanceProven() ? 1U : 0U,
+        gpu.lastPresentationReplayPreviousPolygons(),
+        gpu.lastPresentationReplayCurrentPolygons(),
+        gpu.lastPresentationReplayRawMatches(),
+        gpu.lastPresentationReplayRelativeMatches(),
+        gpu.lastPresentationReplayTotalMatches(),
+        gpu.lastPresentationReplayPreviousRelativePolygons(),
+        gpu.lastPresentationReplayCurrentRelativePolygons(),
+        gpu.lastPresentationReplayRelativeCommonKeys(),
+        gpu.lastPresentationReplayRelativeCandidates(),
+        gpu.lastPresentationReplayRelativeStaticRejects(),
+        gpu.lastPresentationReplayRelativeTopologyRejects(),
+        static_cast<unsigned int>(page_target.x),
+        static_cast<unsigned int>(page_target.y),
+        static_cast<unsigned int>(page_target.width),
+        static_cast<unsigned int>(page_target.height),
+        first_write != nullptr ? static_cast<unsigned int>(first_write->opcode)
+                               : 0U,
+        static_cast<unsigned int>(write_source.x),
+        static_cast<unsigned int>(write_source.y),
+        static_cast<unsigned int>(write_target.x),
+        static_cast<unsigned int>(write_target.y),
+        static_cast<unsigned int>(write_target.width),
+        static_cast<unsigned int>(write_target.height),
+        static_cast<unsigned long long>(last_clear_sequence),
+        first_write != nullptr
+            ? static_cast<unsigned long long>(first_write->sequence)
+            : 0ULL);
+
+    interpolated_presentations_ = 0U;
+    cached_presentations_ = 0U;
+    full_presentations_ = 0U;
+    presentation_pattern_ = 0U;
+    presentation_pattern_samples_ = 0U;
+    minimum_interpolation_alpha_ = 0.0F;
+    maximum_interpolation_alpha_ = 0.0F;
+    last_interpolation_alpha_ = 0.0F;
+  }
+
+private:
+  [[nodiscard]] static bool enabled() noexcept {
+    static const auto value = [] {
+      const auto *setting = SDL_getenv("MOHU_GEOMETRY_TRACE");
+      return setting == nullptr || setting[0] == '\0' ||
+             std::strcmp(setting, "0") != 0;
+    }();
+    return value;
+  }
+
+  std::uint64_t frequency_{};
+  std::uint64_t origin_{};
+  std::uint64_t interpolated_presentations_{};
+  std::uint64_t cached_presentations_{};
+  std::uint64_t full_presentations_{};
+  std::uint64_t presentation_pattern_{};
+  std::uint32_t presentation_pattern_samples_{};
+  float minimum_interpolation_alpha_{};
+  float maximum_interpolation_alpha_{};
+  float last_interpolation_alpha_{};
+  bool initialized_{};
+};
+
+class RuntimePerformanceDiagnostics final {
+public:
+  [[nodiscard]] std::uint64_t beginLoop() noexcept {
+    if (!enabled()) {
+      return 0U;
+    }
+    if (frequency_ == 0U) {
+      frequency_ = SDL_GetPerformanceFrequency();
+    }
+    const auto now = SDL_GetPerformanceCounter();
+    if (window_started_ == 0U) {
+      window_started_ = now;
+    }
+    return now;
+  }
+
+  void addInput(std::uint64_t ticks) noexcept { input_ticks_ += ticks; }
+  void addGuest(std::uint64_t ticks) noexcept { guest_ticks_ += ticks; }
+  void addGpu(std::uint64_t ticks) noexcept { gpu_ticks_ += ticks; }
+  void addAudio(std::uint64_t ticks) noexcept { audio_ticks_ += ticks; }
+  void addPresent(std::uint64_t ticks) noexcept { present_ticks_ += ticks; }
+  void addGuestStep() noexcept { ++guest_steps_; }
+  void addGpuSubmission() noexcept { ++gpu_submissions_; }
+
+  void finishLoop(std::uint64_t started, RuntimePerfPresentation presentation,
+                  const RuntimeGuestCadencePolicy &cadence,
+                  const detail::PsyCrossGuestGpu &guest_gpu) noexcept {
+    if (started == 0U) {
+      return;
+    }
+    const auto now = SDL_GetPerformanceCounter();
+    const auto loop_ticks = now - started;
+    loop_ticks_ += loop_ticks;
+    maximum_loop_ticks_ = std::max(maximum_loop_ticks_, loop_ticks);
+    ++loops_;
+    switch (presentation) {
+    case RuntimePerfPresentation::interpolated:
+      ++interpolated_presentations_;
+      break;
+    case RuntimePerfPresentation::cached:
+      ++cached_presentations_;
+      break;
+    case RuntimePerfPresentation::full:
+      ++full_presentations_;
+      break;
+    }
+
+    if (frequency_ == 0U || now - window_started_ < frequency_ * 2U) {
+      return;
+    }
+    const auto accounted_ticks = input_ticks_ + guest_ticks_ + gpu_ticks_ +
+                                 audio_ticks_ + present_ticks_;
+    const auto outside_ticks =
+        loop_ticks_ > accounted_ticks ? loop_ticks_ - accounted_ticks : 0U;
+    const auto window_ticks = now - window_started_;
+    const auto rate = [this, window_ticks](std::uint64_t count) noexcept {
+      return frequency_ != 0U && window_ticks != 0U
+                 ? static_cast<double>(count) * frequency_ / window_ticks
+                 : 0.0;
+    };
+    PsyX_Log_Info(
+        "[PerfDiag][runtime] fps(present/logic/gpu)=%.1f/%.1f/%.1f "
+        "loops=%llu guest_steps=%llu gpu_submits=%llu "
+        "path(interp/cached/full)=%llu/%llu/%llu "
+        "loop_ms(avg/max)=%.3f/%.3f phase_ms/loop(input/guest/gpu/audio/"
+        "present/outside)=%.3f/%.3f/%.3f/%.3f/%.3f/%.3f "
+        "cadence_ms(max/backlog/dropped)=%.3f/%.3f/%.3f resyncs=%llu\n",
+        rate(loops_), rate(guest_steps_), rate(gpu_submissions_),
+        static_cast<unsigned long long>(loops_),
+        static_cast<unsigned long long>(guest_steps_),
+        static_cast<unsigned long long>(gpu_submissions_),
+        static_cast<unsigned long long>(interpolated_presentations_),
+        static_cast<unsigned long long>(cached_presentations_),
+        static_cast<unsigned long long>(full_presentations_),
+        milliseconds(loop_ticks_, loops_),
+        milliseconds(maximum_loop_ticks_, 1U),
+        milliseconds(input_ticks_, loops_), milliseconds(guest_ticks_, loops_),
+        milliseconds(gpu_ticks_, loops_), milliseconds(audio_ticks_, loops_),
+        milliseconds(present_ticks_, loops_),
+        milliseconds(outside_ticks, loops_),
+        cadence.maximumElapsedSeconds() * 1'000.0,
+        cadence.backlogSeconds() * 1'000.0, cadence.droppedSeconds() * 1'000.0,
+        static_cast<unsigned long long>(cadence.lateRecoveryCount()));
+
+    const auto polygons = guest_gpu.polygonPrimitives();
+    const auto precise = guest_gpu.precisePrimitives();
+    const auto fallback = polygons >= precise ? polygons - precise : 0U;
+    const auto coverage =
+        polygons != 0U ? static_cast<double>(precise) * 100.0 / polygons : 0.0;
+    PsyX_Log_Info(
+        "[PerfDiag][pgxp] total polygons=%llu precise=%llu coverage=%.1f%% "
+        "exact=%llu integer=%llu candidates=%llu partial=%llu fallback=%llu\n",
+        static_cast<unsigned long long>(polygons),
+        static_cast<unsigned long long>(precise), coverage,
+        static_cast<unsigned long long>(guest_gpu.exactPrecisePrimitives()),
+        static_cast<unsigned long long>(guest_gpu.integerPrecisePrimitives()),
+        static_cast<unsigned long long>(guest_gpu.preciseCandidates()),
+        static_cast<unsigned long long>(
+            guest_gpu.partialProjectionPrimitives()),
+        static_cast<unsigned long long>(fallback));
+    PsyX_Log_Info(
+        "[PerfDiag][pgxp] reject(missing/nonfinite/packet/hazard/ir/depth/"
+        "divide/screen/reproject/camera/near)="
+        "%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
+        "recover(identity/catalog/plane_v/plane_p/plane_reject/ambiguous)="
+        "%llu/%llu/%llu/%llu/%llu/%llu "
+        "replay(captured/promoted/vram/ready/interpolated/rejected)="
+        "%llu/%llu/%llu/%u/%llu/%llu\n",
+        static_cast<unsigned long long>(
+            guest_gpu.missingProjectionPrimitives()),
+        static_cast<unsigned long long>(
+            guest_gpu.nonfiniteProjectionPrimitives()),
+        static_cast<unsigned long long>(guest_gpu.packetMismatchPrimitives()),
+        static_cast<unsigned long long>(guest_gpu.projectionHazardPrimitives()),
+        static_cast<unsigned long long>(guest_gpu.irSaturationPrimitives()),
+        static_cast<unsigned long long>(guest_gpu.depthSaturationPrimitives()),
+        static_cast<unsigned long long>(guest_gpu.divideOverflowPrimitives()),
+        static_cast<unsigned long long>(guest_gpu.screenSaturationPrimitives() +
+                                        guest_gpu.screenMismatchPrimitives()),
+        static_cast<unsigned long long>(
+            guest_gpu.reprojectionMismatchPrimitives()),
+        static_cast<unsigned long long>(guest_gpu.cameraMismatchPrimitives()),
+        static_cast<unsigned long long>(guest_gpu.nearPlanePrimitives()),
+        static_cast<unsigned long long>(
+            guest_gpu.identityRecoveredPrimitives()),
+        static_cast<unsigned long long>(
+            guest_gpu.projectionCatalogPrimitives()),
+        static_cast<unsigned long long>(guest_gpu.planeRecoveredVertices()),
+        static_cast<unsigned long long>(guest_gpu.planeRecoveredPrimitives()),
+        static_cast<unsigned long long>(
+            guest_gpu.planeRecoveryRejectedPrimitives()),
+        static_cast<unsigned long long>(
+            guest_gpu.projectionCatalogAmbiguities()),
+        static_cast<unsigned long long>(
+            guest_gpu.capturedPresentationReplayEvents()),
+        static_cast<unsigned long long>(
+            guest_gpu.promotedPresentationReplayFrames()),
+        static_cast<unsigned long long>(
+            guest_gpu.skippedPresentationReplayVramCommands()),
+        guest_gpu.presentationReplayReady() ? 1U : 0U,
+        static_cast<unsigned long long>(
+            guest_gpu.interpolatedPresentationReplayFrames()),
+        static_cast<unsigned long long>(
+            guest_gpu.rejectedPresentationReplayFrames()));
+    PsyX_Log_Info(
+        "[PerfDiag][replay] reject_reason(page/target/clear/match/required/"
+        "coverage/replay_page/mapping/backend)=%u\n",
+        static_cast<unsigned int>(
+            guest_gpu.lastPresentationReplayRejectReason()));
+    const auto missing_group = [&guest_gpu](std::uint8_t base) noexcept {
+      return guest_gpu.missingProjectionPrimitives(base) +
+             guest_gpu.missingProjectionPrimitives(base + 1U) +
+             guest_gpu.missingProjectionPrimitives(base + 2U) +
+             guest_gpu.missingProjectionPrimitives(base + 3U);
+    };
+    PsyX_Log_Info("[PerfDiag][pgxp] missing_type(F3/FT3/F4/FT4/G3/GT3/G4/GT4)="
+                  "%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
+                  "missing_vertices(1/2/3/4)=%llu/%llu/%llu/%llu\n",
+                  static_cast<unsigned long long>(missing_group(0x20U)),
+                  static_cast<unsigned long long>(missing_group(0x24U)),
+                  static_cast<unsigned long long>(missing_group(0x28U)),
+                  static_cast<unsigned long long>(missing_group(0x2cU)),
+                  static_cast<unsigned long long>(missing_group(0x30U)),
+                  static_cast<unsigned long long>(missing_group(0x34U)),
+                  static_cast<unsigned long long>(missing_group(0x38U)),
+                  static_cast<unsigned long long>(missing_group(0x3cU)),
+                  static_cast<unsigned long long>(
+                      guest_gpu.missingProjectionVertexBucket(1U)),
+                  static_cast<unsigned long long>(
+                      guest_gpu.missingProjectionVertexBucket(2U)),
+                  static_cast<unsigned long long>(
+                      guest_gpu.missingProjectionVertexBucket(3U)),
+                  static_cast<unsigned long long>(
+                      guest_gpu.missingProjectionVertexBucket(4U)));
+    PsyX_Log_Info(
+        "[PerfDiag][pgxp-dma] unavailable=%llu mixed=%llu overflow=%llu\n",
+        static_cast<unsigned long long>(
+            guest_gpu.missingProjectionDmaUnavailablePrimitives()),
+        static_cast<unsigned long long>(
+            guest_gpu.missingProjectionDmaMixedPrimitives()),
+        static_cast<unsigned long long>(
+            guest_gpu.missingProjectionDmaOverflowPrimitives()));
+    std::array<const detail::MissingProjectionDmaDiagnostic *, 4U>
+        top_missing_sources{};
+    for (const auto &entry : guest_gpu.missingProjectionDmaDiagnostics()) {
+      if (entry.primitives == 0U) {
+        continue;
+      }
+      for (std::size_t rank{}; rank < top_missing_sources.size(); ++rank) {
+        if (top_missing_sources[rank] != nullptr &&
+            top_missing_sources[rank]->primitives >= entry.primitives) {
+          continue;
+        }
+        for (std::size_t shifted = top_missing_sources.size() - 1U;
+             shifted > rank; --shifted) {
+          top_missing_sources[shifted] = top_missing_sources[shifted - 1U];
+        }
+        top_missing_sources[rank] = &entry;
+        break;
+      }
+    }
+    for (std::size_t rank{}; rank < top_missing_sources.size(); ++rank) {
+      const auto *entry = top_missing_sources[rank];
+      if (entry == nullptr) {
+        break;
+      }
+      PsyX_Log_Info(
+          "[PerfDiag][pgxp-dma] top=%u kind=%u opcode=0x%02x "
+          "root=0x%08x words=0x%08x-0x%08x primitives=%llu full=%llu "
+          "missing_vertices=%llu\n",
+          static_cast<unsigned int>(rank + 1U),
+          static_cast<unsigned int>(entry->kind),
+          static_cast<unsigned int>(entry->opcode), entry->transfer_root,
+          entry->first_word_address, entry->last_word_address,
+          static_cast<unsigned long long>(entry->primitives),
+          static_cast<unsigned long long>(entry->fully_missing_primitives),
+          static_cast<unsigned long long>(entry->missing_vertices));
+    }
+    resetWindow(now);
+  }
+
+private:
+  [[nodiscard]] static bool enabled() noexcept {
+    static const auto value = [] {
+      const auto *setting = SDL_getenv("SF_PERF_DIAGNOSTICS");
+      return setting == nullptr || setting[0] == '\0' ||
+             std::strcmp(setting, "0") != 0;
+    }();
+    return value;
+  }
+
+  [[nodiscard]] double milliseconds(std::uint64_t ticks,
+                                    std::uint64_t divisor) const noexcept {
+    if (frequency_ == 0U || divisor == 0U) {
+      return 0.0;
+    }
+    return static_cast<double>(ticks) * 1'000.0 /
+           (static_cast<double>(frequency_) * static_cast<double>(divisor));
+  }
+
+  void resetWindow(std::uint64_t now) noexcept {
+    const auto frequency = frequency_;
+    *this = {};
+    frequency_ = frequency;
+    window_started_ = now;
+  }
+
+  std::uint64_t frequency_{};
+  std::uint64_t window_started_{};
+  std::uint64_t loops_{};
+  std::uint64_t guest_steps_{};
+  std::uint64_t gpu_submissions_{};
+  std::uint64_t interpolated_presentations_{};
+  std::uint64_t cached_presentations_{};
+  std::uint64_t full_presentations_{};
+  std::uint64_t loop_ticks_{};
+  std::uint64_t maximum_loop_ticks_{};
+  std::uint64_t input_ticks_{};
+  std::uint64_t guest_ticks_{};
+  std::uint64_t gpu_ticks_{};
+  std::uint64_t audio_ticks_{};
+  std::uint64_t present_ticks_{};
+};
 
 class PsyCrossHost final : public Host {
 public:
   PsyCrossHost(std::string title, GraphicsSettings graphics,
                RuntimeFrameCallback frame = {},
-               RuntimeGpuFrameCallback gpu_frame = {},
                KeyboardMouseBindings input = defaultKeyboardMouseBindings(),
                MohUndergroundRuntimeActionBindings runtime_actions =
                    defaultMohUndergroundRuntimeActionBindings(),
                RuntimeAudioDrainCallback audio = {})
       : title_(title.begin(), title.end()), graphics_(graphics),
-        frame_(std::move(frame)), gpu_frame_(std::move(gpu_frame)),
-        input_(std::move(input)), runtime_actions_(std::move(runtime_actions)),
-        audio_(std::move(audio)) {
+        frame_(std::move(frame)), input_(std::move(input)),
+        runtime_actions_(std::move(runtime_actions)), audio_(std::move(audio)) {
     title_.push_back('\0');
   }
 
   void run() override {
     configureGraphics(graphics_);
-    if (gpu_frame_) {
+    if (frame_) {
       // Raw guest pages use the selected output resolution directly while
       // preserving the PS1's exact logical 1024x512 VRAM contract.
       g_cfg_composedGuestScanout = 1;
@@ -185,24 +838,34 @@ public:
       g_cfg_msaaSamples = 0;
       g_cfg_smaaFinalFrame = graphics_.smaa ? 1 : 0;
       g_cfg_fxaaFinalFrame = graphics_.fxaa ? 1 : 0;
+      g_cfg_volumetricFog = 1;
     }
-    // Raw guest pages use exact projective W and reversed world depth. Mixed
-    // fallback packets retain PS1 painter order inside the GPU backend.
-    g_cfg_pgxpTextureCorrection = gpu_frame_ ? 1 : g_cfg_pgxpTextureCorrection;
-    g_cfg_pgxpZBuffer = gpu_frame_ ? 1 : g_cfg_pgxpZBuffer;
-    guest_gpu_.setGeometryOptions(true, true, true, true, false, true, true);
-    guest_gpu_.setRuntimeGeometryPolicy(true, false, false);
+    // Raw pages use one reversed camera-space W domain. Fallback packets keep
+    // PS1 painter order.
+    g_cfg_pgxpTextureCorrection = frame_ ? 1 : g_cfg_pgxpTextureCorrection;
+    g_cfg_pgxpZBuffer = frame_ ? 1 : g_cfg_pgxpZBuffer;
+    guest_gpu_.setGeometryOptions(true, true, true, false, false, false, true);
+    guest_gpu_.setCoplanarClippingRecovery(false);
+    guest_gpu_.setRuntimeGeometryPolicy(false, false, false);
 
-    guest_gpu_.setPresentationInterpolationEnabled(
-        graphics_.frame_limit == 0U || graphics_.frame_limit > 30U);
+    guest_gpu_.setModelAnimationInterpolationEnabled(true);
     configureControllerProtocol(graphics_.controller_protocol);
+    configureControllerDevices(graphics_);
     PsyX_Initialise(title_.data(), graphics_.width, graphics_.height, 0);
+    PsyX_Log_Info("Controller routing: P1=device %d P2=device %d "
+                  "(-1 disabled)\n",
+                  graphics_.controller_device_indices[0U],
+                  graphics_.controller_device_indices[1U]);
     configurePresentation(graphics_);
     [[maybe_unused]] detail::PsyCrossWindowMode window_mode{
         graphics_.fullscreen};
     detail::configurePsyCrossVideoMode(detail::gameplay_video_mode, true);
-    if (gpu_frame_) {
+    if (frame_) {
       GR_EnableDepth(1);
+    }
+    std::unique_ptr<detail::PsyCrossSkybox> skybox;
+    if (frame_) {
+      skybox = std::make_unique<detail::PsyCrossSkybox>();
     }
     std::unique_ptr<detail::PsyCrossAudioOutput> runtime_audio;
     std::array<psx::SpuPcmFrame, 4'096U> runtime_audio_scratch{};
@@ -213,49 +876,77 @@ public:
           std::make_unique<detail::PsyCrossAudioOutput>(2U, "retail-spu");
     }
     detail::RelativeMouseCapture runtime_mouse_capture;
-    const auto maximum_guest_steps =
-        runtimeGuestCatchUpStepsForPresentation(graphics_.frame_limit);
-    RuntimeGuestCadencePolicy runtime_cadence{60.0, maximum_guest_steps,
-                                              maximum_guest_steps * 2U};
-    RuntimeAudioPlaybackRatePolicy runtime_audio_clock;
+    detail::MenuCursor runtime_menu_cursor;
+    detail::RuntimeMenuPointerController runtime_menu_pointer;
+    RuntimeMenuState runtime_menu;
+    // Never compound an expensive guest frame with a multi-frame catch-up
+    // burst. Keep one additional frame of debt, however: the elapsed sample
+    // following a guest step includes that step's execution time. Clamping the
+    // accumulator to one frame discarded this time and slowed the guest clock.
+    RuntimeGuestCadencePolicy runtime_cadence{60.0, 1U, 2U, 2U};
+    RuntimePresentationInterpolationClock presentation_clock{30.0};
+    auto presentation_alpha = 1.0;
     auto runtime_previous_counter = SDL_GetPerformanceCounter();
     const auto runtime_counter_frequency = SDL_GetPerformanceFrequency();
+    auto runtime_audio_diagnostic_counter = runtime_previous_counter;
     std::uint64_t guest_projection_epoch{};
     auto runtime_frame_ready = false;
-    RuntimeVisualPublicationTracker runtime_visual_publications;
-    RuntimePresentationInterpolationClock runtime_interpolation_clock;
+    RuntimeAtomicFrameTracker runtime_frames;
+    RuntimePerformanceDiagnostics performance_diagnostics;
+    RuntimeGeometryTrace geometry_trace;
+    RuntimeGpuDisplayPublication active_display;
+    mohu::StableGuestDisplayGeometry runtime_display_geometry;
+    auto active_display_valid = false;
+    std::optional<PresentationContent> active_content;
 
-    RuntimePresentationPolicy runtime_presentation;
+    struct PendingGpuSubmission {
+      std::shared_ptr<const RuntimeGpuFrame> frame;
+      RuntimeGpuDisplayPublication display;
+      std::size_t begin{};
+      std::size_t end{};
+    };
+    std::vector<PendingGpuSubmission> pending_gpu_submissions;
+    std::optional<std::uint64_t> pending_gpu_epoch;
+
     const auto prepareRuntimeDisplay =
-        [this, &runtime_presentation](const RuntimeGpuFrame &frame) {
-          const auto content = runtime_presentation.update({
-              frame.display_width,
-              frame.display_height,
-              frame.display_rgb24,
-              frame.display_interlaced,
-          });
+        [this](const RuntimeGpuDisplayPublication &display,
+               PresentationContent content) {
           const auto aspect =
               presentationAspectRatio(graphics_.aspect_ratio, content);
-          g_cfg_aspectMode = aspect == AspectRatioMode::adaptive
-                                 ? PSYX_ASPECT_ADAPTIVE
-                                 : PSYX_ASPECT_ORIGINAL_4_3;
-          GR_SetGuestDisplayGeometry(static_cast<int>(frame.display_width),
-                                     static_cast<int>(frame.display_height));
+          const auto next_aspect = aspect == AspectRatioMode::adaptive
+                                       ? PSYX_ASPECT_ADAPTIVE
+                                       : PSYX_ASPECT_ORIGINAL_4_3;
+          // Frontend and loading overlays can carry valid GTE tuples even
+          // though they are screen-space artwork. Never let those tuples
+          // inherit gameplay depth and reject a full-screen background.
+          g_cfg_pgxpZBuffer =
+              content == PresentationContent::gameplay ? 1 : 0;
+
+          if (g_cfg_aspectMode != next_aspect) {
+            PsyX_Log_Info(
+                "Runtime aspect: %s, guest=%ux%u rgb24=%u interlaced=%u\n",
+                next_aspect == PSYX_ASPECT_ADAPTIVE ? "adaptive" : "4:3",
+                static_cast<unsigned int>(display.display_width),
+                static_cast<unsigned int>(display.display_height),
+                display.display_rgb24 ? 1U : 0U,
+                display.display_interlaced ? 1U : 0U);
+            g_cfg_aspectMode = next_aspect;
+          }
+          GR_SetGuestDisplayGeometry(static_cast<int>(display.display_width),
+                                     static_cast<int>(display.display_height));
         };
 
-    const auto presentRuntimeDisplay = [this, &runtime_interpolation_clock](
-                                           const RuntimeGpuFrame &frame) {
-      const auto promotions_before =
-          guest_gpu_.promotedPresentationReplayFrames();
-      guest_gpu_.presentDisplay(frame.display_x, frame.display_y,
-                                frame.display_width, frame.display_height,
-                                frame.display_enabled, frame.display_rgb24,
-                                frame.display_interlaced);
-      if (guest_gpu_.promotedPresentationReplayFrames() != promotions_before) {
-        runtime_interpolation_clock.publishAuthoredFrame();
-      }
-    };
+    const auto presentRuntimeDisplay =
+        [this](const RuntimeGpuDisplayPublication &display) {
+          guest_gpu_.presentDisplay(
+              display.display_x, display.display_y, display.display_width,
+              display.display_height, display.display_enabled,
+              display.display_rgb24, display.display_interlaced);
+        };
     for (;;) {
+      const auto diagnostic_loop_started = performance_diagnostics.beginLoop();
+      auto diagnostic_phase_started = diagnostic_loop_started;
+      auto diagnostic_present_started = diagnostic_loop_started;
       auto visual_dirty = false;
       if (frame_) {
         PsyX_UpdateInput();
@@ -267,62 +958,358 @@ public:
                       static_cast<double>(runtime_counter_frequency)
                 : 1.0 / 60.0;
         runtime_previous_counter = runtime_counter;
+        presentation_alpha = presentation_clock.advance(elapsed_seconds);
         const auto guest_steps = runtime_cadence.advance(elapsed_seconds);
-        if (runtime_audio) {
-          runtime_audio->setPlaybackRate(
-              runtime_audio_clock.advance(elapsed_seconds, guest_steps));
+        if (diagnostic_phase_started != 0U) {
+          const auto now = SDL_GetPerformanceCounter();
+          performance_diagnostics.addInput(now - diagnostic_phase_started);
+          diagnostic_phase_started = now;
         }
         if (guest_steps != 0U) {
+          const auto menu_active = runtime_menu.active;
+          runtime_menu_cursor.set(menu_active &&
+                                  SDL_GetKeyboardFocus() != nullptr);
+          auto menu_pointer = runtime_menu_cursor.sample(512, 240);
           const auto input_sample = sampleRuntimePadInput(
-              input_, runtime_actions_, runtime_mouse_capture);
+              input_, graphics_.controller_bindings,
+              graphics_.controller_bindings_player_2, runtime_actions_,
+              runtime_mouse_capture, menu_active);
           auto runtime_running = true;
           for (std::size_t step{}; step < guest_steps; ++step) {
-            const auto pad = applyMohUndergroundRuntimeMouseLook(
-                input_sample.pad,
+            auto pads = input_sample.pads;
+            pads[0U] = applyMohUndergroundRuntimeMouseLook(
+                pads[0U],
                 runtimeMouseDeltaForGuestStep(input_sample.mouse_delta_x, step,
                                               guest_steps),
                 runtimeMouseDeltaForGuestStep(input_sample.mouse_delta_y, step,
                                               guest_steps),
                 input_sample.mouse_look_active,
-                graphics_.mouse_sensitivity_percent, runtime_actions_,
-                input_sample.movement_camera_yaw);
-            if (!frame_(pad)) {
+                graphics_.mouse_sensitivity_percent, runtime_actions_);
+            const auto menu_action =
+                runtime_menu_pointer.update(runtime_menu, menu_pointer);
+            pads[0U].active_low_buttons = static_cast<std::uint16_t>(
+                pads[0U].active_low_buttons & menu_action.active_low_buttons);
+            const RuntimeMenuInteraction menu_interaction{
+                .selection_valid = menu_action.selection_valid,
+                .screen_id = menu_action.screen_id,
+                .selection = menu_action.selection,
+            };
+            menu_pointer.moved = false;
+            menu_pointer.primary_pressed = false;
+            menu_pointer.secondary_pressed = false;
+            const auto guest_started = diagnostic_loop_started != 0U
+                                           ? SDL_GetPerformanceCounter()
+                                           : 0U;
+            const auto runtime_step = frame_(pads, menu_interaction);
+            if (!runtime_step.running) {
               runtime_running = false;
               break;
             }
-            if (gpu_frame_) {
-              const auto gpu_frame = gpu_frame_();
-              const auto publication_dirty =
-                  runtime_visual_publications.observe(
-                      RuntimeVisualPublicationState{
-                          .display_x = gpu_frame.display_x,
-                          .display_y = gpu_frame.display_y,
-                          .display_width = gpu_frame.display_width,
-                          .display_height = gpu_frame.display_height,
-                          .display_enabled = gpu_frame.display_enabled,
-                          .display_rgb24 = gpu_frame.display_rgb24,
-                          .display_interlaced = gpu_frame.display_interlaced,
-                          .command_buffer_epoch =
-                              gpu_frame.command_buffer_epoch,
-                      },
-                      !gpu_frame.words.empty());
-              visual_dirty = visual_dirty || publication_dirty;
-              prepareRuntimeDisplay(gpu_frame);
-              if (step + 1U == guest_steps && visual_dirty) {
-                presentRuntimeDisplay(gpu_frame);
+            if (guest_started != 0U) {
+              performance_diagnostics.addGuest(SDL_GetPerformanceCounter() -
+                                               guest_started);
+            }
+            performance_diagnostics.addGuestStep();
+            if (runtime_step.frame) {
+              const auto gpu_started = diagnostic_loop_started != 0U
+                                           ? SDL_GetPerformanceCounter()
+                                           : 0U;
+              const auto &gpu_frame = *runtime_step.frame;
+              runtime_menu = gpu_frame.menu;
+              guest_gpu_.setCampaignLighting(gpu_frame.campaign_level,
+                                             gpu_frame.sequence);
+              if (skybox) {
+                skybox->setLevel(gpu_frame.campaign_level);
+                skybox->setView(gpu_frame.atmosphere.skybox_yaw,
+                                gpu_frame.atmosphere.skybox_pitch,
+                                gpu_frame.atmosphere.skybox_vertical_fov,
+                                gpu_frame.atmosphere.skybox_view_valid);
               }
-              GR_BeginGuestProjectionEpoch(
-                  ++guest_projection_epoch,
-                  static_cast<int>(gpu_frame.display_width),
-                  static_cast<int>(gpu_frame.display_height),
-                  gpu_frame.display_rgb24 ? 1 : 0,
-                  gpu_frame.display_interlaced ? 1 : 0);
-              GR_BeginGuestSubmit();
-              guest_gpu_.submit(gpu_frame.words, gpu_frame.projections,
-                                gpu_frame.projection_identities,
-                                gpu_frame.command_buffer_epoch,
-                                gpu_frame.projection_catalog,
-                                gpu_frame.dma_sources);
+              GR_EnableSceneFog(0);
+              const auto geometry_trace_before =
+                  captureGeometryTraceCounters(guest_gpu_);
+              const auto observation = runtime_frames.observe(
+                  gpu_frame.sequence, gpu_frame.display_publication_sequence);
+              if (!observation.valid) {
+                throw core::Error{
+                    core::ErrorCode::invalid_argument,
+                    "Runtime published a stale or non-monotonic frame"};
+              }
+              const auto gpu_frame_owner = runtime_step.frame;
+              const auto stabilize_geometry_changes =
+                  gpu_frame.content == PresentationContent::gameplay;
+              const auto stable_geometry = runtime_display_geometry.update(
+                  {gpu_frame.display_width, gpu_frame.display_height,
+                   gpu_frame.display_rgb24, gpu_frame.display_interlaced},
+                  stabilize_geometry_changes);
+              const auto stabilize_geometry =
+                  [stable_geometry, stabilize_geometry_changes](
+                      RuntimeGpuDisplayPublication display) {
+                    if (!stabilize_geometry_changes) {
+                      return display;
+                    }
+                    display.display_width = stable_geometry.width;
+                    display.display_height = stable_geometry.height;
+                    display.display_rgb24 = stable_geometry.rgb24;
+                    display.display_interlaced = stable_geometry.interlaced;
+                    return display;
+                  };
+
+              const auto final_display =
+                  stabilize_geometry(RuntimeGpuDisplayPublication{
+                      .word_offset = gpu_frame.words.size(),
+                      .sequence = gpu_frame.display_publication_sequence,
+                      .display_x = gpu_frame.display_x,
+                      .display_y = gpu_frame.display_y,
+                      .display_width = gpu_frame.display_width,
+                      .display_height = gpu_frame.display_height,
+                      .display_enabled = gpu_frame.display_enabled,
+                      .display_rgb24 = gpu_frame.display_rgb24,
+                      .display_interlaced = gpu_frame.display_interlaced,
+                  });
+              const auto bootstrap_display = !active_display_valid;
+              if (bootstrap_display) {
+                active_display = final_display;
+                active_display_valid = true;
+              }
+
+              const auto aligned_slice = [](const RuntimeGpuFrame &frame,
+                                            const auto &values,
+                                            std::size_t offset,
+                                            std::size_t count) {
+                const auto span = std::span{values};
+                if (span.empty()) {
+                  return span;
+                }
+                if (span.size() != frame.words.size()) {
+                  throw core::Error{core::ErrorCode::invalid_argument,
+                                    "Runtime GPU sidecar is not word-aligned"};
+                }
+                return span.subspan(offset, count);
+              };
+              const auto queue_range = [&](std::size_t offset,
+                                           std::size_t end) {
+                if (end < offset || end > gpu_frame.words.size()) {
+                  throw core::Error{
+                      core::ErrorCode::invalid_argument,
+                      "Runtime GP1 boundary is outside the GPU batch"};
+                }
+                if (end == offset) {
+                  return;
+                }
+                pending_gpu_epoch = gpu_frame.command_buffer_epoch;
+                pending_gpu_submissions.push_back({
+                    .frame = gpu_frame_owner,
+                    .display = active_display,
+                    .begin = offset,
+                    .end = end,
+                });
+              };
+              const auto flush_queued_ranges = [&] {
+                for (const auto &batch : pending_gpu_submissions) {
+                  const auto &frame = *batch.frame;
+                  const auto count = batch.end - batch.begin;
+                  guest_gpu_.setCampaignLighting(frame.campaign_level,
+                                                 frame.sequence);
+                  if (skybox) {
+                    skybox->setLevel(frame.campaign_level);
+                    skybox->setView(frame.atmosphere.skybox_yaw,
+                                    frame.atmosphere.skybox_pitch,
+                                    frame.atmosphere.skybox_vertical_fov,
+                                    frame.atmosphere.skybox_view_valid);
+                  }
+                  prepareRuntimeDisplay(batch.display, frame.content);
+                  GR_BeginGuestProjectionEpoch(
+                      ++guest_projection_epoch,
+                      static_cast<int>(batch.display.display_width),
+                      static_cast<int>(batch.display.display_height),
+                      batch.display.display_rgb24 ? 1 : 0,
+                      batch.display.display_interlaced ? 1 : 0);
+                  GR_BeginGuestSubmit();
+                  guest_gpu_.submit(
+                      std::span{frame.words}.subspan(batch.begin, count),
+                      aligned_slice(frame, frame.projections, batch.begin,
+                                    count),
+                      aligned_slice(frame, frame.projection_identities,
+                                    batch.begin, count),
+                      frame.command_buffer_epoch, frame.projection_catalog,
+                      aligned_slice(frame, frame.dma_sources, batch.begin,
+                                    count));
+                  performance_diagnostics.addGpuSubmission();
+                }
+                pending_gpu_submissions.clear();
+                pending_gpu_epoch.reset();
+              };
+
+              if (pending_gpu_epoch &&
+                  *pending_gpu_epoch != gpu_frame.command_buffer_epoch) {
+                auto pending_words = std::size_t{};
+                for (const auto &batch : pending_gpu_submissions) {
+                  pending_words += batch.end - batch.begin;
+                }
+                PsyX_Log_Info(
+                    "[MReturnTrace][epoch-flush] from=%llu to=%llu "
+                    "batches=%zu words=%zu\n",
+                    static_cast<unsigned long long>(*pending_gpu_epoch),
+                    static_cast<unsigned long long>(
+                        gpu_frame.command_buffer_epoch),
+                    pending_gpu_submissions.size(), pending_words);
+                // An epoch change retires the guest command buffer, not the
+                // GPU work already accepted from it. Each pending range owns
+                // an immutable frame snapshot, so commit it before admitting
+                // commands from the replacement overlay/buffer.
+                flush_queued_ranges();
+              }
+
+              const auto content_transition =
+                  active_content && *active_content != gpu_frame.content;
+              if (content_transition) {
+                // Execute every accepted guest command under the display and
+                // aspect which owned it before changing presentation mode.
+                // Dropping this tail would desynchronize the host VRAM from
+                // the emulated GPU; presenting it would expose a partial old
+                // frame. The new scanout below remains the only visible one.
+                flush_queued_ranges();
+                // LEVEL draws the return-to-base still immediately before
+                // SHELL replaces its command buffer. That completed page is
+                // the background inherited by the authored 4:3 loader; the
+                // shell intentionally does not reload MRETURN.RSC. Preserve
+                // the pending replay while entering authored content, then
+                // promote it through presentDisplay() below. Entering a new
+                // gameplay scene must still reject frontend replay state.
+                if (gpu_frame.content == PresentationContent::gameplay) {
+                  guest_gpu_.resetPresentationHistory();
+                }
+                presentation_clock.reset();
+                presentation_alpha = 1.0;
+                runtime_frame_ready = false;
+                PsyX_Log_Info("Runtime content: %s -> %s\n",
+                              *active_content == PresentationContent::gameplay
+                                  ? "gameplay"
+                                  : "authored-4:3",
+                              gpu_frame.content == PresentationContent::gameplay
+                                  ? "gameplay"
+                                  : "authored-4:3");
+                if (gpu_frame.content != PresentationContent::gameplay) {
+                  detail::PresentationReplayDrawTarget inherited_page{};
+                  if (guest_gpu_.selectPendingPresentationReplayPage(
+                          active_display.display_width,
+                          active_display.display_height, inherited_page)) {
+                    PsyX_Log_Info(
+                        "[MReturnTrace][page-handoff] active=%u,%u,%ux%u "
+                        "captured=%u,%u,%ux%u\n",
+                        static_cast<unsigned int>(active_display.display_x),
+                        static_cast<unsigned int>(active_display.display_y),
+                        static_cast<unsigned int>(active_display.display_width),
+                        static_cast<unsigned int>(active_display.display_height),
+                        static_cast<unsigned int>(inherited_page.x),
+                        static_cast<unsigned int>(inherited_page.y),
+                        static_cast<unsigned int>(inherited_page.width),
+                        static_cast<unsigned int>(inherited_page.height));
+                    // The outgoing overlay owns this completed page. SHELL
+                    // intentionally inherits it without issuing a GP1 flip.
+                    active_display.display_x = inherited_page.x;
+                    active_display.display_y = inherited_page.y;
+                  }
+                }
+                prepareRuntimeDisplay(active_display, gpu_frame.content);
+                presentRuntimeDisplay(active_display);
+                visual_dirty = true;
+              }
+              active_content = gpu_frame.content;
+
+              auto consumed_words = std::size_t{};
+              auto validated_word_offset = std::size_t{};
+              auto previous_publication_sequence = std::uint64_t{};
+              for (const auto &publication : gpu_frame.display_publications) {
+                if (publication.word_offset < validated_word_offset ||
+                    publication.word_offset > gpu_frame.words.size() ||
+                    (previous_publication_sequence != 0U &&
+                     publication.sequence <= previous_publication_sequence) ||
+                    publication.sequence >
+                        gpu_frame.display_publication_sequence) {
+                  throw core::Error{
+                      core::ErrorCode::invalid_argument,
+                      "Runtime GP1 publications are not monotonic"};
+                }
+                validated_word_offset = publication.word_offset;
+                previous_publication_sequence = publication.sequence;
+              }
+
+              // Consecutive GP1 states at one GP0 boundary are one atomic
+              // control transaction. Retail overlay changes commonly reset
+              // and immediately restore the display mode before drawing any
+              // pixel. Only the final state can own an observable image;
+              // presenting the intermediate reset discards the prepared
+              // return-to-base/loading page.
+              for (std::size_t publication_index{};
+                   publication_index < gpu_frame.display_publications.size();) {
+                auto final_index = publication_index;
+                while (final_index + 1U <
+                           gpu_frame.display_publications.size() &&
+                       gpu_frame.display_publications[final_index + 1U]
+                               .word_offset ==
+                           gpu_frame.display_publications[publication_index]
+                               .word_offset) {
+                  ++final_index;
+                }
+                const auto &publication =
+                    gpu_frame.display_publications[final_index];
+                queue_range(consumed_words, publication.word_offset);
+                flush_queued_ranges();
+                active_display = stabilize_geometry(publication);
+                prepareRuntimeDisplay(active_display, gpu_frame.content);
+                presentRuntimeDisplay(active_display);
+                visual_dirty = true;
+                consumed_words = publication.word_offset;
+                publication_index = final_index + 1U;
+              }
+              if (!gpu_frame.display_publications.empty() &&
+                  previous_publication_sequence !=
+                      gpu_frame.display_publication_sequence) {
+                throw core::Error{core::ErrorCode::invalid_argument,
+                                  "Runtime omitted the final GP1 publication"};
+              }
+              if (observation.publication &&
+                  gpu_frame.display_publications.empty()) {
+                if (!bootstrap_display) {
+                  throw core::Error{
+                      core::ErrorCode::invalid_argument,
+                      "Runtime omitted a GP1 publication boundary"};
+                }
+                active_display = final_display;
+                prepareRuntimeDisplay(active_display, gpu_frame.content);
+                presentRuntimeDisplay(active_display);
+                visual_dirty = true;
+              }
+              if (observation.publication) {
+                presentation_clock.publishAuthoredFrame();
+                presentation_alpha = 0.0;
+              }
+              queue_range(consumed_words, gpu_frame.words.size());
+              if (requiresIncrementalGpuFlush(gpu_frame.content) &&
+                  !pending_gpu_submissions.empty()) {
+                // Retail loading/menu code often draws into the currently
+                // displayed page without a GP1 flip. Commit such guest-frame
+                // updates now so progress bars and return-to-base screens do
+                // not wait for the first gameplay publication.
+                flush_queued_ranges();
+                prepareRuntimeDisplay(active_display, gpu_frame.content);
+                presentRuntimeDisplay(active_display);
+                visual_dirty = true;
+              }
+              if (gpu_started != 0U) {
+                performance_diagnostics.addGpu(SDL_GetPerformanceCounter() -
+                                               gpu_started);
+              }
+              auto pending_gpu_words = std::size_t{};
+              for (const auto &batch : pending_gpu_submissions) {
+                pending_gpu_words += batch.end - batch.begin;
+              }
+              geometry_trace.logFrame(
+                  gpu_frame, stable_geometry, active_display, guest_gpu_,
+                  geometry_trace_before, 1.0 / 30.0,
+                  pending_gpu_submissions.size(), pending_gpu_words);
             }
           }
           if (!runtime_running) {
@@ -338,11 +1325,19 @@ public:
             break;
           }
         }
+        const auto audio_started =
+            diagnostic_loop_started != 0U ? SDL_GetPerformanceCounter() : 0U;
         if (runtime_audio) {
+          if (runtime_cadence.lateRecoveryStartedForLastAdvance()) {
+            runtime_audio->reset("guest-late-recovery");
+          }
           if (guest_steps != 0U) {
+            const auto drain_mode =
+                runtime_cadence.suppressAudioForLastAdvance()
+                    ? RuntimeAudioDrainMode::discard
+                    : RuntimeAudioDrainMode::queue;
             const auto valid = drainRuntimeAudioFrames(
-                std::span<psx::SpuPcmFrame>{runtime_audio_scratch},
-                RuntimeAudioDrainMode::queue,
+                std::span<psx::SpuPcmFrame>{runtime_audio_scratch}, drain_mode,
                 [this](std::span<psx::SpuPcmFrame> destination) {
                   return audio_(destination);
                 },
@@ -357,26 +1352,66 @@ public:
             runtime_audio->flush();
           }
           runtime_audio->update();
+          if (diagnostic_loop_started != 0U &&
+              runtime_counter_frequency != 0U &&
+              runtime_counter - runtime_audio_diagnostic_counter >=
+                  runtime_counter_frequency * 2U) {
+            runtime_audio->logDiagnostics("runtime");
+            runtime_audio_diagnostic_counter = runtime_counter;
+          }
         }
-        const auto interpolation_alpha =
-            runtime_interpolation_clock.advance(elapsed_seconds);
-        if (runtime_frame_ready && gpu_frame_ &&
+        if (audio_started != 0U) {
+          performance_diagnostics.addAudio(SDL_GetPerformanceCounter() -
+                                           audio_started);
+        }
+        diagnostic_present_started =
+            diagnostic_loop_started != 0U ? SDL_GetPerformanceCounter() : 0U;
+        if (active_content &&
+            *active_content == PresentationContent::gameplay &&
+            runtime_frame_ready && guest_gpu_.presentationReplayReady() &&
             guest_gpu_.presentInterpolatedDisplay(
-                static_cast<float>(interpolation_alpha))) {
+                static_cast<float>(presentation_alpha))) {
+          geometry_trace.notePresentation(
+              RuntimePerfPresentation::interpolated,
+              static_cast<float>(presentation_alpha));
+          if (diagnostic_present_started != 0U) {
+            performance_diagnostics.addPresent(SDL_GetPerformanceCounter() -
+                                               diagnostic_present_started);
+          }
+          performance_diagnostics.finishLoop(
+              diagnostic_loop_started, RuntimePerfPresentation::interpolated,
+              runtime_cadence, guest_gpu_);
           continue;
         }
         const auto presentation_mode =
             runtimeHostPresentationMode(visual_dirty);
         if (presentation_mode == RuntimeHostPresentationMode::cached &&
-            runtime_frame_ready && gpu_frame_ &&
-            PsyX_PresentCachedFrame() != 0) {
+            runtime_frame_ready && frame_ && PsyX_PresentCachedFrame() != 0) {
+          geometry_trace.notePresentation(RuntimePerfPresentation::cached);
+          if (diagnostic_present_started != 0U) {
+            performance_diagnostics.addPresent(SDL_GetPerformanceCounter() -
+                                               diagnostic_present_started);
+          }
+          performance_diagnostics.finishLoop(diagnostic_loop_started,
+                                             RuntimePerfPresentation::cached,
+                                             runtime_cadence, guest_gpu_);
           continue;
         }
       }
       static_cast<void>(PsyX_BeginScene());
       DrawSync(0);
       PsyX_EndScene();
-      if (gpu_frame_) {
+      if (frame_) {
+        geometry_trace.notePresentation(RuntimePerfPresentation::full);
+      }
+      if (diagnostic_present_started != 0U) {
+        performance_diagnostics.addPresent(SDL_GetPerformanceCounter() -
+                                           diagnostic_present_started);
+      }
+      performance_diagnostics.finishLoop(diagnostic_loop_started,
+                                         RuntimePerfPresentation::full,
+                                         runtime_cadence, guest_gpu_);
+      if (frame_) {
         runtime_frame_ready = true;
       }
     }
@@ -386,7 +1421,6 @@ private:
   std::vector<char> title_;
   GraphicsSettings graphics_;
   RuntimeFrameCallback frame_;
-  RuntimeGpuFrameCallback gpu_frame_;
   KeyboardMouseBindings input_;
   MohUndergroundRuntimeActionBindings runtime_actions_;
   RuntimeAudioDrainCallback audio_;
@@ -435,8 +1469,92 @@ std::uint16_t readHostButtons(const PADRAW &pad) noexcept {
          (static_cast<std::uint16_t>(pad.buttons[1]) << 8U);
 }
 
+template <std::size_t Capacity> class FixedMenuHitRegions final {
+public:
+  void add(int x, int y, int width, int height,
+           std::size_t selection) noexcept {
+    if (size_ < regions_.size()) {
+      regions_[size_++] = detail::MenuHitRegion{x, y, width, height, selection};
+    }
+  }
+
+  [[nodiscard]] std::span<const detail::MenuHitRegion> span() const noexcept {
+    return std::span<const detail::MenuHitRegion>{regions_}.first(size_);
+  }
+
+private:
+  std::array<detail::MenuHitRegion, Capacity> regions_{};
+  std::size_t size_{};
+};
+
+FixedMenuHitRegions<6U>
+titleMenuHitRegions(const game::TitleMenu &menu,
+                    const game::TitleAssets &assets) noexcept {
+  FixedMenuHitRegions<6U> regions;
+  switch (menu.phase()) {
+  case game::TitlePhase::searching:
+  case game::TitlePhase::menu: {
+    constexpr auto title_layout_width = 384U;
+    constexpr auto title_movie_width = 320U;
+    const auto scale_x = [](unsigned int value) {
+      return static_cast<int>(
+          (value * title_movie_width + title_layout_width / 2U) /
+          title_layout_width);
+    };
+    for (std::size_t index{}; index < game::TitleMenu::item_count; ++index) {
+      if (!menu.itemEnabled(index)) {
+        continue;
+      }
+      const auto &sprite = assets.sprite(static_cast<game::TitleVisual>(index));
+      regions.add(
+          scale_x(static_cast<unsigned int>(std::max<int>(sprite.x, 0))),
+          std::max<int>(sprite.y, 0), scale_x(sprite.image.displayWidth()),
+          sprite.image.displayHeight(), index);
+    }
+    break;
+  }
+  case game::TitlePhase::load_slots:
+    for (std::size_t index{}; index < game::title_save_slot_count; ++index) {
+      regions.add(30, static_cast<int>(52 + index * 27U), 260, 20, index);
+    }
+    regions.add(30, 187, 260, 20, game::title_save_slot_count);
+    break;
+  case game::TitlePhase::select_difficulty:
+    for (std::size_t index{}; index < game::TitleMenu::difficulty_count;
+         ++index) {
+      regions.add(42, static_cast<int>(100 + index * 34U), 236, 23, index);
+    }
+    break;
+  case game::TitlePhase::agent_warning:
+    regions.add(42, 202, 236, 24, 0U);
+    break;
+  }
+  return regions;
+}
+
+FixedMenuHitRegions<5U>
+campaignSaveHitRegions(const game::CampaignSaveMenu &menu) noexcept {
+  FixedMenuHitRegions<5U> regions;
+  switch (menu.phase()) {
+  case game::CampaignSavePhase::prompt:
+  case game::CampaignSavePhase::overwrite:
+    regions.add(66, 101, 58, 17, 0U);
+    regions.add(144, 101, 58, 17, 1U);
+    break;
+  case game::CampaignSavePhase::slots:
+    for (std::size_t index{}; index < game::title_save_slot_count; ++index) {
+      regions.add(52, static_cast<int>(76 + index * 24U), 165, 17, index);
+    }
+    break;
+  case game::CampaignSavePhase::complete:
+    break;
+  }
+  return regions;
+}
+
 KeyboardMouseActionSnapshot
-sampleHostKeyboardMouseActions(const KeyboardMouseBindings &bindings) {
+sampleHostKeyboardMouseActions(const KeyboardMouseBindings &bindings,
+                               bool mouse_enabled = true) {
   int keyboard_count{};
   const auto *keyboard = SDL_GetKeyboardState(&keyboard_count);
   const auto keyboard_state =
@@ -448,47 +1566,60 @@ sampleHostKeyboardMouseActions(const KeyboardMouseBindings &bindings) {
   return sampleKeyboardMouseActions(
       bindings, KeyboardMouseDeviceState{
                     .keyboard = keyboard_state,
-                    .mouse_left = (mouse_buttons & SDL_BUTTON_LMASK) != 0U,
-                    .mouse_right = (mouse_buttons & SDL_BUTTON_RMASK) != 0U,
-                    .mouse_middle = (mouse_buttons & SDL_BUTTON_MMASK) != 0U,
-                    .mouse_x1 = (mouse_buttons & SDL_BUTTON_X1MASK) != 0U,
-                    .mouse_x2 = (mouse_buttons & SDL_BUTTON_X2MASK) != 0U,
+                    .mouse_left = mouse_enabled &&
+                                  (mouse_buttons & SDL_BUTTON_LMASK) != 0U,
+                    .mouse_right = mouse_enabled &&
+                                   (mouse_buttons & SDL_BUTTON_RMASK) != 0U,
+                    .mouse_middle = mouse_enabled &&
+                                    (mouse_buttons & SDL_BUTTON_MMASK) != 0U,
+                    .mouse_x1 = mouse_enabled &&
+                                (mouse_buttons & SDL_BUTTON_X1MASK) != 0U,
+                    .mouse_x2 = mouse_enabled &&
+                                (mouse_buttons & SDL_BUTTON_X2MASK) != 0U,
                     .mouse_wheel_delta = detail::consumePsyCrossMouseWheel(),
                 });
 }
 
 RuntimePadSample sampleRuntimePadInput(
     const KeyboardMouseBindings &bindings,
+    const ControllerButtonBindings &controller_bindings,
+    const ControllerButtonBindings &controller_bindings_player_2,
     const MohUndergroundRuntimeActionBindings &runtime_actions,
-    detail::RelativeMouseCapture &mouse_capture) noexcept {
-  const auto actions = sampleHostKeyboardMouseActions(bindings);
-  RuntimePadInput physical;
-  PsyXControllerSnapshot snapshot{};
-  if (PsyX_Pad_GetControllerSnapshot(0, &snapshot) != 0 &&
-      snapshot.connected != 0U) {
+    detail::RelativeMouseCapture &mouse_capture, bool menu_active) noexcept {
+  const auto actions = sampleHostKeyboardMouseActions(bindings, !menu_active);
+  RuntimePadSample sample;
+  sample.pads[1U].connected = false;
+  for (std::size_t slot{}; slot < sample.pads.size(); ++slot) {
+    PsyXControllerSnapshot snapshot{};
+    if (PsyX_Pad_GetControllerSnapshot(static_cast<int>(slot), &snapshot) ==
+            0 ||
+        snapshot.connected == 0U) {
+      continue;
+    }
+    auto &physical = sample.pads[slot];
+    physical.connected = true;
     physical.active_low_buttons =
         static_cast<std::uint16_t>(snapshot.buttons[0]) |
         (static_cast<std::uint16_t>(snapshot.buttons[1]) << 8U);
     std::copy_n(snapshot.analog, physical.analog.size(),
                 physical.analog.begin());
   }
-  mouse_capture.set(SDL_GetKeyboardFocus() != nullptr);
+  sample.pads[0U] = applyMohUndergroundControllerBindings(sample.pads[0U],
+                                                          controller_bindings);
+  sample.pads[1U] = applyMohUndergroundControllerBindings(
+      sample.pads[1U], controller_bindings_player_2);
+  sample.pads[0U] = mergeMohUndergroundRuntimeInput(sample.pads[0U], actions,
+                                                    runtime_actions);
+  mouse_capture.set(!menu_active && SDL_GetKeyboardFocus() != nullptr);
   auto mouse_delta_x = int{};
   auto mouse_delta_y = int{};
   if (mouse_capture.enabled()) {
     SDL_GetRelativeMouseState(&mouse_delta_x, &mouse_delta_y);
   }
-  const auto movement_camera_yaw =
-      static_cast<double>(actions[KeyboardMouseAction::strafe_right]) -
-      static_cast<double>(actions[KeyboardMouseAction::strafe_left]);
-  return RuntimePadSample{
-      .pad =
-          mergeMohUndergroundRuntimeInput(physical, actions, runtime_actions),
-      .mouse_delta_x = static_cast<std::int32_t>(mouse_delta_x),
-      .mouse_delta_y = static_cast<std::int32_t>(mouse_delta_y),
-      .mouse_look_active = mouse_capture.enabled(),
-      .movement_camera_yaw = movement_camera_yaw,
-  };
+  sample.mouse_delta_x = static_cast<std::int32_t>(mouse_delta_x);
+  sample.mouse_delta_y = static_cast<std::int32_t>(mouse_delta_y);
+  sample.mouse_look_active = mouse_capture.enabled();
+  return sample;
 }
 SaveStoreDecision
 storeTitleSaveSlotsWithRecovery(const std::filesystem::path &path,
@@ -581,6 +1712,8 @@ game::CampaignSaveResult runCampaignSaveMenu(
   game::CampaignSaveMenu menu;
   ControllerMenuNavigator analog_navigation;
   auto first_frame_presented = false;
+  detail::MenuCursor menu_cursor;
+  menu_cursor.set(true);
   constexpr std::uint16_t previous_buttons_mask = 0x80U | 0x10U;
   constexpr std::uint16_t next_buttons_mask = 0x20U | 0x40U;
   constexpr std::uint16_t confirm_buttons_mask = 0x4000U | 0x8000U | 0x08U;
@@ -590,6 +1723,11 @@ game::CampaignSaveResult runCampaignSaveMenu(
   auto pause_was_down = false;
   for (;;) {
     PsyX_UpdateInput();
+    const auto pointer = menu_cursor.sample(game::PauseMenu::screen_width,
+                                            game::PauseMenu::screen_height);
+    const auto pointer_regions = campaignSaveHitRegions(menu);
+    const auto pointer_hit =
+        detail::menuHitTest(pointer, pointer_regions.span());
     ui_audio.update();
     const auto buttons = readHostButtons(pad);
     const auto pressed =
@@ -610,10 +1748,14 @@ game::CampaignSaveResult runCampaignSaveMenu(
         previous_controller_instance);
     const auto analog = analog_navigation.update(menu_sample);
     const game::CampaignSaveInput input{
-        (pressed & previous_buttons_mask) != 0U || analog.previous,
-        (pressed & next_buttons_mask) != 0U || analog.next,
-        (pressed & confirm_buttons_mask) != 0U || interact_pressed,
-        (pressed & cancel_buttons_mask) != 0U || pause_pressed,
+        .previous = (pressed & previous_buttons_mask) != 0U || analog.previous,
+        .next = (pressed & next_buttons_mask) != 0U || analog.next,
+        .confirm = (pressed & confirm_buttons_mask) != 0U || interact_pressed ||
+                   (pointer.primary_pressed && pointer_hit),
+        .cancel = (pressed & cancel_buttons_mask) != 0U || pause_pressed ||
+                  pointer.secondary_pressed,
+        .pointer_selection =
+            pointer.moved ? pointer_hit : std::optional<std::size_t>{},
     };
     const auto previous_phase = menu.phase();
     const auto previous_save_selection = menu.saveSelected();
@@ -894,6 +2036,7 @@ public:
         graphics_, controller_settings_commit_};
     configureGraphics(graphics_);
     configureControllerProtocol(graphics_.controller_protocol);
+    configureControllerDevices(graphics_);
     PsyX_Initialise(title_.data(), graphics_.width, graphics_.height, 0);
     configurePresentation(graphics_);
     [[maybe_unused]] detail::PsyCrossWindowMode window_mode{
@@ -923,6 +2066,7 @@ public:
     bool title_pause_was_down{};
     detail::PsyCrossUiAudio ui_audio{cue_path_};
     detail::PsyCrossMoviePlayer movie_player;
+    detail::MenuCursor title_cursor;
     auto active_title_prompt_bindings =
         keyboardMouseInputPromptBindings(input_);
     auto previous_title_controller_instance = -1;
@@ -931,9 +2075,15 @@ public:
     const detail::MovieOverlayCallbacks overlay{
         [this, &pad, &ui_audio, &title_keyboard_initialized,
          &title_interact_was_down, &title_pause_was_down, &title_load_renderer,
-         &active_title_prompt_bindings, &previous_title_controller_instance](
-            std::uint16_t pressed, std::uint32_t movie_frame) {
+         &active_title_prompt_bindings, &previous_title_controller_instance,
+         &title_cursor](std::uint16_t pressed, std::uint32_t movie_frame) {
           ui_audio.update();
+          title_cursor.set(true);
+          const auto pointer = title_cursor.sample(
+              game::TitleMenu::screen_width, game::TitleMenu::screen_height);
+          const auto pointer_regions = titleMenuHitRegions(menu_, assets_);
+          const auto pointer_hit =
+              detail::menuHitTest(pointer, pointer_regions.span());
           const auto actions = sampleHostKeyboardMouseActions(input_);
           const auto interact_down = actions[KeyboardMouseAction::interact];
           const auto pause_down = actions[KeyboardMouseAction::pause];
@@ -953,11 +2103,15 @@ public:
               .previous = (pressed & (0x80U | 0x10U)) != 0 || analog.previous,
               .next = (pressed & (0x20U | 0x40U)) != 0 || analog.next,
               .confirm = (pressed & (0x4000U | 0x8000U | 0x08U)) != 0 ||
-                         interact_pressed,
-              .cancel = (pressed & (0x2000U | 0x01U)) != 0 || pause_pressed,
+                         interact_pressed ||
+                         (pointer.primary_pressed && pointer_hit),
+              .cancel = (pressed & (0x2000U | 0x01U)) != 0 || pause_pressed ||
+                        pointer.secondary_pressed,
               .confirm_down = ((~readHostButtons(pad)) &
                                (0x4000U | 0x8000U | 0x08U)) != 0U ||
-                              interact_down,
+                              interact_down || pointer.primary_pressed,
+              .pointer_selection =
+                  pointer.moved ? pointer_hit : std::optional<std::size_t>{},
           };
           const auto previous_selection = menu_.selection();
           const auto previous_phase = menu_.phase();
@@ -987,6 +2141,7 @@ public:
               command == game::TitleCommand::load_game ||
               command == game::TitleCommand::training_video) {
             selected_command_ = command;
+            title_cursor.set(false);
             PsyX_Log_Info("Title command accepted: %s\n",
                           game::titleCommandName(command).data());
             return false;
@@ -1032,6 +2187,7 @@ public:
       title_menu_navigation_.reset();
       previous_buttons = movie_player.play(movies_, pad, previous_buttons,
                                            overlay, play_startup_movies);
+      title_cursor.set(false);
       if (selected_command_ == game::TitleCommand::training_video) {
         menu_.completeSearch();
         play_startup_movies = false;
@@ -1310,6 +2466,7 @@ public:
         graphics_, controller_settings_commit_};
     configureGraphics(graphics_);
     configureControllerProtocol(graphics_.controller_protocol);
+    configureControllerDevices(graphics_);
     PsyX_Initialise(title_.data(), graphics_.width, graphics_.height, 0);
     configurePresentation(graphics_);
     [[maybe_unused]] detail::PsyCrossWindowMode window_mode{
@@ -1366,16 +2523,189 @@ private:
 };
 
 } // namespace
+
+void logRuntimeCpuAccelerationDiagnostics(
+    std::uint64_t frames, std::uint64_t fast_forwards,
+    std::uint64_t skipped_ticks) noexcept {
+  const auto skipped_per_frame =
+      frames != 0U ? static_cast<double>(skipped_ticks) / frames : 0.0;
+  PsyX_Log_Info("[PerfDiag][cpu-accel] frames=%llu fast_forwards=%llu "
+                "skipped_ticks=%llu skipped_per_frame=%.1f\n",
+                static_cast<unsigned long long>(frames),
+                static_cast<unsigned long long>(fast_forwards),
+                static_cast<unsigned long long>(skipped_ticks),
+                skipped_per_frame);
+}
+
+void logRuntimeGuestCpuDiagnostics(
+    std::uint64_t frames, std::uint64_t average_microseconds,
+    std::uint64_t maximum_microseconds, std::uint64_t instructions_per_frame,
+    std::uint64_t fast_fallbacks, std::uint32_t guest_pc,
+    std::uint32_t guest_ra, const psx::BiosHleState &bios_state,
+    const RuntimeGuestCardDiagnostics &card,
+    std::uint64_t machine_tick) noexcept {
+  const auto total_instructions = instructions_per_frame * frames;
+  const auto fast_coverage =
+      total_instructions != 0U
+          ? 100.0 *
+                static_cast<double>(
+                    total_instructions -
+                    std::min(fast_fallbacks, total_instructions)) /
+                static_cast<double>(total_instructions)
+          : 0.0;
+  PsyX_Log_Info("[PerfDiag][guest-cpu] frames=%llu avg_us=%llu max_us=%llu "
+                "instructions_per_frame=%llu fast=%.1f%% fallback=%llu "
+                "scale_percent=100 pc=%08X ra=%08X tick=%llu\n",
+                static_cast<unsigned long long>(frames),
+                static_cast<unsigned long long>(average_microseconds),
+                static_cast<unsigned long long>(maximum_microseconds),
+                static_cast<unsigned long long>(instructions_per_frame),
+                fast_coverage, static_cast<unsigned long long>(fast_fallbacks),
+                guest_pc, guest_ra,
+                static_cast<unsigned long long>(machine_tick));
+  PsyX_Log_Info(
+      "[CardDiag] init=%u/%u/%u op=%u status=%08X channel=%08X "
+      "submit=%llu complete=%llu event=%08X/%08X callbacks=%llu/%llu "
+      "guest=%u/%u/%u ports=%08X channel=%08X stack=%08X cb=%08X "
+      "ticks=%u done_cb=%08X sw=%u,%u,%u,%u hw=%u,%u,%u,%u\n",
+      static_cast<unsigned>(bios_state.memory_card_initialized),
+      static_cast<unsigned>(bios_state.memory_card_started),
+      static_cast<unsigned>(bios_state.memory_card_filesystem_initialized),
+      static_cast<unsigned>(bios_state.memory_card_operation),
+      bios_state.memory_card_status, bios_state.memory_card_channel,
+      static_cast<unsigned long long>(bios_state.memory_card_submissions),
+      static_cast<unsigned long long>(bios_state.memory_card_completions),
+      bios_state.memory_card_last_event_class,
+      bios_state.memory_card_last_event_spec,
+      static_cast<unsigned long long>(bios_state.event_callbacks_started),
+      static_cast<unsigned long long>(bios_state.event_callbacks_completed),
+      card.task, card.result, card.done, card.ports, card.channel,
+      card.task_stack_depth, card.vblank_callback, card.update_ticks,
+      card.completion_callback, card.software_events[0U],
+      card.software_events[1U], card.software_events[2U],
+      card.software_events[3U], card.hardware_events[0U],
+      card.hardware_events[1U], card.hardware_events[2U],
+      card.hardware_events[3U]);
+  PsyX_Log_Info("[CardDiag][events] sw_handle=%08X,%08X,%08X,%08X "
+                "hw_handle=%08X,%08X,%08X,%08X\n",
+                card.software_handles[0U], card.software_handles[1U],
+                card.software_handles[2U], card.software_handles[3U],
+                card.hardware_handles[0U], card.hardware_handles[1U],
+                card.hardware_handles[2U], card.hardware_handles[3U]);
+  PsyX_Log_Info("[CardDiag][stack] "
+                "0=%08X:%08X,%08X,%08X,%08X "
+                "1=%08X:%08X,%08X,%08X,%08X "
+                "2=%08X:%08X,%08X,%08X,%08X "
+                "3=%08X:%08X,%08X,%08X,%08X\n",
+                card.stack_callbacks[0U], card.stack_frames[0U][0U],
+                card.stack_frames[0U][1U], card.stack_frames[0U][2U],
+                card.stack_frames[0U][3U], card.stack_callbacks[1U],
+                card.stack_frames[1U][0U], card.stack_frames[1U][1U],
+                card.stack_frames[1U][2U], card.stack_frames[1U][3U],
+                card.stack_callbacks[2U], card.stack_frames[2U][0U],
+                card.stack_frames[2U][1U], card.stack_frames[2U][2U],
+                card.stack_frames[2U][3U], card.stack_callbacks[3U],
+                card.stack_frames[3U][0U], card.stack_frames[3U][1U],
+                card.stack_frames[3U][2U], card.stack_frames[3U][3U]);
+}
+
+void logRuntimeExactTransformDiagnostics(
+    std::uint64_t captures, std::uint64_t publications,
+    std::uint64_t rejections, std::uint64_t composition_entries,
+    std::uint64_t composition_captures, std::uint64_t composition_sites,
+    std::uint64_t composition_publications,
+    std::span<const psx::GteProjectedVertex> projections) noexcept {
+  std::uint64_t valid{};
+  std::uint64_t exact{};
+  std::uint64_t enhanced_rotation{};
+  std::uint64_t enhanced_translation{};
+  std::uint64_t enhanced_vector{};
+  for (const auto &projection : projections) {
+    if (!projection.valid)
+      continue;
+    ++valid;
+    exact += projection.exact_transform ? 1U : 0U;
+    enhanced_rotation += (projection.enhanced_sources &
+                          psx::GteProjectedVertex::enhanced_rotation) != 0U;
+    enhanced_translation +=
+        (projection.enhanced_sources &
+         psx::GteProjectedVertex::enhanced_translation) != 0U;
+    enhanced_vector += (projection.enhanced_sources &
+                        psx::GteProjectedVertex::enhanced_vector) != 0U;
+  }
+  PsyX_Log_Info(
+      "[PerfDiag][exact-transform] capture/publish/reject=%llu/%llu/%llu "
+      "compose(entry/capture/site/publish)=%llu/%llu/%llu/%llu "
+      "catalog(valid/exact/enhanced_r/t/v)=%llu/%llu/%llu/%llu/%llu\n",
+      static_cast<unsigned long long>(captures),
+      static_cast<unsigned long long>(publications),
+      static_cast<unsigned long long>(rejections),
+      static_cast<unsigned long long>(composition_entries),
+      static_cast<unsigned long long>(composition_captures),
+      static_cast<unsigned long long>(composition_sites),
+      static_cast<unsigned long long>(composition_publications),
+      static_cast<unsigned long long>(valid),
+      static_cast<unsigned long long>(exact),
+      static_cast<unsigned long long>(enhanced_rotation),
+      static_cast<unsigned long long>(enhanced_translation),
+      static_cast<unsigned long long>(enhanced_vector));
+}
+
+void logRuntimeSpuDiagnostics(std::span<const psx::SpuDiagnosticEvent> events,
+                              std::uint64_t dropped_events) noexcept {
+  for (const auto &event : events) {
+    switch (event.type) {
+    case psx::SpuDiagnosticType::dma_write:
+    case psx::SpuDiagnosticType::dma_read:
+      PsyX_Log_Info(
+          "[SpuTrace][dma] seq=%llu frame=%llu dir=%s ram=%06X "
+          "spu=%05X..%05X words=%u/%u hash=%08X\n",
+          static_cast<unsigned long long>(event.sequence),
+          static_cast<unsigned long long>(event.mixed_frame),
+          event.type == psx::SpuDiagnosticType::dma_write ? "ram->spu"
+                                                          : "spu->ram",
+          event.ram_address, event.start_address, event.end_address,
+          event.word_count, event.expected_word_count, event.fingerprint);
+      break;
+    case psx::SpuDiagnosticType::key_on:
+      PsyX_Log_Info(
+          "[SpuTrace][kon] seq=%llu frame=%llu pc=%08X voice=%u "
+          "mask=%06X start=%05X repeat=%05X pitch=%04X vol=%04X/%04X "
+          "adsr=%04X/%04X adpcm=%02X/%02X hash=%08X\n",
+          static_cast<unsigned long long>(event.sequence),
+          static_cast<unsigned long long>(event.mixed_frame), event.producer_pc,
+          static_cast<unsigned int>(event.voice), event.mask,
+          event.start_address, event.repeat_address, event.pitch,
+          event.volume_left, event.volume_right, event.adsr_low,
+          event.adsr_high, static_cast<unsigned int>(event.adpcm_header),
+          static_cast<unsigned int>(event.adpcm_flags), event.fingerprint);
+      break;
+    case psx::SpuDiagnosticType::key_off:
+      PsyX_Log_Info("[SpuTrace][koff] seq=%llu frame=%llu pc=%08X mask=%06X\n",
+                    static_cast<unsigned long long>(event.sequence),
+                    static_cast<unsigned long long>(event.mixed_frame),
+                    event.producer_pc, event.mask);
+      break;
+    }
+  }
+
+  static std::uint64_t reported_drops{};
+  if (dropped_events != reported_drops) {
+    PsyX_Log_Warning("[SpuTrace][overflow] dropped=%llu\n",
+                     static_cast<unsigned long long>(dropped_events));
+    reported_drops = dropped_events;
+  }
+}
+
 std::unique_ptr<Host>
 createPsyCrossRuntimeHost(std::string title, RuntimeFrameCallback frame,
-                          RuntimeGpuFrameCallback gpu_frame,
                           GraphicsSettings graphics,
                           KeyboardMouseBindings input,
                           MohUndergroundRuntimeActionBindings runtime_actions,
                           RuntimeAudioDrainCallback audio) {
   return std::make_unique<PsyCrossHost>(
-      std::move(title), graphics, std::move(frame), std::move(gpu_frame),
-      std::move(input), std::move(runtime_actions), std::move(audio));
+      std::move(title), graphics, std::move(frame), std::move(input),
+      std::move(runtime_actions), std::move(audio));
 }
 
 std::unique_ptr<Host> createPsyCrossHost(std::string title,

@@ -20,6 +20,12 @@ struct GpuDisplayState {
   bool interlaced{};
 };
 
+struct GpuDisplayPublication {
+  std::size_t word_offset{};
+  std::uint64_t sequence{};
+  GpuDisplayState display;
+};
+
 class GpuCommandStream final : public sf::psx::GpuPort {
 public:
   void beginFrame() noexcept;
@@ -73,6 +79,10 @@ public:
   frameDmaSources() const noexcept {
     return frame_dma_sources_;
   }
+  [[nodiscard]] std::span<const GpuDisplayPublication>
+  frameDisplayPublications() const noexcept {
+    return frame_display_publications_;
+  }
   [[nodiscard]] bool overrideFrameProjectionIdentities(
       std::span<const std::size_t> word_indices,
       std::span<const std::uint16_t> identities) noexcept {
@@ -114,6 +124,9 @@ public:
   [[nodiscard]] std::uint64_t commandBufferEpoch() const noexcept {
     return command_buffer_epoch_;
   }
+  [[nodiscard]] std::uint64_t displayPublicationSequence() const noexcept {
+    return display_publication_sequence_;
+  }
   [[nodiscard]] const GpuDisplayState &displayState() const noexcept {
     return display_state_;
   }
@@ -123,6 +136,7 @@ private:
     command_start,
     fixed_payload,
     polyline,
+    vram_copy_payload,
     cpu_to_vram_header,
     cpu_to_vram_payload,
   };
@@ -132,15 +146,16 @@ private:
                                std::uint64_t source_identity,
                                sf::psx::GpuDmaWordSource dma_source) noexcept;
   void advanceGp0Boundary(std::uint32_t value) noexcept;
+  void recordDisplayPublication() noexcept;
   void resetFrameCapture() noexcept;
   static constexpr std::uint32_t reset_status = 0x14802000U;
   std::vector<std::uint32_t> frame_words_;
   std::vector<sf::psx::GteProjectedVertex> frame_projections_;
   std::vector<std::uint64_t> frame_projection_identities_;
   std::vector<sf::psx::GpuDmaWordSource> frame_dma_sources_;
+  std::vector<GpuDisplayPublication> frame_display_publications_;
   bool projection_tracking_{true};
   bool projection_identity_tracking_{true};
-  bool dma_sidecar_disabled_{};
   Gp0BoundaryState gp0_boundary_state_{Gp0BoundaryState::command_start};
   std::size_t gp0_words_remaining_{};
   std::size_t gp0_polyline_minimum_remaining_{};
@@ -151,6 +166,7 @@ private:
   std::uint64_t total_gp0_words_{};
   std::uint64_t total_gp1_words_{};
   std::uint64_t command_buffer_epoch_{};
+  std::uint64_t display_publication_sequence_{};
 };
 
 } // namespace mohu

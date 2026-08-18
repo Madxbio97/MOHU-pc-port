@@ -132,6 +132,109 @@ void testBootCalls() {
               runtime.state().pc == 0x80012340U,
           "StartCARD did not enter run state or apply ChangeClearPAD(1)");
 
+  const auto open_card_event = [&](std::uint32_t event_class) {
+    const auto handle = invokeBios(bios, runtime, 0x000000b0U, 0x08U,
+                                   event_class, 4U, 0x2000U, 0U);
+    require((handle & 0xffff0000U) == 0xf1000000U &&
+                invokeBios(bios, runtime, 0x000000b0U, 0x0cU, handle) == 1U,
+            "Memory Card event setup failed");
+    return handle;
+  };
+  const auto backup_event = open_card_event(0xf4000001U);
+  const auto low_event = open_card_event(0xf0000011U);
+
+  prepareCall(runtime, 0x000000a0U, 0xabU);
+  require(bios.handleCall() && runtime.state().gpr[2U] == 1U &&
+              bios.state().memory_card_channel == 0U &&
+              bios.state().memory_card_status == 2U &&
+              runtime.state().pc == 0x80012340U,
+          "A0 _card_info did not accept the formatted first-port card");
+  require(bios.serviceAsync() == sf::psx::BiosAsyncServiceResult::progressed &&
+              bios.state().memory_card_status == 1U &&
+              invokeBios(bios, runtime, 0x000000b0U, 0x0bU, backup_event) ==
+                  1U &&
+              invokeBios(bios, runtime, 0x000000b0U, 0x0bU, low_event) == 0U,
+          "A0 _card_info crossed from SwCARD into HwCARD");
+
+  prepareCall(runtime, 0x000000a0U, 0xacU);
+  require(bios.handleCall() && runtime.state().gpr[2U] == 1U &&
+              bios.state().memory_card_status == 2U &&
+              bios.serviceAsync() ==
+                  sf::psx::BiosAsyncServiceResult::progressed,
+          "A0 _card_load did not complete the directory preload");
+  require(invokeBios(bios, runtime, 0x000000b0U, 0x0bU, backup_event) == 1U &&
+              invokeBios(bios, runtime, 0x000000b0U, 0x0bU, low_event) == 0U,
+          "A0 _card_load crossed from SwCARD into HwCARD");
+
+  prepareCall(runtime, 0x000000a0U, 0xadU);
+  runtime.setRegister(4U, 1U);
+  require(bios.handleCall() && bios.state().memory_card_auto_format,
+          "A0 _card_auto did not update its mode");
+
+  prepareCall(runtime, 0x000000b0U, 0x4dU);
+  require(bios.handleCall() && runtime.state().gpr[2U] == 1U &&
+              runtime.state().pc == 0x80012340U &&
+              bios.serviceAsync() ==
+                  sf::psx::BiosAsyncServiceResult::progressed,
+          "B0 _card_info_subfunc did not accept the first-port card");
+  require(invokeBios(bios, runtime, 0x000000b0U, 0x0bU, low_event) == 1U &&
+              invokeBios(bios, runtime, 0x000000b0U, 0x0bU, backup_event) == 0U,
+          "B0 _card_info_subfunc crossed from HwCARD into SwCARD");
+
+  require(invokeBios(bios, runtime, 0x000000b0U, 0x58U) == 0U &&
+              invokeBios(bios, runtime, 0x000000b0U, 0x5cU, 0U) == 1U &&
+              invokeBios(bios, runtime, 0x000000b0U, 0x5dU, 0U) == 1U,
+          "Memory Card channel/status/wait frontend mismatch");
+
+  constexpr std::uint32_t raw_source = 0x00003000U;
+  constexpr std::uint32_t raw_destination = 0x00003100U;
+  for (std::uint32_t index{}; index < 0x80U; ++index) {
+    require(runtime.write8(raw_source + index,
+                           static_cast<std::uint8_t>(index ^ 0xa5U)),
+            "Could not initialize the raw Memory Card source sector");
+  }
+  const auto generation = bios.state().memory_card.dirty_generation;
+  require(
+      invokeBios(bios, runtime, 0x000000b0U, 0x4eU, 0U, 0x40U, raw_source) ==
+              1U &&
+          bios.state().memory_card_status == 4U && bios.asyncServicePending() &&
+          bios.serviceAsync() == sf::psx::BiosAsyncServiceResult::progressed &&
+          invokeBios(bios, runtime, 0x000000b0U, 0x0aU, low_event) == 1U &&
+          invokeBios(bios, runtime, 0x000000b0U, 0x0bU, backup_event) == 0U &&
+          bios.state().memory_card.dirty_generation == generation + 1U,
+      "Raw Memory Card write crossed from HwCARD into SwCARD");
+  require(invokeBios(bios, runtime, 0x000000b0U, 0x4fU, 0U, 0x40U,
+                     raw_destination) == 1U &&
+              bios.state().memory_card_status == 2U &&
+              bios.serviceAsync() ==
+                  sf::psx::BiosAsyncServiceResult::progressed,
+          "Raw Memory Card sector read did not complete asynchronously");
+  for (std::uint32_t index{}; index < 0x80U; ++index) {
+    std::uint8_t value{};
+    require(runtime.read8(raw_destination + index, value) &&
+                value == static_cast<std::uint8_t>(index ^ 0xa5U),
+            "Raw Memory Card sector roundtrip mismatch");
+  }
+  require(invokeBios(bios, runtime, 0x000000b0U, 0x4eU, 0U, 0x3fU, 0U) == 1U &&
+              bios.state().memory_card_status == 4U &&
+              bios.serviceAsync() ==
+                  sf::psx::BiosAsyncServiceResult::progressed &&
+              bios.state().memory_card_status == 1U,
+          "Memory Card write-test sector was rejected");
+  require(invokeBios(bios, runtime, 0x000000b0U, 0x4eU, 0U, 0x400U,
+                     raw_source) == 0U,
+          "Out-of-range raw Memory Card sector was accepted");
+
+  const auto disabled_event = invokeBios(bios, runtime, 0x000000b0U, 0x08U,
+                                         0xf0000011U, 4U, 0x2000U, 0U);
+  require(invokeBios(bios, runtime, 0x000000b0U, 0x0aU, disabled_event) == 0U,
+          "WaitEvent did not return zero for a disabled event");
+
+  prepareCall(runtime, 0x000000b0U, 0x50U);
+  require(bios.handleCall() && runtime.state().gpr[2U] == 0U &&
+              runtime.state().pc == 0x80012340U,
+          "_new_card did not complete");
+
   prepareCall(runtime, 0x000000b0U, 0x4cU);
   runtime.setRegister(2U, 0xffffffffU);
   require(bios.handleCall() && !bios.state().memory_card_started &&
@@ -144,16 +247,123 @@ void testBootCalls() {
               runtime.state().pc == 0x80012340U,
           "GetC0Table did not return the retail kernel table address");
 
+  std::uint32_t c0_driver{};
+  std::uint32_t c0_hook_upper{};
+  std::uint32_t c0_hook_lower{};
+  require(runtime.read32(0x00000674U + 0x18U, c0_driver) && c0_driver != 0U &&
+              runtime.read32(c0_driver + 0x70U, c0_hook_upper) &&
+              runtime.read32(c0_driver + 0x74U, c0_hook_lower),
+          "GetC0Table did not expose the libcard driver ABI");
+  const auto c0_hook_table =
+      ((c0_hook_upper & 0xffffU) << 16U) | (c0_hook_lower & 0xffffU);
+  require(c0_hook_table != 0U &&
+              runtime.write32(c0_hook_table + 0x28U, 0x12345678U),
+          "Libcard could not patch the C0 hook table");
+
   prepareCall(runtime, 0x000000b0U, 0x57U);
   require(bios.handleCall() && runtime.state().gpr[2U] == 0x00000874U &&
               runtime.state().pc == 0x80012340U,
           "GetB0Table did not return the retail kernel table address");
+
+  std::uint32_t b0_driver{};
+  constexpr std::array<std::uint32_t, 5U> installed_b0_hook{
+      0x3c08a001U, 0x2508df80U, 0x0100f809U, 0x00000000U, 0x00000000U};
+  require(runtime.read32(0x00000874U + 0x16cU, b0_driver) && b0_driver != 0U &&
+              c0_hook_table > b0_driver + 0x1988U,
+          "GetB0Table did not expose an isolated libcard driver ABI");
+  for (std::size_t word{}; word < installed_b0_hook.size(); ++word) {
+    require(runtime.write32(b0_driver + 0x9c8U +
+                                static_cast<std::uint32_t>(word * 4U),
+                            installed_b0_hook[word]),
+            "Libcard could not install the B0 trampoline");
+  }
+  require(invokeBios(bios, runtime, 0x000000b0U, 0x57U) == 0x00000874U &&
+              runtime.write32(b0_driver + 0x1988U, 0U),
+          "Repeated GetB0Table failed after the libcard patch");
+  for (std::size_t word{}; word < installed_b0_hook.size(); ++word) {
+    std::uint32_t actual{};
+    require(runtime.read32(b0_driver + 0x9c8U +
+                               static_cast<std::uint32_t>(word * 4U),
+                           actual) &&
+                actual == installed_b0_hook[word],
+            "Repeated GetB0Table destroyed the installed B0 trampoline");
+  }
+  std::uint32_t installed_c0_hook{};
+  require(runtime.read32(c0_hook_table + 0x28U, installed_c0_hook) &&
+              installed_c0_hook == 0x12345678U,
+          "Repeated GetB0Table destroyed the installed C0 trampoline");
+  std::uint32_t low_vector_guard{};
+  require(runtime.read32(0x28U, low_vector_guard) && low_vector_guard == 0U,
+          "Libcard hook discovery still aliases the low exception vectors");
+
+  constexpr std::uint32_t prior_device_table = 0x00004000U;
+  constexpr std::uint32_t prior_device_name = 0x00004100U;
+  constexpr std::uint32_t device_stride = 0x50U;
+  writeCString(runtime, prior_device_name, "cdrom");
+  for (std::uint32_t word{}; word < device_stride / 4U; ++word) {
+    require(runtime.write32(prior_device_table + word * 4U, 0xa5000000U | word),
+            "Existing BIOS device fixture setup failed");
+  }
+  require(runtime.write32(prior_device_table, prior_device_name) &&
+              runtime.write32(0x00000150U, prior_device_table) &&
+              runtime.write32(0x00000154U, device_stride),
+          "BIOS device table fixture setup failed");
 
   prepareCall(runtime, 0x000000a0U, 0x70U);
   require(bios.handleCall() &&
               bios.state().memory_card_filesystem_initialized &&
               runtime.state().pc == 0x80012340U,
           "_bu_init did not initialize the Memory Card file system");
+
+  std::uint32_t installed_device_table{};
+  std::uint32_t installed_device_bytes{};
+  require(runtime.read32(0x00000150U, installed_device_table) &&
+              runtime.read32(0x00000154U, installed_device_bytes) &&
+              installed_device_table != prior_device_table &&
+              installed_device_bytes == device_stride * 2U,
+          "_bu_init did not register the backup-unit device");
+  for (std::uint32_t word{}; word < device_stride / 4U; ++word) {
+    std::uint32_t value{};
+    const auto expected = word == 0U ? prior_device_name : 0xa5000000U | word;
+    require(runtime.read32(installed_device_table + word * 4U, value) &&
+                value == expected,
+            "_bu_init damaged an existing BIOS device descriptor");
+  }
+
+  const auto backup_unit = installed_device_table + device_stride;
+  std::uint32_t backup_unit_name{};
+  std::uint32_t firstfile_stub{};
+  std::uint32_t nextfile_stub{};
+  require(runtime.read32(backup_unit, backup_unit_name) &&
+              runtime.read32(backup_unit + 0x30U, firstfile_stub) &&
+              runtime.read32(backup_unit + 0x34U, nextfile_stub) &&
+              backup_unit_name != 0U && firstfile_stub != 0U &&
+              nextfile_stub != 0U,
+          "Backup-unit descriptor is incomplete");
+  constexpr std::array<std::uint8_t, 3U> expected_name{'b', 'u', 0U};
+  for (std::size_t character{}; character < expected_name.size(); ++character) {
+    std::uint8_t value{};
+    require(
+        runtime.read8(backup_unit_name + static_cast<std::uint32_t>(character),
+                      value) &&
+            value == expected_name[character],
+        "Backup-unit device name mismatch");
+  }
+  std::uint32_t firstfile_call{};
+  std::uint32_t nextfile_call{};
+  require(runtime.read32(firstfile_stub + 8U, firstfile_call) &&
+              runtime.read32(nextfile_stub + 8U, nextfile_call) &&
+              firstfile_call == 0x24090042U && nextfile_call == 0x24090043U,
+          "Backup-unit directory stubs target the wrong BIOS calls");
+
+  const auto stable_device_table = installed_device_table;
+  prepareCall(runtime, 0x000000a0U, 0x70U);
+  require(bios.handleCall() &&
+              runtime.read32(0x00000150U, installed_device_table) &&
+              runtime.read32(0x00000154U, installed_device_bytes) &&
+              installed_device_table == stable_device_table &&
+              installed_device_bytes == device_stride * 2U,
+          "Repeated _bu_init duplicated the backup-unit device");
 
   prepareCall(runtime, 0x000000a0U, 0x72U);
   require(bios.handleCall(), "_96_remove was not handled");
@@ -233,22 +443,24 @@ void testMemoryCardFiles() {
   };
   const auto backup_event = open_mark_event(0xf4000001U);
   const auto file_event = open_mark_event(async_descriptor);
+  const auto hardware_card_event = open_mark_event(0xf0000011U);
   require(bios.serviceAsync() == sf::psx::BiosAsyncServiceResult::progressed &&
               bios.state().memory_card.pending.kind ==
                   sf::psx::MemoryCardPendingKind::none &&
               bios.state().memory_card.descriptors[async_descriptor].offset ==
                   0x80U,
           "Async Memory Card write did not complete at the service point");
-  require(invokeBios(bios, runtime, b0, 0x0bU, backup_event) == 1U &&
-              invokeBios(bios, runtime, b0, 0x0bU, file_event) == 1U,
-          "Async Memory Card success events were not delivered");
+  require(invokeBios(bios, runtime, b0, 0x0bU, file_event) == 1U &&
+              invokeBios(bios, runtime, b0, 0x0bU, backup_event) == 1U,
+          "Async Memory Card success did not notify file and SwCARD events");
 
   for (std::uint32_t index{}; index < 0x28U; ++index) {
     require(runtime.write8(directory_entry + index, 0xccU),
             "DIRENTRY sentinel setup failed");
   }
   require(invokeBios(bios, runtime, b0, 0x42U, pattern_path, directory_entry) ==
-              directory_entry,
+                  directory_entry &&
+              invokeBios(bios, runtime, b0, 0x0bU, hardware_card_event) == 1U,
           "Memory Card firstfile did not find the save");
   for (std::size_t index{}; index < 14U; ++index) {
     std::uint8_t value{};
@@ -271,7 +483,8 @@ void testMemoryCardFiles() {
               lba == 0x40U && untouched_next == 0xccccccccU &&
               untouched_fourcc == 0xccccccccU,
           "Memory Card DIRENTRY layout mismatch");
-  require(invokeBios(bios, runtime, b0, 0x43U, directory_entry) == 0U,
+  require(invokeBios(bios, runtime, b0, 0x43U, directory_entry) == 0U &&
+              invokeBios(bios, runtime, b0, 0x0bU, hardware_card_event) == 1U,
           "Memory Card nextfile did not report enumeration exhaustion");
 
   auto invalid_state = bios.state().memory_card;
@@ -359,10 +572,10 @@ void testMemoryCardCommitRollback() {
               commit_count == commits_before_async + 1U &&
               bios.state().memory_card == expected_after_failure,
           "Failed async Memory Card commit was not rolled back");
-  require(invokeBios(bios, runtime, b0, 0x0bU, low_error) == 1U &&
+  require(invokeBios(bios, runtime, b0, 0x0bU, backup_error) == 1U &&
               invokeBios(bios, runtime, b0, 0x0bU, file_error) == 1U &&
-              invokeBios(bios, runtime, b0, 0x0bU, backup_error) == 1U,
-          "Failed async Memory Card commit did not deliver error events");
+              invokeBios(bios, runtime, b0, 0x0bU, low_error) == 0U,
+          "Failed async Memory Card commit did not notify file and SwCARD");
 }
 
 void testEventCallbackDispatch() {
@@ -545,6 +758,26 @@ void testEventCalls() {
               runtime.read32(event_table + 4U, stored_status) &&
               stored_status == 0x2000U,
           "WaitEvent did not complete DMA4 and re-arm the SPU EvCB");
+
+  require(runtime.write32(dma_source, 0x04030201U) &&
+              runtime.write32(dma_source + 4U, 0x08070605U) &&
+              runtime.write32(dma_source + 8U, 0x0c0b0a09U) &&
+              runtime.write16(spu_transfer_address, 0U) &&
+              runtime.write32(dma4_base, dma_source) &&
+              runtime.write32(dma4_base + 4U, 0x00030001U) &&
+              runtime.write32(dma4_base + 8U, 0x01000201U) &&
+              machine.dmaCompletionTick(sf::psx::DmaChannel::spu),
+          "Could not schedule the multi-block SPU WaitEvent fixture");
+
+  prepareCall(runtime, 0x000000b0U, 0x0aU);
+  runtime.setRegister(4U, 0xf1000000U);
+  require(bios.handleCall() && runtime.state().gpr[2U] == 1U &&
+              !machine.dmaCompletionTick(sf::psx::DmaChannel::spu) &&
+              machine.spu().ram()[0] == std::byte{0x01U} &&
+              machine.spu().ram()[11] == std::byte{0x0cU} &&
+              runtime.read32(event_table + 4U, stored_status) &&
+              stored_status == 0x2000U,
+          "WaitEvent stopped before multi-block DMA4 completed");
 }
 
 void testDisableEventContract() {
@@ -624,12 +857,14 @@ void testControllerSio() {
 
   constexpr std::array<std::uint8_t, 4U> neutral_axes{0x80U, 0x80U, 0x80U,
                                                       0x80U};
-  require(machine.controllerSio().analog == neutral_axes,
+  require(machine.controllerSio().ports[0U].analog == neutral_axes,
           "Controller SIO axes did not reset to neutral");
 
-  const auto select_controller = [&] {
+  const auto select_controller = [&](std::size_t port = 0U) {
+    const auto control = static_cast<std::uint16_t>(
+        0x0003U | (static_cast<std::uint16_t>(port) << 13U));
     require(runtime.write16(0x1f80104aU, 0x0000U) &&
-                runtime.write16(0x1f80104aU, 0x0003U),
+                runtime.write16(0x1f80104aU, control),
             "Controller SIO select failed");
   };
   const auto exchange = [&](std::uint8_t command) {
@@ -652,9 +887,9 @@ void testControllerSio() {
     return response;
   };
   const auto transaction = [&](const auto &request, const auto &expected,
-                               const char *message) {
+                               const char *message, std::size_t port = 0U) {
     require(request.size() == expected.size(), message);
-    select_controller();
+    select_controller(port);
     for (std::size_t index = 0U; index < request.size(); ++index) {
       require(exchange(request[index]) == expected[index], message);
     }
@@ -755,7 +990,7 @@ void testControllerSio() {
   transaction(std::array<std::uint8_t, 5U>{0x01U, 0x43U, 0x00U, 0x01U, 0x00U},
               std::array<std::uint8_t, 5U>{0xffU, 0x41U, 0x5aU, 0xfeU, 0xffU},
               "Controller SIO config-entry mismatch");
-  require(machine.controllerSio().configuration_mode,
+  require(machine.controllerSio().ports[0U].configuration_mode,
           "Controller SIO did not enter config mode");
 
   constexpr std::array<std::uint8_t, 9U> config_poll_request{
@@ -820,8 +1055,8 @@ void testControllerSio() {
       0x01U, 0x43U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U};
   transaction(config_request, config_response,
               "Controller SIO analog-mode command mismatch");
-  require(machine.controllerSio().analog_mode &&
-              machine.controllerSio().analog_locked,
+  require(machine.controllerSio().ports[0U].analog_mode &&
+              machine.controllerSio().ports[0U].analog_locked,
           "Controller SIO did not enable and lock analog mode");
 
   constexpr std::array<std::uint8_t, 9U> mode_query_request{
@@ -833,7 +1068,7 @@ void testControllerSio() {
 
   transaction(config_exit_request, config_response,
               "Controller SIO config-exit mismatch");
-  require(!machine.controllerSio().configuration_mode,
+  require(!machine.controllerSio().ports[0U].configuration_mode,
           "Controller SIO did not leave config mode");
 
   constexpr std::array<std::uint8_t, 4U> analog_axes{0x10U, 0x20U, 0x30U,
@@ -868,14 +1103,24 @@ void testControllerSio() {
       0x01U, 0x44U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U};
   transaction(digital_mode_request, config_response,
               "Controller SIO digital-mode command mismatch");
-  require(!machine.controllerSio().analog_mode &&
-              !machine.controllerSio().analog_locked,
+  require(!machine.controllerSio().ports[0U].analog_mode &&
+              !machine.controllerSio().ports[0U].analog_locked,
           "Controller SIO did not disable and unlock analog mode");
   transaction(config_exit_request, config_response,
               "Controller SIO digital config-exit mismatch");
   transaction(std::array<std::uint8_t, 5U>{0x01U, 0x42U, 0x00U, 0x00U, 0x00U},
               std::array<std::uint8_t, 5U>{0xffU, 0x41U, 0x5aU, 0x36U, 0x12U},
               "Controller SIO post-config digital poll mismatch");
+
+  constexpr std::array<std::uint8_t, 4U> second_axes{0x11U, 0x22U, 0x33U,
+                                                     0x44U};
+  machine.setControllerState(1U, 0x55f8U, second_axes, true);
+  transaction(std::array<std::uint8_t, 5U>{0x01U, 0x42U, 0x00U, 0x00U, 0x00U},
+              std::array<std::uint8_t, 5U>{0xffU, 0x41U, 0x5aU, 0xfeU, 0x55U},
+              "Controller SIO second-port digital poll mismatch", 1U);
+  require(machine.controllerSio().ports[0U].buttons == 0x1234U &&
+              machine.controllerSio().ports[1U].buttons == 0x55f8U,
+          "Controller SIO ports leaked input state");
 
   std::uint16_t status{};
   require(runtime.read16(0x1f801044U, status) && (status & 0x0002U) == 0U,
@@ -1080,6 +1325,113 @@ void testHookedInterruptDispatch() {
           "ReturnFromException did not restore interrupted CPU");
 }
 
+void testMemoryCardGuestTiming() {
+  sf::psx::R3000Runtime runtime;
+  sf::psx::PsxMachine machine{runtime};
+  sf::psx::BiosHle bios{runtime, &machine};
+
+  require(invokeBios(bios, runtime, 0x000000b0U, 0x4aU, 1U) == 0U &&
+              invokeBios(bios, runtime, 0x000000b0U, 0x4bU) == 1U,
+          "Memory Card timing fixture did not start the driver");
+  const auto event = invokeBios(bios, runtime, 0x000000b0U, 0x08U, 0xf4000001U,
+                                4U, 0x2000U, 0U);
+  require(invokeBios(bios, runtime, 0x000000b0U, 0x0cU, event) == 1U,
+          "Memory Card timing fixture could not enable SwCARD");
+
+  require(invokeBios(bios, runtime, 0x000000a0U, 0xabU) == 1U &&
+              bios.state().memory_card_operation ==
+                  sf::psx::BiosMemoryCardOperation::info &&
+              bios.serviceAsync() == sf::psx::BiosAsyncServiceResult::idle,
+          "Memory Card info completed before its wire interval");
+  const auto ticks = bios.asyncServiceTicksRemaining();
+  require(ticks > 1U,
+          "Memory Card info did not expose a scheduled guest interval");
+
+  machine.advanceTicks(ticks - 1U);
+  require(bios.asyncServiceTicksRemaining() == 1U &&
+              bios.serviceAsync() == sf::psx::BiosAsyncServiceResult::idle &&
+              invokeBios(bios, runtime, 0x000000b0U, 0x0bU, event) == 0U,
+          "Memory Card event became visible before the final ACK tick");
+  machine.advanceTicks(1U);
+  require(bios.serviceAsync() == sf::psx::BiosAsyncServiceResult::progressed &&
+              bios.state().memory_card_operation ==
+                  sf::psx::BiosMemoryCardOperation::none &&
+              bios.state().memory_card_submissions == 1U &&
+              bios.state().memory_card_completions == 1U &&
+              invokeBios(bios, runtime, 0x000000b0U, 0x0bU, event) == 1U,
+          "Memory Card event did not complete on the final ACK tick");
+}
+
+void testSecondMemoryCardSlot() {
+  sf::psx::R3000Runtime runtime;
+  std::array<std::size_t, 2U> commits{};
+  sf::psx::BiosHle bios{runtime, nullptr,
+                        [&](const sf::psx::MemoryCardHleState &) {
+                          ++commits[0U];
+                          return true;
+                        },
+                        [&](const sf::psx::MemoryCardHleState &) {
+                          ++commits[1U];
+                          return true;
+                        }};
+  constexpr std::uint32_t b0 = 0x000000b0U;
+  constexpr std::uint32_t slot_1_path = 0x00007000U;
+  constexpr std::uint32_t slot_2_path = 0x00007100U;
+  constexpr std::uint32_t slot_2_pattern = 0x00007200U;
+  constexpr std::uint32_t source = 0x00007300U;
+  constexpr std::uint32_t destination = 0x00007400U;
+  constexpr std::uint32_t directory_entry = 0x00007500U;
+
+  writeCString(runtime, slot_1_path, "bu00:BASLUS-01270S");
+  writeCString(runtime, slot_2_path, "bu10:BASLUS-01270S");
+  writeCString(runtime, slot_2_pattern, "bu10:BASLUS-01270*");
+  const auto slot_1_descriptor =
+      invokeBios(bios, runtime, b0, 0x32U, slot_1_path, 0x00010203U);
+  const auto slot_2_descriptor =
+      invokeBios(bios, runtime, b0, 0x32U, slot_2_path, 0x00010203U);
+  require(slot_1_descriptor == 2U && slot_2_descriptor == 9U &&
+              commits == std::array<std::size_t, 2U>{1U, 1U},
+          "Memory Card slots did not allocate independent descriptors");
+  require(sf::psx::MemoryCardHle::validateState(bios.state().memory_card, 0U) &&
+              sf::psx::MemoryCardHle::validateState(
+                  bios.state().memory_card_slot_2, 1U),
+          "Memory Card slot descriptor ownership is invalid");
+
+  for (std::uint32_t index{}; index < 0x80U; ++index) {
+    require(runtime.write8(source + index,
+                           static_cast<std::uint8_t>(index ^ 0x3cU)),
+            "Second Memory Card source setup failed");
+  }
+  require(invokeBios(bios, runtime, b0, 0x35U, slot_2_descriptor, source,
+                     0x80U) == 0x80U &&
+              commits == std::array<std::size_t, 2U>{1U, 2U} &&
+              invokeBios(bios, runtime, b0, 0x33U, slot_2_descriptor, 0U, 0U) ==
+                  0U &&
+              invokeBios(bios, runtime, b0, 0x34U, slot_2_descriptor,
+                         destination, 0x80U) == 0x80U,
+          "Second Memory Card I/O crossed into the first slot");
+  for (std::uint32_t index{}; index < 0x80U; ++index) {
+    std::uint8_t value{};
+    require(runtime.read8(destination + index, value) &&
+                value == static_cast<std::uint8_t>(index ^ 0x3cU),
+            "Second Memory Card readback mismatch");
+  }
+  require(invokeBios(bios, runtime, b0, 0x42U, slot_2_pattern,
+                     directory_entry) == directory_entry &&
+              bios.state().memory_card_slot_2.find.active,
+          "Second Memory Card directory search used the wrong slot");
+
+  require(invokeBios(bios, runtime, b0, 0x4aU, 1U) == 0U &&
+              invokeBios(bios, runtime, b0, 0x4bU) == 1U &&
+              invokeBios(bios, runtime, 0x000000a0U, 0xabU, 0x10U) == 1U &&
+              bios.state().memory_card_slot_2_status == 2U &&
+              bios.serviceAsync() ==
+                  sf::psx::BiosAsyncServiceResult::progressed &&
+              bios.state().memory_card_slot_2_status == 1U &&
+              invokeBios(bios, runtime, b0, 0x5cU, 1U) == 1U,
+          "Second Memory Card hardware channel was not exposed");
+}
+
 void testUnsupportedCall() {
   sf::psx::R3000Runtime runtime;
   sf::psx::BiosHle bios{runtime};
@@ -1100,12 +1452,14 @@ int main() {
     testMemoryCardCommitRollback();
     testGpuCommand();
     testEventCalls();
+    testSecondMemoryCardSlot();
     testDisableEventContract();
     testEventCallbackDispatch();
     testCriticalSections();
     testControllerSio();
     testInterruptDispatch();
     testHookedInterruptDispatch();
+    testMemoryCardGuestTiming();
     testUnsupportedCall();
     std::cout << "BIOS HLE tests passed\n";
     return 0;

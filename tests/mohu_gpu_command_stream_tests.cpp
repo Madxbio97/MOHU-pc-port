@@ -107,7 +107,14 @@ void testLazyTransferSidecars() {
   require(gpu.frameWords().size() == upload.size() &&
               gpu.frameProjectionIdentities().empty() &&
               gpu.frameDmaSources().empty() && aligned(gpu),
-          "CPU-to-VRAM payload retained an unused provenance sidecar");
+          "CPU-to-VRAM-only stream retained an unused provenance sidecar");
+
+  require(gpu.writeGp0FromRam(0xe1000000U, dma_source, nullptr, 0U),
+          "Post-upload GP0 provenance capture failed");
+  require(gpu.frameDmaSources().size() == gpu.frameWords().size() &&
+              gpu.frameDmaSources().back().valid() &&
+              !gpu.frameDmaSources().front().valid() && aligned(gpu),
+          "CPU-to-VRAM payload permanently disabled later provenance");
 
   gpu.beginFrame();
   constexpr std::array fill_with_upload_lookalike{0x02000000U, 0xa0000000U,
@@ -130,15 +137,22 @@ void testLazyTransferSidecars() {
 void testControlCommands() {
   mohu::GpuCommandStream gpu;
   gpu.writeGp1(0x03000001U);
-  require(!gpu.displayState().enabled && (gpu.readStatus() & (1U << 23U)) != 0U,
-          "GP1 display disable mismatch");
+  require(!gpu.displayState().enabled &&
+              (gpu.readStatus() & (1U << 23U)) != 0U &&
+              gpu.displayPublicationSequence() == 1U,
+          "GP1 display disable publication mismatch");
   gpu.writeGp1(0x05019040U);
-  require(gpu.displayState().x == 64U && gpu.displayState().y == 100U,
+  require(gpu.displayState().x == 64U && gpu.displayState().y == 100U &&
+              gpu.displayPublicationSequence() == 2U,
           "GP1 display origin mismatch");
+  gpu.writeGp1(0x05019040U);
+  require(gpu.displayPublicationSequence() == 3U,
+          "Repeated GP1 display origin did not publish a new frame");
   gpu.writeGp1(0x08000035U);
   require(gpu.displayState().width == 320U &&
               gpu.displayState().height == 480U && gpu.displayState().rgb24 &&
-              gpu.displayState().interlaced,
+              gpu.displayState().interlaced &&
+              gpu.displayPublicationSequence() == 4U,
           "GP1 display mode mismatch");
   gpu.writeGp1(0x04000002U);
   require(((gpu.readStatus() >> 29U) & 3U) == 2U &&
@@ -153,12 +167,43 @@ void testControlCommands() {
   gpu.writeGp1(0x00000000U);
   require(gpu.commandBufferEpoch() == 2U && gpu.readStatus() == 0x14802000U &&
               gpu.displayState().enabled && gpu.displayState().width == 256U &&
-              gpu.displayState().height == 240U,
+              gpu.displayState().height == 240U &&
+              gpu.displayPublicationSequence() == 5U,
           "Full GP1 reset mismatch");
 
   std::uint32_t readback{0xffffffffU};
   require(!gpu.readGp0(readback) && readback == 0U,
           "Unsupported VRAM readback mismatch");
+}
+
+void testDisplayPublicationBoundaries() {
+  mohu::GpuCommandStream gpu;
+  gpu.beginFrame();
+  constexpr std::array first_draw{0x20000000U, 0U, 0U, 0U};
+  for (const auto word : first_draw) {
+    require(gpu.writeGp0(word), "First draw capture failed");
+  }
+  gpu.writeGp1(0x05019040U);
+  constexpr std::array second_draw{0x02000000U, 0U, 0x00010001U};
+  for (const auto word : second_draw) {
+    require(gpu.writeGp0(word), "Second draw capture failed");
+  }
+  gpu.writeGp1(0x05032080U);
+
+  const auto publications = gpu.frameDisplayPublications();
+  require(publications.size() == 2U,
+          "GP1 publications were not captured independently");
+  require(publications[0U].word_offset == first_draw.size() &&
+              publications[0U].sequence == 1U &&
+              publications[0U].display.x == 64U &&
+              publications[0U].display.y == 100U,
+          "First GP1 publication boundary mismatch");
+  require(publications[1U].word_offset ==
+                  first_draw.size() + second_draw.size() &&
+              publications[1U].sequence == 2U &&
+              publications[1U].display.x == 128U &&
+              publications[1U].display.y == 200U,
+          "Second GP1 publication boundary mismatch");
 }
 
 void testCommandLengths() {
@@ -181,6 +226,7 @@ int main() {
     testLazyTransferSidecars();
     testProjectionSidecars();
     testControlCommands();
+    testDisplayPublicationBoundaries();
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

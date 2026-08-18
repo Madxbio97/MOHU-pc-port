@@ -24,13 +24,7 @@ struct GteExactState {
   std::array<GteExactComponent, 3> translation{};
   std::array<std::array<GteExactComponent, 3>, 3> vectors{};
   std::array<GteExactComponent, 3> result{};
-  std::array<GteExactComponent, 9> pending_rotation{};
-  std::array<GteExactComponent, 3> pending_translation{};
-  std::array<std::array<GteExactComponent, 3>, 3> pending_vectors{};
   std::array<GteExactComponent, 3> pending_result{};
-  std::uint16_t rotation_mask{};
-  std::uint8_t translation_mask{};
-  std::array<std::uint8_t, 3> vector_masks{};
   std::uint8_t result_mask{};
   std::uint32_t generation{1U};
   std::uint64_t camera_revision{1U};
@@ -73,12 +67,17 @@ struct GteProjectedVertex {
   static constexpr std::uint8_t enhanced_rotation = 1U << 0U;
   static constexpr std::uint8_t enhanced_translation = 1U << 1U;
   static constexpr std::uint8_t enhanced_vector = 1U << 2U;
+  static constexpr std::uint8_t unclamped_view = 1U << 7U;
   std::uint64_t mesh_vertex_id{};
   std::uint64_t transform_lineage{};
   std::uint64_t projection_epoch{};
 
   [[nodiscard]] constexpr bool hasExactTransformProvenance() const noexcept {
     return exact_transform && transform_lineage != 0U && projection_epoch != 0U;
+  }
+
+  [[nodiscard]] constexpr bool hasUnclampedView() const noexcept {
+    return (enhanced_sources & unclamped_view) != 0U;
   }
 
   [[nodiscard]] constexpr bool pgxpEligible() const noexcept {

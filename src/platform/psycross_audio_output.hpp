@@ -5,6 +5,7 @@
 
 #include <AL/al.h>
 #include <AL/alext.h>
+#include <SDL.h>
 
 #include <array>
 #include <atomic>
@@ -54,7 +55,6 @@ public:
   void flush();
   void update();
   void setGainPercent(std::uint8_t percent);
-  void setPlaybackRate(double rate);
   void logDiagnostics(std::string_view context) const noexcept;
   void reset(std::string_view reason = "explicit") noexcept;
 
@@ -69,7 +69,7 @@ private:
   static constexpr std::size_t maximum_callback_producer_batch_frames =
       2U * guest_frames_per_tick;
   static constexpr std::size_t maximum_stream_frames =
-      psx::Spu::sample_rate / 2U;
+      psx::Spu::sample_rate / 10U;
   static constexpr std::size_t maximum_staged_frames =
       psx::Spu::pcm_queue_capacity;
   static constexpr std::size_t restart_fade_frames =
@@ -77,6 +77,11 @@ private:
   void collectProcessed();
   void fillCallbackRing();
   void uploadReadyBuffers(bool flush_partial);
+  [[nodiscard]] bool openRealtimeDevice() noexcept;
+  void queueRealtime(std::span<const psx::SpuPcmFrame> frames) noexcept;
+  static void SDLCALL realtimeCallback(void *user, Uint8 *stream,
+                                       int byte_count) noexcept;
+  void fillRealtime(Uint8 *stream, int byte_count) noexcept;
   void uploadBuffer(std::span<const psx::SpuPcmFrame> frames);
   void compactStaging();
   void recycleProcessedBuffers(ALint processed);
@@ -92,6 +97,9 @@ private:
   std::string diagnostic_name_;
   PsyCrossAudioStreamKind stream_kind_{PsyCrossAudioStreamKind::continuous};
   ALuint source_{};
+  SDL_AudioDeviceID realtime_device_{};
+  SDL_AudioSpec realtime_spec_{};
+  std::atomic<bool> realtime_started_{};
   ALuint callback_buffer_{};
   LPALBUFFERCALLBACKSOFT buffer_callback_{};
   AudioFrameRing<psx::SpuPcmFrame> stream_frames_{maximum_stream_frames};
@@ -103,11 +111,10 @@ private:
   std::vector<ALuint> buffers_;
   std::vector<ALuint> available_;
   std::vector<psx::SpuPcmFrame> staged_frames_;
-  std::vector<psx::SpuPcmFrame> tempo_scratch_;
-  AudioTempoStretcher<psx::SpuPcmFrame> tempo_stretcher_;
   std::vector<psx::SpuPcmFrame> upload_scratch_;
   std::size_t staged_offset_{};
   std::atomic<std::size_t> fade_in_frames_remaining_{};
+  std::atomic<std::uint32_t> software_gain_q16_{1U << 16U};
   std::atomic<std::uint64_t> callback_frames_read_{};
   std::atomic<std::uint64_t> callback_silence_frames_{};
   std::atomic<std::uint64_t> callback_underruns_{};
@@ -119,13 +126,12 @@ private:
   std::uint64_t source_starts_{};
   std::uint64_t source_underruns_{};
   std::uint64_t source_resets_{};
+  std::uint64_t stale_frames_dropped_{};
   std::uint64_t reported_callback_underruns_{};
   bool underrun_latched_{};
   AudioOutputStartPolicy start_policy_{2U};
   AudioOutputRecyclePolicy recycle_policy_{};
   AudioOutputGainPolicy gain_policy_{};
-  double playback_rate_{1.0};
-  bool tempo_control_enabled_{};
 };
 
 enum class PsyCrossUiCue {

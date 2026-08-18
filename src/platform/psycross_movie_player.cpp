@@ -47,6 +47,171 @@ std::uint16_t readButtons(const PADRAW& pad) {
         (static_cast<std::uint16_t>(pad.buttons[1]) << 8U));
 }
 
+class MoviePerformanceDiagnostics final {
+public:
+    explicit MoviePerformanceDiagnostics(std::string_view path) noexcept
+        : path_(path) {
+        const auto* value = SDL_getenv("SF_PERF_DIAGNOSTICS");
+        enabled_ = value != nullptr && value[0] != '\0' &&
+                   std::strcmp(value, "0") != 0;
+        if (enabled_) {
+            frequency_ = SDL_GetPerformanceFrequency();
+            window_started_ = SDL_GetPerformanceCounter();
+        }
+    }
+
+    ~MoviePerformanceDiagnostics() { report(true); }
+
+    MoviePerformanceDiagnostics(const MoviePerformanceDiagnostics&) = delete;
+    MoviePerformanceDiagnostics& operator=(
+        const MoviePerformanceDiagnostics&) = delete;
+
+    [[nodiscard]] std::uint64_t counter() const noexcept {
+        return enabled_ ? SDL_GetPerformanceCounter() : 0U;
+    }
+
+    void addDecode(std::uint64_t started) noexcept {
+        add(started, decode_ticks_, maximum_decode_ticks_);
+    }
+
+    void addUpload(std::uint64_t started) noexcept {
+        add(started, upload_ticks_, maximum_upload_ticks_);
+    }
+
+    void addInput(std::uint64_t started) noexcept {
+        add(started, input_ticks_, maximum_input_ticks_);
+        ++input_calls_;
+    }
+
+    void addAudio(std::uint64_t started) noexcept {
+        add(started, audio_ticks_, maximum_audio_ticks_);
+        ++audio_calls_;
+    }
+
+    void addPresentation(std::uint64_t started, bool cached) noexcept {
+        add(started, presentation_ticks_, maximum_presentation_ticks_);
+        if (cached) {
+            ++cached_presentations_;
+        } else {
+            ++full_presentations_;
+        }
+    }
+
+    void finishFrame(double deadline_seconds, double elapsed_seconds) noexcept {
+        ++video_frames_;
+        const auto lateness = std::max(elapsed_seconds - deadline_seconds, 0.0);
+        maximum_lateness_seconds_ =
+            std::max(maximum_lateness_seconds_, lateness);
+        if (lateness > 0.020) {
+            ++late20ms_frames_;
+        }
+        report(false);
+    }
+
+private:
+    void add(std::uint64_t started, std::uint64_t& total,
+             std::uint64_t& maximum) noexcept {
+        if (started == 0U) {
+            return;
+        }
+        const auto ticks = SDL_GetPerformanceCounter() - started;
+        total += ticks;
+        maximum = std::max(maximum, ticks);
+    }
+
+    [[nodiscard]] double milliseconds(std::uint64_t ticks,
+                                      std::uint64_t divisor) const noexcept {
+        if (frequency_ == 0U || divisor == 0U) {
+            return 0.0;
+        }
+        return static_cast<double>(ticks) * 1'000.0 /
+               (static_cast<double>(frequency_) *
+                static_cast<double>(divisor));
+    }
+
+    void report(bool force) noexcept {
+        if (!enabled_ || frequency_ == 0U || window_started_ == 0U) {
+            return;
+        }
+        const auto now = SDL_GetPerformanceCounter();
+        if (!force && now - window_started_ < frequency_ * 2U) {
+            return;
+        }
+        if (video_frames_ == 0U && decode_ticks_ == 0U) {
+            return;
+        }
+        const auto presentation_calls =
+            full_presentations_ + cached_presentations_;
+        PsyX_Log_Info(
+            "[PerfDiag][movie] path=%.*s frames=%llu "
+            "presents(full/cached)=%llu/%llu late20=%llu max_late_ms=%.3f "
+            "avg_ms(decode/upload/input/audio/present)="
+            "%.3f/%.3f/%.3f/%.3f/%.3f "
+            "max_ms(decode/upload/input/audio/present)="
+            "%.3f/%.3f/%.3f/%.3f/%.3f\n",
+            static_cast<int>(path_.size()), path_.data(),
+            static_cast<unsigned long long>(video_frames_),
+            static_cast<unsigned long long>(full_presentations_),
+            static_cast<unsigned long long>(cached_presentations_),
+            static_cast<unsigned long long>(late20ms_frames_),
+            maximum_lateness_seconds_ * 1'000.0,
+            milliseconds(decode_ticks_, video_frames_),
+            milliseconds(upload_ticks_, video_frames_),
+            milliseconds(input_ticks_, input_calls_),
+            milliseconds(audio_ticks_, audio_calls_),
+            milliseconds(presentation_ticks_, presentation_calls),
+            milliseconds(maximum_decode_ticks_, 1U),
+            milliseconds(maximum_upload_ticks_, 1U),
+            milliseconds(maximum_input_ticks_, 1U),
+            milliseconds(maximum_audio_ticks_, 1U),
+            milliseconds(maximum_presentation_ticks_, 1U));
+        reset(now);
+    }
+
+    void reset(std::uint64_t now) noexcept {
+        video_frames_ = 0U;
+        input_calls_ = 0U;
+        audio_calls_ = 0U;
+        full_presentations_ = 0U;
+        cached_presentations_ = 0U;
+        late20ms_frames_ = 0U;
+        decode_ticks_ = 0U;
+        upload_ticks_ = 0U;
+        input_ticks_ = 0U;
+        audio_ticks_ = 0U;
+        presentation_ticks_ = 0U;
+        maximum_decode_ticks_ = 0U;
+        maximum_upload_ticks_ = 0U;
+        maximum_input_ticks_ = 0U;
+        maximum_audio_ticks_ = 0U;
+        maximum_presentation_ticks_ = 0U;
+        maximum_lateness_seconds_ = 0.0;
+        window_started_ = now;
+    }
+
+    std::string_view path_;
+    bool enabled_{};
+    std::uint64_t frequency_{};
+    std::uint64_t window_started_{};
+    std::uint64_t video_frames_{};
+    std::uint64_t input_calls_{};
+    std::uint64_t audio_calls_{};
+    std::uint64_t full_presentations_{};
+    std::uint64_t cached_presentations_{};
+    std::uint64_t late20ms_frames_{};
+    std::uint64_t decode_ticks_{};
+    std::uint64_t upload_ticks_{};
+    std::uint64_t input_ticks_{};
+    std::uint64_t audio_ticks_{};
+    std::uint64_t presentation_ticks_{};
+    std::uint64_t maximum_decode_ticks_{};
+    std::uint64_t maximum_upload_ticks_{};
+    std::uint64_t maximum_input_ticks_{};
+    std::uint64_t maximum_audio_ticks_{};
+    std::uint64_t maximum_presentation_ticks_{};
+    double maximum_lateness_seconds_{};
+};
+
 void requireAl(const char* operation) {
     const auto error = alGetError();
     if (error != AL_NO_ERROR) {
@@ -580,16 +745,23 @@ bool waitVideoFrame(
     MovieAudioPlayer& audio,
     bool allow_skip,
     std::uint8_t& fade_intensity,
-    bool fade_gameplay_movie) {
+    bool fade_gameplay_movie,
+    MoviePerformanceDiagnostics& diagnostics) {
+    const auto upload_started = diagnostics.counter();
     video_texture.upload(frame);
+    diagnostics.addUpload(upload_started);
     if (!clock.running) {
         clock.start();
         audio.start();
     }
     auto presented_fade = std::optional<std::uint8_t>{};
     do {
+        const auto input_started = diagnostics.counter();
         const auto pressed = updateInput(pad, previous_buttons);
+        diagnostics.addInput(input_started);
+        const auto audio_started = diagnostics.counter();
         audio.update();
+        diagnostics.addAudio(audio_started);
         const auto fade_progress = std::clamp(
             clock.elapsedSeconds() / gameplay_movie_fade_seconds, 0.0, 1.0);
         fade_intensity = static_cast<std::uint8_t>(
@@ -597,16 +769,24 @@ bool waitVideoFrame(
                 ? std::clamp<long>(
                       std::lround((1.0 - fade_progress) * 255.0), 0L, 255L)
                 : 0L);
+        const auto presentation_started = diagnostics.counter();
+        auto cached = false;
         if (!presented_fade || *presented_fade != fade_intensity) {
             presentMovieFrame(video_texture, {}, fade_intensity);
             presented_fade = fade_intensity;
-        } else if (PsyX_PresentCachedFrame() == 0) {
-            presentMovieFrame(video_texture, {}, fade_intensity);
+        } else {
+            cached = PsyX_PresentCachedFrame() != 0;
+            if (!cached) {
+                presentMovieFrame(video_texture, {}, fade_intensity);
+            }
         }
+        diagnostics.addPresentation(presentation_started, cached);
         if (allow_skip && (pressed & skip_buttons) != 0) {
+            diagnostics.finishFrame(end_time_seconds, clock.elapsedSeconds());
             return false;
         }
     } while (clock.elapsedSeconds() < end_time_seconds);
+    diagnostics.finishFrame(end_time_seconds, clock.elapsedSeconds());
     return true;
 }
 
@@ -619,20 +799,31 @@ bool waitOverlayFrame(
     PADRAW& pad,
     std::uint16_t& previous_buttons,
     MovieAudioPlayer& audio,
-    const MovieOverlayCallbacks& overlay) {
+    const MovieOverlayCallbacks& overlay,
+    MoviePerformanceDiagnostics& diagnostics) {
+    const auto upload_started = diagnostics.counter();
     video_texture.upload(frame);
+    diagnostics.addUpload(upload_started);
     if (!clock.running) {
         clock.start();
         audio.start();
     }
     do {
+        const auto input_started = diagnostics.counter();
         const auto pressed = updateInput(pad, previous_buttons);
+        diagnostics.addInput(input_started);
+        const auto audio_started = diagnostics.counter();
         audio.update();
+        diagnostics.addAudio(audio_started);
         if (!overlay.update(pressed, movie_frame)) {
+            diagnostics.finishFrame(end_time_seconds, clock.elapsedSeconds());
             return false;
         }
+        const auto presentation_started = diagnostics.counter();
         presentMovieFrame(video_texture, overlay.draw);
+        diagnostics.addPresentation(presentation_started, false);
     } while (clock.elapsedSeconds() < end_time_seconds);
+    diagnostics.finishFrame(end_time_seconds, clock.elapsedSeconds());
     return true;
 }
 
@@ -734,6 +925,7 @@ bool playMovieData(
     std::uint16_t& previous_buttons,
     bool allow_skip = true,
     bool fade_gameplay_movie = false) {
+    MoviePerformanceDiagnostics diagnostics{path};
     std::cout << "Playing " << path << '\n';
     // OpenAL source state is stream-local.  Reusing a stopped source across
     // consecutive STR files can retain an implementation-defined queue/
@@ -753,7 +945,9 @@ bool playMovieData(
     // safety queue used by the looping frontend stream.
     const std::size_t decoded_ahead_video_frames =
         fade_gameplay_movie ? 1U : 5U;
+    auto decode_started = diagnostics.counter();
     stream.fill(decoded_ahead_video_frames, audio);
+    diagnostics.addDecode(decode_started);
     media::MovieVideoFrame last_frame;
     MovieVideoTexture video_texture;
     MoviePlaybackClock clock;
@@ -776,7 +970,8 @@ bool playMovieData(
                 audio,
                 allow_skip,
                 gameplay_fade_intensity,
-                fade_gameplay_movie)) {
+                fade_gameplay_movie,
+                diagnostics)) {
             audio.reset();
             // A skipped gameplay STR still closes through the same brief
             // authored blackout instead of exposing the resumed world on
@@ -788,7 +983,9 @@ bool playMovieData(
             }
             return false;
         }
+        decode_started = diagnostics.counter();
         stream.fill(decoded_ahead_video_frames, audio);
+        diagnostics.addDecode(decode_started);
     }
     if (has_frame) {
         if (!drainAudio(
@@ -847,6 +1044,7 @@ bool playBackgroundPass(
     PADRAW& pad,
     std::uint16_t& previous_buttons,
     const MovieOverlayCallbacks& overlay) {
+    MoviePerformanceDiagnostics diagnostics{movie.path};
     // TITLE.STR is reopened on every loop, so its audio transport must be
     // reopened too.  This also guarantees sample zero is the loop boundary.
     MovieAudioPlayer audio;
@@ -858,7 +1056,9 @@ bool playBackgroundPass(
             "STR stream has an invalid video frame rate"};
     }
     constexpr std::size_t decoded_ahead_video_frames = 5U;
+    auto decode_started = diagnostics.counter();
     stream.fill(decoded_ahead_video_frames, audio);
+    diagnostics.addDecode(decode_started);
     media::MovieVideoFrame last_frame;
     MovieVideoTexture video_texture;
     MoviePlaybackClock clock;
@@ -868,7 +1068,9 @@ bool playBackgroundPass(
 
     while (stream.hasVideoFrame()) {
         last_frame = stream.takeVideoFrame();
+        decode_started = diagnostics.counter();
         stream.fill(decoded_ahead_video_frames, audio);
+        diagnostics.addDecode(decode_started);
         has_frame = true;
         if (!waitOverlayFrame(
                 last_frame,
@@ -881,7 +1083,8 @@ bool playBackgroundPass(
                 pad,
                 previous_buttons,
                 audio,
-                overlay)) {
+                overlay,
+                diagnostics)) {
             audio.reset();
             return false;
         }

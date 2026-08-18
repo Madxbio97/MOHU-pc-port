@@ -8,18 +8,36 @@ void GpuCommandStream::resetFrameCapture() noexcept {
   frame_projections_.clear();
   frame_projection_identities_.clear();
   frame_dma_sources_.clear();
-  dma_sidecar_disabled_ = false;
   gp0_boundary_state_ = Gp0BoundaryState::command_start;
   gp0_words_remaining_ = 0U;
   gp0_polyline_minimum_remaining_ = 0U;
 }
 
-void GpuCommandStream::beginFrame() noexcept { resetFrameCapture(); }
+void GpuCommandStream::beginFrame() noexcept {
+  resetFrameCapture();
+  frame_display_publications_.clear();
+}
+
+void GpuCommandStream::recordDisplayPublication() noexcept {
+  try {
+    frame_display_publications_.push_back(
+        {.word_offset = frame_words_.size(),
+         .sequence = display_publication_sequence_,
+         .display = display_state_});
+  } catch (...) {
+    frame_display_publications_.clear();
+  }
+}
 
 void GpuCommandStream::advanceGp0Boundary(std::uint32_t value) noexcept {
   switch (gp0_boundary_state_) {
   case Gp0BoundaryState::command_start: {
     const auto opcode = static_cast<std::uint8_t>(value >> 24U);
+    if (opcode >= 0x80U && opcode < 0xa0U) {
+      gp0_boundary_state_ = Gp0BoundaryState::vram_copy_payload;
+      gp0_words_remaining_ = 3U;
+      return;
+    }
     if (opcode >= 0xa0U && opcode < 0xc0U) {
       gp0_boundary_state_ = Gp0BoundaryState::cpu_to_vram_header;
       gp0_words_remaining_ = 2U;
@@ -41,6 +59,7 @@ void GpuCommandStream::advanceGp0Boundary(std::uint32_t value) noexcept {
     return;
   }
   case Gp0BoundaryState::fixed_payload:
+  case Gp0BoundaryState::vram_copy_payload:
   case Gp0BoundaryState::cpu_to_vram_payload:
     if (--gp0_words_remaining_ == 0U) {
       gp0_boundary_state_ = Gp0BoundaryState::command_start;
@@ -77,8 +96,13 @@ bool GpuCommandStream::appendGp0(
   const auto command_start =
       gp0_boundary_state_ == Gp0BoundaryState::command_start;
   const auto opcode = static_cast<std::uint8_t>(value >> 24U);
-  const auto disable_dma_sidecar =
-      command_start && opcode >= 0x80U && opcode < 0xc0U;
+  const auto transfer_word =
+      (command_start && opcode >= 0x80U && opcode < 0xc0U) ||
+      gp0_boundary_state_ == Gp0BoundaryState::vram_copy_payload ||
+      gp0_boundary_state_ == Gp0BoundaryState::cpu_to_vram_header ||
+      gp0_boundary_state_ == Gp0BoundaryState::cpu_to_vram_payload;
+  const auto captured_dma_source =
+      transfer_word ? sf::psx::GpuDmaWordSource{} : dma_source;
   try {
     frame_words_.push_back(value);
     if (projection_tracking_) {
@@ -92,12 +116,11 @@ bool GpuCommandStream::appendGp0(
       }
       frame_projection_identities_.push_back(source_identity);
     }
-    if (!dma_sidecar_disabled_ && !disable_dma_sidecar &&
-        (!frame_dma_sources_.empty() || dma_source.valid())) {
+    if (!frame_dma_sources_.empty() || captured_dma_source.valid()) {
       if (frame_dma_sources_.empty()) {
         frame_dma_sources_.resize(words_size);
       }
-      frame_dma_sources_.push_back(dma_source);
+      frame_dma_sources_.push_back(captured_dma_source);
     }
   } catch (...) {
     while (frame_dma_sources_.size() > sources_size) {
@@ -113,10 +136,6 @@ bool GpuCommandStream::appendGp0(
       frame_words_.pop_back();
     }
     return false;
-  }
-  if (disable_dma_sidecar) {
-    frame_dma_sources_.clear();
-    dma_sidecar_disabled_ = true;
   }
   advanceGp0Boundary(value);
   if (first_word_count_ < first_words_.size()) {
@@ -163,19 +182,31 @@ void GpuCommandStream::writeGp1(std::uint32_t value) noexcept {
     status_ = reset_status;
     display_state_ = {};
     ++command_buffer_epoch_;
+    ++display_publication_sequence_;
     resetFrameCapture();
+    frame_display_publications_.clear();
+    recordDisplayPublication();
     break;
   case 0x01U:
     ++command_buffer_epoch_;
     resetFrameCapture();
+    for (auto &publication : frame_display_publications_) {
+      publication.word_offset = 0U;
+    }
     break;
   case 0x02U:
     status_ &= ~(1U << 24U);
     break;
-  case 0x03U:
+  case 0x03U: {
+    const auto enabled = (value & 1U) == 0U;
     status_ = (status_ & ~(1U << 23U)) | ((value & 1U) << 23U);
-    display_state_.enabled = (value & 1U) == 0U;
+    if (display_state_.enabled != enabled) {
+      display_state_.enabled = enabled;
+      ++display_publication_sequence_;
+      recordDisplayPublication();
+    }
     break;
+  }
   case 0x04U: {
     status_ = (status_ & ~(3U << 29U)) | ((value & 3U) << 29U);
     const auto direction = value & 3U;
@@ -189,8 +220,11 @@ void GpuCommandStream::writeGp1(std::uint32_t value) noexcept {
   case 0x05U:
     display_state_.x = static_cast<std::uint16_t>(value & 0x03ffU);
     display_state_.y = static_cast<std::uint16_t>((value >> 10U) & 0x01ffU);
+    ++display_publication_sequence_;
+    recordDisplayPublication();
     break;
   case 0x08U: {
+    const auto previous = display_state_;
     constexpr std::array<std::uint16_t, 4U> horizontal_resolutions{256U, 320U,
                                                                    512U, 640U};
     display_state_.width =
@@ -203,6 +237,13 @@ void GpuCommandStream::writeGp1(std::uint32_t value) noexcept {
     display_state_.rgb24 = (value & 0x10U) != 0U;
     status_ = (status_ & ~0x007f0000U) | ((value & 0x3fU) << 17U) |
               ((value & 0x40U) << 10U);
+    if (display_state_.width != previous.width ||
+        display_state_.height != previous.height ||
+        display_state_.rgb24 != previous.rgb24 ||
+        display_state_.interlaced != previous.interlaced) {
+      ++display_publication_sequence_;
+      recordDisplayPublication();
+    }
     break;
   }
   default:

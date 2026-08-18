@@ -1,5 +1,4 @@
 #include "sf/platform/host.hpp"
-#include "sf/platform/runtime_presentation_policy.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -52,26 +51,23 @@ void testAntialiasingModesDisableLegacyMsaa() {
           "FXAA did not replace legacy raw-guest MSAA");
 }
 
-void testRuntimePresentationPolicy() {
+void testControllerDeviceRoutes() {
   using namespace sf::platform;
-  RuntimePresentationPolicy policy;
-  require(policy.content() == PresentationContent::authored_4_3,
-          "Runtime presentation did not start in safe authored mode");
-  require(policy.update({512U, 240U, false, false}) ==
-              PresentationContent::authored_4_3,
-          "Ambiguous frontend mode became widescreen");
-  require(policy.update({368U, 240U, false, false}) ==
-              PresentationContent::gameplay,
-          "Stable gameplay display mode did not become adaptive");
-  require(policy.update({512U, 240U, false, false}) ==
-              PresentationContent::gameplay,
-          "One ambiguous frame changed gameplay presentation");
-  require(policy.update({512U, 240U, false, false}) ==
-              PresentationContent::authored_4_3,
-          "Stable frontend transition remained adaptive");
-  require(policy.update({384U, 240U, false, false}) ==
-              PresentationContent::gameplay,
-          "384-wide gameplay mode did not become adaptive");
+  const GraphicsSettings settings;
+  require(settings.controller_device_indices == std::array<int, 2U>{0, 1},
+          "Default controller devices are not routed to distinct players");
+  require(isValidControllerDeviceIndex(disabled_controller_device) &&
+              isValidControllerDeviceIndex(0) &&
+              isValidControllerDeviceIndex(1) &&
+              !isValidControllerDeviceIndex(-2) &&
+              !isValidControllerDeviceIndex(2),
+          "Controller device route validation accepted an invalid index");
+  require(areControllerDeviceRoutesValid({0, 1}) &&
+              areControllerDeviceRoutesValid({disabled_controller_device, 0}) &&
+              areControllerDeviceRoutesValid({1, disabled_controller_device}) &&
+              !areControllerDeviceRoutesValid({0, 0}) &&
+              !areControllerDeviceRoutesValid({1, 2}),
+          "Controller device route validation accepted ambiguous routing");
 }
 
 } // namespace
@@ -79,7 +75,7 @@ void testRuntimePresentationPolicy() {
 int main() {
   testFilteringModesAreMutuallyExclusive();
   testAntialiasingModesDisableLegacyMsaa();
-  testRuntimePresentationPolicy();
+  testControllerDeviceRoutes();
   std::cout << "Graphics settings tests passed\n";
   return 0;
 }

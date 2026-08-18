@@ -12,6 +12,7 @@
 #include <assert.h>
 #include <cmath>
 #include <cstdint>
+#include <stdlib.h>
 #include <string.h>
 #include <vector>
 
@@ -144,6 +145,17 @@ TextureID g_offscreenRTTexture = -1;
 
 TextureID g_whiteTexture = -1;
 TextureID g_lastBoundTexture = -1;
+
+static TextureID g_guestSkyboxTexture = 0;
+static int g_guestSkyboxWidth = 0;
+static int g_guestSkyboxHeight = 0;
+static int g_guestSkyboxEnabled = 0;
+static int g_guestSkyboxCompositeLogged = 0;
+static int g_guestSkyboxCompositeTarget = 0;
+static unsigned long long g_guestSkyboxCompositeCount = 0U;
+static float g_guestSkyboxYaw = 0.0F;
+static float g_guestSkyboxPitch = 0.0F;
+static float g_guestSkyboxVerticalFov = 0.75F;
 
 int g_windowWidth = 0;
 int g_windowHeight = 0;
@@ -284,6 +296,11 @@ static PsyXPresentationViewport PsyX_GetRenderViewport() {
   return PsyX_CalculatePresentationViewport(target.w, target.h,
                                             g_cfg_aspectMode);
 }
+
+#if defined(RENDERER_OGL)
+static void GR_ClearNativePresentationMargins(
+    const PsyXPresentationViewport &viewport);
+#endif
 
 PsyXPresentationScale PsyX_CalculatePresentationScale(int drawableWidth,
                                                       int drawableHeight,
@@ -426,6 +443,25 @@ static bool GR_IsVRAMDirtyRect(const GrVRAMDirtyRows &dirty, int x, int y,
       if ((dirty.rows[row][word] & GR_VRAMDirtyMask(word, x0, x1)) != 0U)
         return true;
   return false;
+}
+
+static bool GR_IsVRAMDirtyRectFullyCovered(const GrVRAMDirtyRows &dirty,
+                                            int x, int y, int w, int h) {
+  const int x0 = std::max(0, x);
+  const int y0 = std::max(0, y);
+  const int x1 = std::min(VRAM_WIDTH, x + w);
+  const int y1 = std::min(VRAM_HEIGHT, y + h);
+  if (x0 >= x1 || y0 >= y1)
+    return false;
+  for (int row = y0; row < y1; ++row) {
+    for (int word = x0 / gr_vram_dirty_word_bits;
+         word <= (x1 - 1) / gr_vram_dirty_word_bits; ++word) {
+      const auto mask = GR_VRAMDirtyMask(word, x0, x1);
+      if ((dirty.rows[row][word] & mask) != mask)
+        return false;
+    }
+  }
+  return true;
 }
 
 namespace {
@@ -927,6 +963,8 @@ static void PsyX_PresentNativeFramebuffer() {
 
   const PsyXPresentationViewport viewport = PsyX_GetPresentationViewport();
   const PsyXPresentationViewport source = PsyX_GetRenderViewport();
+  const GLenum filter =
+      source.w > viewport.w || source.h > viewport.h ? GL_LINEAR : GL_NEAREST;
   const int scissorEnabled = g_PreviousScissorState;
   glDisable(GL_SCISSOR_TEST);
   PsyX_ResolveNativeFramebuffer();
@@ -938,7 +976,7 @@ static void PsyX_PresentNativeFramebuffer() {
   glBlitFramebuffer(source.x, source.y, source.x + source.w,
                     source.y + source.h, viewport.x, viewport.y,
                     viewport.x + viewport.w, viewport.y + viewport.h,
-                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                    GL_COLOR_BUFFER_BIT, filter);
 
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   if (scissorEnabled)
@@ -949,7 +987,8 @@ static void PsyX_PresentNativeFramebuffer() {
 
 #if defined(RENDERER_OGL) || defined(RENDERER_OGLES)
 int GR_InitialiseGLContext(char *windowName, int fullscreen) {
-  int windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE;
+  int windowFlags =
+      SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
 
 #if defined(__ANDROID__)
   windowFlags |= SDL_WINDOW_FULLSCREEN;
@@ -1327,6 +1366,52 @@ static std::array<GrVRAMWriteEvent, GR_VRAM_WRITE_JOURNAL_CAPACITY>
     g_vramWriteJournal{};
 static unsigned long long g_vramWriteSequence = 0;
 
+struct GrMReturnTraceState {
+  unsigned long long generation{};
+  unsigned int loaded_halves{};
+  unsigned int overlapping_writes{};
+};
+
+static GrMReturnTraceState g_mreturnTrace{};
+
+static bool GR_MReturnAtlasOverlap(int x, int y, int width, int height) {
+  return width > 0 && height > 0 && x < 1024 && x + width > 512 && y < 496 &&
+         y + height > 256;
+}
+
+static unsigned long long GR_HashVRAMWords(const unsigned short *words,
+                                           size_t count) {
+  constexpr unsigned long long offset = 14695981039346656037ULL;
+  constexpr unsigned long long prime = 1099511628211ULL;
+  unsigned long long hash = offset;
+  const unsigned char *bytes =
+      reinterpret_cast<const unsigned char *>(words);
+  for (size_t index = 0; index < count * sizeof(unsigned short); ++index) {
+    hash ^= bytes[index];
+    hash *= prime;
+  }
+  return hash;
+}
+
+static int GR_MReturnHalfForUpload(const unsigned short *source, int source_x,
+                                   int source_y, int width, int height,
+                                   int destination_x, int destination_y) {
+  if (source == NULL || source_x != 0 || source_y != 0 || width != 256 ||
+      height != 240 || destination_y != 256 ||
+      (destination_x != 512 && destination_x != 768)) {
+    return -1;
+  }
+  const unsigned long long hash =
+      GR_HashVRAMWords(source, static_cast<size_t>(width) * height);
+  constexpr unsigned long long left_hash = 0xefd0a792df86a948ULL;
+  constexpr unsigned long long right_hash = 0x80ee0f1acb24a942ULL;
+  if (destination_x == 512 && hash == left_hash)
+    return 0;
+  if (destination_x == 768 && hash == right_hash)
+    return 1;
+  return -1;
+}
+
 static void GR_RecordVRAMWrite(int kind, int source_x, int source_y,
                                int destination_x, int destination_y, int width,
                                int height,
@@ -1366,6 +1451,20 @@ static void GR_RecordVRAMWrite(int kind, int source_x, int source_y,
   g_vramWriteJournal[(sequence - 1) % GR_VRAM_WRITE_JOURNAL_CAPACITY] = {
       sequence,      kind,          source_x, source_y,
       destination_x, destination_y, width,    height};
+  if (g_mreturnTrace.generation != 0 &&
+      GR_MReturnAtlasOverlap(destination_x, destination_y, width, height) &&
+      g_mreturnTrace.overlapping_writes < 64U) {
+    ++g_mreturnTrace.overlapping_writes;
+    PsyX_Log_Info(
+        "[MReturnTrace][vram-write] generation=%llu sequence=%llu kind=%d "
+        "source=%d,%d destination=%d,%d size=%dx%d halves=0x%x "
+        "offscreen=%d rect=%d,%d,%d,%d\n",
+        g_mreturnTrace.generation, sequence, kind, source_x, source_y,
+        destination_x, destination_y, width, height,
+        g_mreturnTrace.loaded_halves, g_PreviousOffscreenState,
+        g_PreviousOffscreen.x, g_PreviousOffscreen.y, g_PreviousOffscreen.w,
+        g_PreviousOffscreen.h);
+  }
 }
 
 unsigned long long GR_GetVRAMWriteSequence() { return g_vramWriteSequence; }
@@ -1387,6 +1486,10 @@ int GR_ReadVRAMWriteEvents(unsigned long long after_sequence,
     ++sequence;
   }
   return count;
+}
+
+unsigned long long GR_GetMReturnTraceGeneration(void) {
+  return g_mreturnTrace.loaded_halves == 3U ? g_mreturnTrace.generation : 0U;
 }
 static u_char rgLUT[LUT_WIDTH * LUT_HEIGHT * sizeof(u_int)];
 
@@ -1828,7 +1931,8 @@ static int g_cachedProjection3DValid{};
       "		} else {\n"                                                           \
       "			color = nearestTextureSample(v_texcoord.xy);\n"                      \
       "		}\n"                                                                  \
-      "		vec4 shaded = dither(color * v_color);\n"                             \
+      "		vec4 shaded = dither(color * v_color * "                            \
+      "vec4(v_lighting, 1.0));\n"                                                \
       "		if (textureFilterMode > 0 && textureBlendMode > 0) {\n"               \
       "			shaded.a *= coverage;\n"                                             \
       "			if (textureBlendMode != 1) { shaded.rgb *= coverage; "               \
@@ -1840,16 +1944,17 @@ static int g_cachedProjection3DValid{};
 static const char *gpu_shader_common = R"(
 	varying vec4 v_texcoord;
 	NOPERSPECTIVE varying vec4 v_color;
+	NOPERSPECTIVE varying vec3 v_lighting;
 	FLAT varying vec4 v_page_clut;
 	FLAT varying float v_alias_page;
 	FLAT varying vec4 v_texbounds;
 	varying float v_z;
 	uniform vec4 u_scene_fog_color_enabled;
 	uniform vec4 u_scene_fog_gte;
-	uniform vec2 u_scene_fog_terrain;
+	uniform vec3 u_scene_fog_terrain;
 
 	vec4 applySceneAtmosphere(vec4 source) {
-		if (u_scene_fog_color_enabled.w < 0.5 || v_z <= 0.0)
+		if (v_z <= 0.0)
 			return source;
 		float cameraDepth = v_z * 128.0 / 1.35;
 		float quotient = clamp(
@@ -1859,16 +1964,24 @@ static const char *gpu_shader_common = R"(
 			(u_scene_fog_gte.y + u_scene_fog_gte.x * quotient) /
 				16777216.0,
 			0.0, 1.0);
-		float terrainDistance =
-			floor(floor(cameraDepth + 0.5) * 0.75) -
-			u_scene_fog_terrain.x;
+		float terrainCoordinate = floor(cameraDepth + 0.5) * 0.75;
+		float terrainDistance = terrainCoordinate - u_scene_fog_terrain.x;
 		float terrainFog = clamp(
 			terrainDistance * u_scene_fog_terrain.y, 0.0, 1.0);
 		float retailFog = mix(terrainFog, gteFog, u_scene_fog_gte.w);
-		float onset = smoothstep(0.04, 0.45, retailFog);
-		float air = 1.0 - exp(-sqrt(retailFog) * 0.52);
-		float volume = clamp(onset * air * (1.0 - retailFog), 0.0, 0.16);
-		source.rgb = mix(source.rgb, u_scene_fog_color_enabled.rgb, volume);
+		if (u_scene_fog_color_enabled.w >= 0.5) {
+			float veilFog = 0.0;
+			if (u_scene_fog_terrain.x >= 16.0) {
+				veilFog = smoothstep(u_scene_fog_terrain.x * 0.68,
+					u_scene_fog_terrain.x, terrainCoordinate);
+			}
+			retailFog = max(retailFog, veilFog);
+			float density = max(u_scene_fog_terrain.z, 0.01);
+			float denseFog = 1.0 - pow(max(1.0 - retailFog, 0.0), density);
+			float atmosphere = smoothstep(0.02, 0.80, denseFog);
+			source.rgb = mix(source.rgb, u_scene_fog_color_enabled.rgb,
+				atmosphere);
+		}
 		return source;
 	}
 )";
@@ -1883,7 +1996,8 @@ const char *gpu_shader_32_rgba =
     "		vec2 tc = v_texcoord.xy * texelSize + texelSize * 0.5;\n"
     "		vec4 color = texture2D(s_texture, tc);\n"
     "		if (color.a <= 0.0) discard;\n"
-    "		fragColor = dither(color * v_color);\n"
+    "		fragColor = dither(color * v_color * "
+    "vec4(v_lighting, 1.0));\n"
     "	}\n";
 
 #if USE_PGXP
@@ -1909,6 +2023,7 @@ const char *gpu_shader_32_rgba =
   "	attribute vec4 a_texcoord; // uv, color multiplier, dither\n"              \
   "	attribute vec2 a_precise_uv;\n"                                            \
   "	attribute vec4 a_color;\n"                                                 \
+  "	attribute vec4 a_lighting;\n"                                              \
   "	attribute vec4 a_extra; // texcoord.xy ofs, presentation flag, "           \
   "precise-UV flag\n"                                                          \
   "	attribute vec4 a_texbounds; // inclusive primitive UV bounds\n"            \
@@ -1924,6 +2039,8 @@ const char *gpu_shader_32_rgba =
   "		v_texbounds = a_texbounds;\n"                                             \
   "		v_color = a_color;\n"                                                     \
   "		v_color.xyz *= a_texcoord.z;\n"                                           \
+  "		v_lighting = mix(vec3(1.0), a_lighting.rgb / 128.0, "                  \
+  "step(0.5, a_lighting.a));\n"                                                \
   "		v_alias_page = floor(a_page_clut.x / 1024.0);\n"                          \
   "		float nativePage = mod(a_page_clut.x, 32.0);\n"                           \
   "		float aliasIndex = max(v_alias_page - 1.0, 0.0);\n"                       \
@@ -2102,6 +2219,7 @@ ShaderID GR_Shader_Compile(const char *source, int isPsxShader) {
   glBindAttribLocation(program, a_page_clut, "a_page_clut");
   glBindAttribLocation(program, a_texcoord, "a_texcoord");
   glBindAttribLocation(program, a_color, "a_color");
+  glBindAttribLocation(program, a_lighting, "a_lighting");
   glBindAttribLocation(program, a_extra, "a_extra");
   glBindAttribLocation(program, a_texbounds, "a_texbounds");
   glBindAttribLocation(program, a_precise_uv, "a_precise_uv");
@@ -2211,6 +2329,179 @@ void GR_UpdateRGBATexture(TextureID texture, int width, int height,
 #endif
 }
 
+void GR_SetGuestSkybox(TextureID texture, int width, int height, int enabled) {
+  g_guestSkyboxTexture = texture;
+  g_guestSkyboxWidth = width;
+  g_guestSkyboxHeight = height;
+  g_guestSkyboxEnabled =
+      enabled != 0 && texture != 0 && width > 0 && height > 0;
+  g_guestSkyboxCompositeLogged = 0;
+  if (!g_guestSkyboxEnabled) {
+    g_guestSkyboxCompositeTarget = 0;
+    return;
+  }
+#if USE_OPENGL
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, texture);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  g_lastBoundTexture = 0;
+#endif
+#if defined(RENDERER_OGL)
+  if (g_PreviousOffscreenState && g_activeOffscreenIsRoot)
+    g_guestSkyboxCompositeTarget = 1;
+#endif
+}
+
+void GR_SetGuestSkyboxView(float yaw, float pitch, float verticalFov) {
+  if (!std::isfinite(yaw) || !std::isfinite(pitch) ||
+      !std::isfinite(verticalFov))
+    return;
+  g_guestSkyboxYaw = std::remainder(yaw, 2.0F * 3.14159265358979323846F);
+  g_guestSkyboxPitch = std::max(-1.45F, std::min(pitch, 1.45F));
+  g_guestSkyboxVerticalFov =
+      std::max(0.35F, std::min(verticalFov, 1.75F));
+}
+
+static void GR_CompositeGuestSkybox() {
+  if (!g_guestSkyboxEnabled || !g_guestSkyboxCompositeTarget)
+    return;
+  if (!g_guestSkyboxCompositeLogged) {
+    eprintf("[Skybox] composited=%dx%d order=before-world world_locked=1 "
+            "grid=32x18\n",
+            g_guestSkyboxWidth, g_guestSkyboxHeight);
+    g_guestSkyboxCompositeLogged = 1;
+  }
+  ++g_guestSkyboxCompositeCount;
+
+  const auto viewport_width =
+      static_cast<float>(std::max(g_offscreenTextureWidth, 1));
+  const auto viewport_height =
+      static_cast<float>(std::max(g_offscreenTextureHeight, 1));
+  const auto viewport_aspect = viewport_width / viewport_height;
+  constexpr auto column_count = std::size_t{32U};
+  constexpr auto row_count = std::size_t{18U};
+  std::array<GrVertex, column_count * row_count * 6U> vertices{};
+  const auto sin_yaw = std::sin(g_guestSkyboxYaw);
+  const auto cos_yaw = std::cos(g_guestSkyboxYaw);
+  const auto sin_pitch = std::sin(g_guestSkyboxPitch);
+  const auto cos_pitch = std::cos(g_guestSkyboxPitch);
+  const std::array<float, 3U> forward{sin_yaw * cos_pitch, sin_pitch,
+                                      cos_yaw * cos_pitch};
+  const std::array<float, 3U> right{cos_yaw, 0.0F, -sin_yaw};
+  const std::array<float, 3U> up{-sin_yaw * sin_pitch, cos_pitch,
+                                 -cos_yaw * sin_pitch};
+  const auto tangent = std::tan(g_guestSkyboxVerticalFov * 0.5F);
+  constexpr auto pi = 3.14159265358979323846F;
+  const auto direction = [&](std::size_t column, std::size_t row) {
+    const auto nx = 2.0F * static_cast<float>(column) /
+                        static_cast<float>(column_count) -
+                    1.0F;
+    const auto ny = 1.0F - 2.0F * static_cast<float>(row) /
+                               static_cast<float>(row_count);
+    std::array<float, 3U> value{};
+    for (std::size_t axis{}; axis < value.size(); ++axis) {
+      value[axis] = forward[axis] + right[axis] * nx * viewport_aspect * tangent +
+                    up[axis] * ny * tangent;
+    }
+    const auto inverse_length = 1.0F / std::sqrt(
+        value[0U] * value[0U] + value[1U] * value[1U] +
+        value[2U] * value[2U]);
+    for (auto &component : value)
+      component *= inverse_length;
+    return value;
+  };
+  const auto texture_coordinate = [&](std::size_t column, std::size_t row) {
+    const auto ray = direction(column, row);
+    const auto u = (0.5F + std::atan2(ray[0U], ray[2U]) / (2.0F * pi)) *
+                   static_cast<float>(g_guestSkyboxWidth);
+    const auto clamped_y = std::max(-1.0F, std::min(ray[1U], 1.0F));
+    const auto v =
+        (0.5F + std::asin(clamped_y) / pi) *
+                   static_cast<float>(g_guestSkyboxHeight);
+    return std::array<float, 2U>{u, v};
+  };
+  const auto set_vertex = [&](std::size_t index, std::size_t column,
+                              std::size_t row, float reference_u) {
+    auto &vertex = vertices[index];
+    vertex.x = -0.5F + static_cast<float>(column) /
+                             static_cast<float>(column_count);
+    vertex.y = -0.5F + static_cast<float>(row) /
+                             static_cast<float>(row_count);
+    vertex.bright = 2U;
+    vertex.r = vertex.g = vertex.b = 128U;
+    vertex.a = 255U;
+    vertex._p0 = 1;
+    vertex._p1 = 1;
+    const auto uv = texture_coordinate(column, row);
+    auto u = uv[0U];
+    const auto half_width = static_cast<float>(g_guestSkyboxWidth) * 0.5F;
+    if (u - reference_u > half_width)
+      u -= static_cast<float>(g_guestSkyboxWidth);
+    else if (reference_u - u > half_width)
+      u += static_cast<float>(g_guestSkyboxWidth);
+    vertex.precise_u = u;
+    vertex.precise_v = uv[1U];
+  };
+  auto vertex_index = std::size_t{};
+  const auto emit_triangle = [&](std::array<std::array<std::size_t, 2U>, 3U> p) {
+    const auto reference_u = texture_coordinate(p[0U][0U], p[0U][1U])[0U];
+    for (const auto &point : p)
+      set_vertex(vertex_index++, point[0U], point[1U], reference_u);
+  };
+  for (std::size_t row{}; row < row_count; ++row) {
+    for (std::size_t column{}; column < column_count; ++column) {
+      emit_triangle({{{column, row}, {column, row + 1U},
+                      {column + 1U, row + 1U}}});
+      emit_triangle({{{column, row}, {column + 1U, row + 1U},
+                      {column + 1U, row}}});
+    }
+  }
+
+#if USE_OPENGL
+  const auto scissor_enabled = g_PreviousScissorState;
+  const auto stencil_enabled = glIsEnabled(GL_STENCIL_TEST);
+  if (scissor_enabled)
+    glDisable(GL_SCISSOR_TEST);
+#endif
+  GR_SetDepthState(0, 0);
+  GR_SetBlendMode(BM_NONE);
+#if USE_OPENGL
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  glStencilMask(0U);
+  glDisable(GL_STENCIL_TEST);
+  glDisable(GL_BLEND);
+#endif
+  GR_SetTexture(g_guestSkyboxTexture, TF_32_BIT_RGBA,
+                TEXTURE_FILTER_WORLD_ANISOTROPIC);
+  GR_SetTextureBlendMode(BM_NONE);
+  GR_SetOverrideTextureSize(g_guestSkyboxWidth, g_guestSkyboxHeight);
+  GR_UpdateVertexBuffer(vertices.data(), static_cast<int>(vertices.size()));
+  GR_DrawTriangles(0, static_cast<int>(vertices.size() / 3U));
+  g_PreviousStencilMode = -1;
+#if USE_OPENGL
+  if (scissor_enabled)
+    glEnable(GL_SCISSOR_TEST);
+  if (stencil_enabled)
+    glEnable(GL_STENCIL_TEST);
+  else
+    glDisable(GL_STENCIL_TEST);
+#endif
+}
+
+int GR_CompositeGuestSkyboxBeforeWorld(void) {
+  if (!g_guestSkyboxEnabled || !g_guestSkyboxCompositeTarget)
+    return 0;
+  GR_CompositeGuestSkybox();
+  g_guestSkyboxCompositeTarget = 0;
+  return 1;
+}
+
+unsigned long long GR_GetGuestSkyboxCompositeCount(void) {
+  return g_guestSkyboxCompositeCount;
+}
+
 void GR_CompilePSXShader(PSXGPU_Shader *sh, const char *source) {
   sh->shader = GR_Shader_Compile(source, true);
 
@@ -2277,6 +2568,8 @@ void GR_InitRG8LUT() {
 }
 
 int GR_InitialisePSX() {
+  g_guestSkyboxCompositeCount = 0U;
+  g_guestSkyboxCompositeTarget = 0;
   g_PreviousOffscreenState = 0;
   g_PreviousOffscreen = {0, 0, 0, 0};
   g_PreviousDepthRangeLower = -1.0f;
@@ -2303,6 +2596,7 @@ int GR_InitialisePSX() {
   g_guestRenderLogicalFallback = false;
   g_guestTextureLimitLogged = false;
   g_nextOffscreenIsRoot = true;
+  g_activeOffscreenIsRoot = false;
 #endif
   SDL_memset(vram, 0, VRAM_WIDTH * VRAM_HEIGHT * sizeof(unsigned short));
   SDL_memset(g_vramAliasPages, 0,
@@ -2546,6 +2840,7 @@ int GR_InitialisePSX() {
       glEnableVertexAttribArray(a_page_clut);
       glEnableVertexAttribArray(a_texcoord);
       glEnableVertexAttribArray(a_color);
+      glEnableVertexAttribArray(a_lighting);
       glEnableVertexAttribArray(a_extra);
       glEnableVertexAttribArray(a_texbounds);
       glEnableVertexAttribArray(a_precise_uv);
@@ -2568,6 +2863,9 @@ int GR_InitialisePSX() {
                             sizeof(GrVertex), &((GrVertex *)NULL)->u);
       glVertexAttribPointer(a_color, 4, GL_UNSIGNED_BYTE, GL_TRUE,
                             sizeof(GrVertex), &((GrVertex *)NULL)->r);
+      glVertexAttribPointer(a_lighting, 4, GL_UNSIGNED_BYTE, GL_FALSE,
+                            sizeof(GrVertex),
+                            &((GrVertex *)NULL)->light_r);
       glVertexAttribPointer(a_extra, 4, GL_BYTE, GL_FALSE, sizeof(GrVertex),
                             &((GrVertex *)NULL)->tcx);
       glVertexAttribPointer(a_texbounds, 4, GL_UNSIGNED_BYTE, GL_FALSE,
@@ -2896,7 +3194,7 @@ void GR_SetOverrideTextureSize(int width, int height) {
   if (u_texelSizeLoc == -1)
     return;
 
-  // WebGL is fucking around with glUniform2f, so use vector version
+  // WebGL requires the vector uniform entry point here.
   float vec[] = {1.0f / (float)width, 1.0f / (float)height};
   glUniform2fv(u_texelSizeLoc, 1, vec);
 }
@@ -3372,6 +3670,35 @@ static void GR_CaptureHighResolutionVRAMPage(const RECT16 &rect) {
 #endif
 }
 
+#if defined(RENDERER_OGL)
+static void GR_ClearNativePresentationMargins(
+    const PsyXPresentationViewport &viewport) {
+  if (viewport.x <= 0 && viewport.y <= 0 &&
+      viewport.w >= g_nativeFramebufferWidth &&
+      viewport.h >= g_nativeFramebufferHeight) {
+    return;
+  }
+
+  glEnable(GL_SCISSOR_TEST);
+  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+  const auto clear = [](int x, int y, int width, int height) {
+    if (width <= 0 || height <= 0)
+      return;
+    glScissor(x, y, width, height);
+    glClear(GL_COLOR_BUFFER_BIT);
+  };
+
+  clear(0, 0, viewport.x, g_nativeFramebufferHeight);
+  clear(viewport.x + viewport.w, 0,
+        g_nativeFramebufferWidth - viewport.x - viewport.w,
+        g_nativeFramebufferHeight);
+  clear(0, 0, g_nativeFramebufferWidth, viewport.y);
+  clear(0, viewport.y + viewport.h, g_nativeFramebufferWidth,
+        g_nativeFramebufferHeight - viewport.y - viewport.h);
+  glDisable(GL_SCISSOR_TEST);
+}
+#endif
+
 int GR_HasHighResolutionVRAM(int x, int y, int width, int height) {
   return GR_FindHighResolutionVRAMPage(x, y, width, height) != nullptr;
 }
@@ -3400,6 +3727,7 @@ int GR_PresentHighResolutionVRAM(int x, int y, int width, int height) {
   glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                          GL_TEXTURE_2D, page->texture, 0);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_glNativeFramebuffer);
+  GR_ClearNativePresentationMargins(destination);
   glBlitFramebuffer(source_x0, source_y0, source_x1, source_y1, destination.x,
                     destination.y, destination.x + destination.w,
                     destination.y + destination.h, GL_COLOR_BUFFER_BIT,
@@ -3483,9 +3811,10 @@ static bool GR_EnsureGuestPresentationReplayTarget(int width, int height) {
   return true;
 }
 
-static void GR_ClearGuestPresentationReplayTarget(unsigned char r,
+static void GR_ClearGuestPresentationReplayRegion(unsigned char r,
                                                   unsigned char g,
-                                                  unsigned char b) {
+                                                  unsigned char b, int x, int y,
+                                                  int width, int height) {
   GLboolean color_mask[4]{};
   GLboolean depth_mask{};
   GLint stencil_mask{};
@@ -3499,7 +3828,8 @@ static void GR_ClearGuestPresentationReplayTarget(unsigned char r,
   const GLboolean scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
 
   glBindFramebuffer(GL_FRAMEBUFFER, g_glGuestPresentationReplayFramebuffer);
-  glDisable(GL_SCISSOR_TEST);
+  glEnable(GL_SCISSOR_TEST);
+  glScissor(x, y, width, height);
   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
   glDepthMask(GL_TRUE);
   glStencilMask(0xffU);
@@ -3514,9 +3844,19 @@ static void GR_ClearGuestPresentationReplayTarget(unsigned char r,
   glStencilMask(static_cast<GLuint>(stencil_mask));
   if (scissor_enabled)
     glEnable(GL_SCISSOR_TEST);
+  else
+    glDisable(GL_SCISSOR_TEST);
   glScissor(scissor_box[0], scissor_box[1], scissor_box[2], scissor_box[3]);
   g_PreviousDepthWrite = -1;
   g_PreviousStencilMode = -1;
+}
+
+static void GR_ClearGuestPresentationReplayTarget(unsigned char r,
+                                                  unsigned char g,
+                                                  unsigned char b) {
+  GR_ClearGuestPresentationReplayRegion(r, g, b, 0, 0,
+                                        g_guestPresentationReplayPixelWidth,
+                                        g_guestPresentationReplayPixelHeight);
 }
 #endif
 
@@ -3545,6 +3885,7 @@ int GR_BeginGuestPresentationReplay(const RECT16 *target) {
   g_guestPresentationReplayValid = 0;
   g_guestPresentationReplayClosing = 0;
   g_guestPresentationReplayActive = 1;
+  g_guestSkyboxCompositeTarget = g_guestSkyboxEnabled;
   g_appliedOffscreenProjectionValid = 0;
   GR_SetOffscreenState(target, 1);
   if (!g_PreviousOffscreenState || g_guestPresentationReplayFailed) {
@@ -3576,6 +3917,56 @@ int GR_ClearGuestPresentationReplay(unsigned char r, unsigned char g,
   GR_ClearGuestPresentationReplayTarget(r, g, b);
   return 1;
 #else
+  (void)r;
+  (void)g;
+  (void)b;
+  return 0;
+#endif
+}
+
+int GR_ClearGuestPresentationReplayRect(int x, int y, int width, int height,
+                                        unsigned char r, unsigned char g,
+                                        unsigned char b) {
+#if defined(RENDERER_OGL)
+  if (!g_guestPresentationReplayActive || !g_PreviousOffscreenState ||
+      width <= 0 || height <= 0)
+    return 0;
+  const int target_x0 = g_guestPresentationReplayRect.x;
+  const int target_y0 = g_guestPresentationReplayRect.y;
+  const int target_x1 = target_x0 + g_guestPresentationReplayRect.w;
+  const int target_y1 = target_y0 + g_guestPresentationReplayRect.h;
+  const int clipped_x0 = std::max(x, target_x0);
+  const int clipped_y0 = std::max(y, target_y0);
+  const int clipped_x1 = std::min(x + width, target_x1);
+  const int clipped_y1 = std::min(y + height, target_y1);
+  if (clipped_x0 >= clipped_x1 || clipped_y0 >= clipped_y1)
+    return 1;
+
+  DrawSync(0);
+  if (g_guestPresentationReplayFailed || !g_PreviousOffscreenState)
+    return 0;
+  const int pixel_x0 =
+      GR_MapGuestEdge(clipped_x0 - target_x0, g_guestPresentationReplayRect.w,
+                      g_guestPresentationReplayPixelWidth);
+  const int pixel_x1 =
+      GR_MapGuestEdge(clipped_x1 - target_x0, g_guestPresentationReplayRect.w,
+                      g_guestPresentationReplayPixelWidth);
+  const int pixel_y0 =
+      GR_MapGuestEdge(target_y1 - clipped_y1, g_guestPresentationReplayRect.h,
+                      g_guestPresentationReplayPixelHeight);
+  const int pixel_y1 =
+      GR_MapGuestEdge(target_y1 - clipped_y0, g_guestPresentationReplayRect.h,
+                      g_guestPresentationReplayPixelHeight);
+  if (pixel_x0 >= pixel_x1 || pixel_y0 >= pixel_y1)
+    return 1;
+  GR_ClearGuestPresentationReplayRegion(
+      r, g, b, pixel_x0, pixel_y0, pixel_x1 - pixel_x0, pixel_y1 - pixel_y0);
+  return 1;
+#else
+  (void)x;
+  (void)y;
+  (void)width;
+  (void)height;
   (void)r;
   (void)g;
   (void)b;
@@ -3641,6 +4032,7 @@ int GR_PresentGuestPresentationReplay(int x, int y, int width, int height) {
                     g_glGuestPresentationReplayFramebuffer);
   glReadBuffer(GL_COLOR_ATTACHMENT0);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_glNativeFramebuffer);
+  GR_ClearNativePresentationMargins(destination);
   glBlitFramebuffer(source_x0, source_y0, source_x1, source_y1, destination.x,
                     destination.y, destination.x + destination.w,
                     destination.y + destination.h, GL_COLOR_BUFFER_BIT,
@@ -3728,10 +4120,11 @@ void GR_SetOffscreenState(const RECT16 *offscreenRect, int enable) {
   const GrGuestPixelExtent requested_extent =
       enable && presentation_replay
           ? GrGuestPixelExtent{g_guestPresentationReplayPixelWidth,
-                               g_guestPresentationReplayPixelHeight}
-      : enable ? GR_CalculateOffscreenPixelExtent(*offscreenRect)
-               : GrGuestPixelExtent{std::max(g_offscreenTextureWidth, 1),
-                                    std::max(g_offscreenTextureHeight, 1)};
+                               g_guestPresentationReplayPixelHeight, true}
+      : enable
+          ? GR_CalculateOffscreenPixelExtent(*offscreenRect)
+          : GrGuestPixelExtent{std::max(g_offscreenTextureWidth, 1),
+                               std::max(g_offscreenTextureHeight, 1), false};
 #else
   const GrGuestPixelExtent requested_extent =
       enable ? GR_CalculateOffscreenPixelExtent(*offscreenRect)
@@ -3809,12 +4202,18 @@ void GR_SetOffscreenState(const RECT16 *offscreenRect, int enable) {
     return;
 
   g_PreviousOffscreenState = enable;
+#if defined(RENDERER_OGL)
+  g_activeOffscreenIsRoot =
+      enable && (presentation_replay || requested_extent.root);
+#endif
 
 #if USE_OPENGL
   if (enable) {
 #if defined(RENDERER_OGL)
     if (presentation_replay) {
       g_PreviousOffscreen = *offscreenRect;
+      g_guestSkyboxCompositeTarget =
+          g_guestSkyboxEnabled && g_activeOffscreenIsRoot;
       glBindFramebuffer(GL_FRAMEBUFFER, g_glGuestPresentationReplayFramebuffer);
       glDisable(GL_STENCIL_TEST);
       g_PreviousStencilMode = -1;
@@ -3857,6 +4256,7 @@ void GR_SetOffscreenState(const RECT16 *offscreenRect, int enable) {
                     framebuffer_status, fallback_status, offscreen_pixel_width,
                     offscreen_pixel_height);
           g_PreviousOffscreenState = 0;
+          g_activeOffscreenIsRoot = false;
           g_offscreenTextureCapacityWidth = 0;
           g_offscreenTextureCapacityHeight = 0;
           glBindFramebuffer(GL_FRAMEBUFFER, PsyX_GetNativeDrawFramebuffer());
@@ -3880,6 +4280,8 @@ void GR_SetOffscreenState(const RECT16 *offscreenRect, int enable) {
     g_offscreenTextureWidth = offscreen_pixel_width;
     g_offscreenTextureHeight = offscreen_pixel_height;
     g_PreviousOffscreen = *offscreenRect;
+    g_guestSkyboxCompositeTarget =
+        g_guestSkyboxEnabled && g_activeOffscreenIsRoot;
 
     GR_SeedOffscreenColorFromVRAM(offscreenRect);
     glBindFramebuffer(GL_FRAMEBUFFER, g_glOffscreenFramebuffer);
@@ -3911,6 +4313,7 @@ void GR_SetOffscreenState(const RECT16 *offscreenRect, int enable) {
   } else {
 #if defined(RENDERER_OGL)
     if (presentation_replay) {
+      g_guestSkyboxCompositeTarget = 0;
       glEnable(GL_STENCIL_TEST);
       g_PreviousStencilMode = -1;
       glBindFramebuffer(GL_FRAMEBUFFER, PsyX_GetNativeDrawFramebuffer());
@@ -3981,6 +4384,7 @@ void GR_SetOffscreenState(const RECT16 *offscreenRect, int enable) {
                                  1, 1, 1, false);
 #endif
     GR_CaptureHighResolutionVRAMPage(g_PreviousOffscreen);
+    g_guestSkyboxCompositeTarget = 0;
     if (scissor_enabled)
       glEnable(GL_SCISSOR_TEST);
     glEnable(GL_STENCIL_TEST);
@@ -4062,6 +4466,27 @@ void GR_CopyVRAM(unsigned short *src, int x, int y, int w, int h, int dst_x,
   assert(dst_x + w <= VRAM_WIDTH && dst_y + h <= VRAM_HEIGHT);
 
   const bool internalCopy = src == NULL;
+  const int mreturn_half = internalCopy
+                               ? -1
+                               : GR_MReturnHalfForUpload(src, x, y, w, h,
+                                                         dst_x, dst_y);
+  if (mreturn_half == 0) {
+    ++g_mreturnTrace.generation;
+    if (g_mreturnTrace.generation == 0)
+      ++g_mreturnTrace.generation;
+    g_mreturnTrace.loaded_halves = 1U;
+    g_mreturnTrace.overlapping_writes = 0U;
+  } else if (mreturn_half == 1 && g_mreturnTrace.generation != 0) {
+    g_mreturnTrace.loaded_halves |= 2U;
+  }
+  if (mreturn_half >= 0) {
+    PsyX_Log_Info(
+        "[MReturnTrace][upload] generation=%llu half=%d destination=%d,%d "
+        "size=%dx%d hash=0x%016llx sequence_before=%llu\n",
+        g_mreturnTrace.generation, mreturn_half, dst_x, dst_y, w, h,
+        GR_HashVRAMWords(src, static_cast<size_t>(w) * h),
+        g_vramWriteSequence);
+  }
   if (internalCopy) {
     assert(x + w <= VRAM_WIDTH && y + h <= VRAM_HEIGHT);
     framebuffer_need_update = 1;
@@ -4210,11 +4635,100 @@ void GR_UpdateVRAM() {
 #endif
 }
 
+typedef struct GrSwapPerfDiagnostics {
+  Uint64 frequency;
+  Uint64 window_started;
+  Uint64 calls;
+  Uint64 resize_ticks;
+  Uint64 blit_ticks;
+  Uint64 driver_ticks;
+  Uint64 total_ticks;
+  Uint64 maximum_blit_ticks;
+  Uint64 maximum_driver_ticks;
+  Uint64 maximum_total_ticks;
+} GrSwapPerfDiagnostics;
+
+static GrSwapPerfDiagnostics g_swapPerf;
+
+static int GR_PerfDiagnosticsEnabled() {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char *value = getenv("SF_PERF_DIAGNOSTICS");
+    enabled = value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+  }
+  return enabled;
+}
+
+static double GR_PerfAverageMilliseconds(Uint64 ticks, Uint64 calls) {
+  if (g_swapPerf.frequency == 0U || calls == 0U)
+    return 0.0;
+  return static_cast<double>(ticks) * 1000.0 /
+         (static_cast<double>(g_swapPerf.frequency) *
+          static_cast<double>(calls));
+}
+
+static void GR_PerfAddTicks(Uint64 &total, Uint64 &maximum, Uint64 ticks) {
+  total += ticks;
+  maximum = std::max(maximum, ticks);
+}
+
+static void GR_PerfCompleteSwap(Uint64 now) {
+  if (g_swapPerf.frequency == 0U || g_swapPerf.window_started == 0U ||
+      now - g_swapPerf.window_started < g_swapPerf.frequency * 2U)
+    return;
+
+  PsyX_Log_Info(
+      "[PerfDiag][swap] calls=%llu target=%dx%d window=%dx%d samples=%d "
+      "avg_ms(resize/blit/driver/total)=%.3f/%.3f/%.3f/%.3f "
+      "max_ms(blit/driver/total)=%.3f/%.3f/%.3f\n",
+      static_cast<unsigned long long>(g_swapPerf.calls),
+      g_nativeFramebufferWidth, g_nativeFramebufferHeight, g_windowWidth,
+      g_windowHeight, g_nativeFramebufferSamples,
+      GR_PerfAverageMilliseconds(g_swapPerf.resize_ticks, g_swapPerf.calls),
+      GR_PerfAverageMilliseconds(g_swapPerf.blit_ticks, g_swapPerf.calls),
+      GR_PerfAverageMilliseconds(g_swapPerf.driver_ticks, g_swapPerf.calls),
+      GR_PerfAverageMilliseconds(g_swapPerf.total_ticks, g_swapPerf.calls),
+      GR_PerfAverageMilliseconds(g_swapPerf.maximum_blit_ticks, 1U),
+      GR_PerfAverageMilliseconds(g_swapPerf.maximum_driver_ticks, 1U),
+      GR_PerfAverageMilliseconds(g_swapPerf.maximum_total_ticks, 1U));
+
+  const auto frequency = g_swapPerf.frequency;
+  g_swapPerf = {};
+  g_swapPerf.frequency = frequency;
+  g_swapPerf.window_started = now;
+}
+
 void GR_SwapWindow() {
+  if (!GR_PerfDiagnosticsEnabled()) {
+    PsyX_CommitDrawableSize();
+#if defined(RENDERER_OGL) || defined(RENDERER_OGLES)
+    PsyX_PresentNativeFramebuffer();
+    SDL_GL_SwapWindow(g_window);
+#endif
+    return;
+  }
+
+  if (g_swapPerf.frequency == 0U)
+    g_swapPerf.frequency = SDL_GetPerformanceFrequency();
+  const auto started = SDL_GetPerformanceCounter();
+  if (g_swapPerf.window_started == 0U)
+    g_swapPerf.window_started = started;
   PsyX_CommitDrawableSize();
+  const auto resized = SDL_GetPerformanceCounter();
 #if defined(RENDERER_OGL) || defined(RENDERER_OGLES)
   PsyX_PresentNativeFramebuffer();
+  const auto blitted = SDL_GetPerformanceCounter();
   SDL_GL_SwapWindow(g_window);
+  const auto swapped = SDL_GetPerformanceCounter();
+  g_swapPerf.resize_ticks += resized - started;
+  GR_PerfAddTicks(g_swapPerf.blit_ticks, g_swapPerf.maximum_blit_ticks,
+                  blitted - resized);
+  GR_PerfAddTicks(g_swapPerf.driver_ticks, g_swapPerf.maximum_driver_ticks,
+                  swapped - blitted);
+  GR_PerfAddTicks(g_swapPerf.total_ticks, g_swapPerf.maximum_total_ticks,
+                  swapped - started);
+  ++g_swapPerf.calls;
+  GR_PerfCompleteSwap(swapped);
 #endif
 
   // glFinish();
@@ -4471,6 +4985,20 @@ void GR_UpdateVertexBuffer(const GrVertex *vertices, int num_vertices) {
                GL_STREAM_DRAW);
 #else
 #error
+#endif
+}
+
+void GR_RebindVertexBuffer(unsigned int uploads_ago) {
+#if USE_OPENGL
+  const auto bounded_age =
+      static_cast<int>(uploads_ago % MAX_NUM_VERTEX_BUFFERS);
+  const auto index =
+      (g_curVertexBuffer - 1 - bounded_age + MAX_NUM_VERTEX_BUFFERS) %
+      MAX_NUM_VERTEX_BUFFERS;
+  glBindVertexArray(g_glVertexArray[index]);
+  glBindBuffer(GL_ARRAY_BUFFER, g_glVertexBuffer[index]);
+#else
+  (void)uploads_ago;
 #endif
 }
 

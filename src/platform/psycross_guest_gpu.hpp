@@ -1,7 +1,11 @@
 #pragma once
 
+#include <psx/types.h>
+
+#include "mohu/level_lighting.hpp"
 #include "sf/psx/gpu_dma_source.hpp"
 #include "sf/psx/gte_runtime.hpp"
+#include <PsyX/common/pgxp_defs.h>
 
 #include <array>
 #include <cstddef>
@@ -51,6 +55,7 @@ struct PresentationReplayDrawEvent {
   bool allow_perspective{};
   bool allow_precise_screen{};
   bool use_projective_depth{};
+  std::uint64_t sequence{};
 };
 
 struct PresentationReplayDrawPage {
@@ -88,8 +93,16 @@ struct PresentationReplayDrawPage {
   }
 };
 
+struct PresentationReplayVramWrite {
+  PresentationReplayDrawTarget target{};
+  std::uint64_t sequence{};
+  PresentationReplayDrawTarget source{};
+  std::uint8_t opcode{};
+};
+
 struct PresentationReplayFrame {
   std::uint64_t generation{};
+  std::uint64_t next_sequence{1U};
   std::uint16_t display_x{};
   std::uint16_t display_y{};
   std::uint16_t display_width{};
@@ -98,11 +111,27 @@ struct PresentationReplayFrame {
   bool display_rgb24{};
   bool display_interlaced{};
   bool contains_vram_commands{};
+  std::vector<std::uint64_t> unknown_vram_write_sequences;
+  std::vector<PresentationReplayVramWrite> vram_writes;
+  std::vector<PresentationReplayVramWrite> deferred_clears;
   std::vector<PresentationReplayDrawPage> pages;
+};
+
+struct MissingProjectionDmaDiagnostic {
+  std::uint32_t transfer_root{psx::GpuDmaWordSource::invalid_address};
+  std::uint32_t first_word_address{psx::GpuDmaWordSource::invalid_address};
+  std::uint32_t last_word_address{};
+  std::uint64_t primitives{};
+  std::uint64_t fully_missing_primitives{};
+  std::uint64_t missing_vertices{};
+  std::uint8_t opcode{};
+  psx::GpuDmaSourceKind kind{psx::GpuDmaSourceKind::none};
 };
 
 class PsyCrossGuestGpu final {
 public:
+  static constexpr std::size_t missing_projection_dma_capacity = 128U;
+
   void presentDisplay(std::uint16_t source_x, std::uint16_t source_y,
                       std::uint16_t width, std::uint16_t height, bool enabled,
                       bool rgb24, bool interlaced);
@@ -114,6 +143,9 @@ public:
               std::span<const psx::GpuDmaWordSource> dma_sources = {});
   [[nodiscard]] bool presentInterpolatedDisplay(float alpha);
 
+  void setCampaignLighting(std::uint8_t campaign_level,
+                           std::uint64_t tick) noexcept;
+
   void setPresentationInterpolationEnabled(bool enabled) noexcept {
     if (presentation_interpolation_enabled_ == enabled) {
       return;
@@ -122,8 +154,23 @@ public:
     resetPresentationReplayHistory();
   }
 
+  void setModelAnimationInterpolationEnabled(bool enabled) noexcept {
+    if (model_animation_interpolation_enabled_ == enabled)
+      return;
+    model_animation_interpolation_enabled_ = enabled;
+    setPresentationInterpolationEnabled(enabled);
+  }
+
+  void resetPresentationHistory() noexcept {
+    resetPresentationReplayHistory();
+  }
+
   void setCoherenceEdgeSnapping(bool enabled) noexcept {
     coherence_edge_snapping_enabled_ = enabled;
+  }
+
+  void setCoplanarClippingRecovery(bool enabled) noexcept {
+    coplanar_clipping_recovery_enabled_ = enabled;
   }
 
   void setRuntimeGeometryPolicy(bool coherence_near_only,
@@ -139,6 +186,10 @@ public:
   currentPresentationReplayFrame() const noexcept {
     return current_presentation_replay_frame_;
   }
+  [[nodiscard]] bool selectPendingPresentationReplayPage(
+      std::uint16_t width, std::uint16_t height,
+      PresentationReplayDrawTarget &target) const noexcept;
+
   [[nodiscard]] const PresentationReplayFrame &
   previousPresentationReplayFrame() const noexcept {
     return previous_presentation_replay_frame_;
@@ -163,9 +214,63 @@ public:
   rejectedPresentationReplayFrames() const noexcept {
     return rejected_presentation_replay_frames_;
   }
+  [[nodiscard]] std::uint8_t
+  lastPresentationReplayRejectReason() const noexcept {
+    return last_presentation_replay_reject_reason_;
+  }
   [[nodiscard]] std::uint64_t
   replayedPresentationStateCommands() const noexcept {
     return replayed_presentation_state_commands_;
+  }
+  [[nodiscard]] bool lastPresentationReplayMatchInputValid() const noexcept {
+    return last_presentation_replay_match_input_valid_;
+  }
+  [[nodiscard]] bool
+  lastPresentationReplayRelativeProvenanceProven() const noexcept {
+    return last_presentation_replay_relative_provenance_proven_;
+  }
+  [[nodiscard]] std::size_t
+  lastPresentationReplayPreviousPolygons() const noexcept {
+    return last_presentation_replay_previous_polygons_;
+  }
+  [[nodiscard]] std::size_t
+  lastPresentationReplayCurrentPolygons() const noexcept {
+    return last_presentation_replay_current_polygons_;
+  }
+  [[nodiscard]] std::size_t
+  lastPresentationReplayPreviousRelativePolygons() const noexcept {
+    return last_presentation_replay_previous_relative_polygons_;
+  }
+  [[nodiscard]] std::size_t
+  lastPresentationReplayCurrentRelativePolygons() const noexcept {
+    return last_presentation_replay_current_relative_polygons_;
+  }
+  [[nodiscard]] std::size_t
+  lastPresentationReplayRelativeCommonKeys() const noexcept {
+    return last_presentation_replay_relative_common_keys_;
+  }
+  [[nodiscard]] std::size_t
+  lastPresentationReplayRelativeCandidates() const noexcept {
+    return last_presentation_replay_relative_candidates_;
+  }
+  [[nodiscard]] std::size_t
+  lastPresentationReplayRelativeStaticRejects() const noexcept {
+    return last_presentation_replay_relative_static_rejects_;
+  }
+  [[nodiscard]] std::size_t
+  lastPresentationReplayRelativeTopologyRejects() const noexcept {
+    return last_presentation_replay_relative_topology_rejects_;
+  }
+  [[nodiscard]] std::size_t lastPresentationReplayRawMatches() const noexcept {
+    return last_presentation_replay_raw_matches_;
+  }
+  [[nodiscard]] std::size_t
+  lastPresentationReplayRelativeMatches() const noexcept {
+    return last_presentation_replay_relative_matches_;
+  }
+  [[nodiscard]] std::size_t
+  lastPresentationReplayTotalMatches() const noexcept {
+    return last_presentation_replay_total_matches_;
   }
 
   void setGeometryOptions(bool master, bool perspective_correction,
@@ -339,6 +444,22 @@ public:
                ? missing_projection_by_opcode_[opcode - 0x20U]
                : 0U;
   }
+  [[nodiscard]] std::span<const MissingProjectionDmaDiagnostic>
+  missingProjectionDmaDiagnostics() const noexcept {
+    return missing_projection_dma_diagnostics_;
+  }
+  [[nodiscard]] std::uint64_t
+  missingProjectionDmaUnavailablePrimitives() const noexcept {
+    return missing_projection_dma_unavailable_primitives_;
+  }
+  [[nodiscard]] std::uint64_t
+  missingProjectionDmaMixedPrimitives() const noexcept {
+    return missing_projection_dma_mixed_primitives_;
+  }
+  [[nodiscard]] std::uint64_t
+  missingProjectionDmaOverflowPrimitives() const noexcept {
+    return missing_projection_dma_overflow_primitives_;
+  }
   [[nodiscard]] std::uint64_t highResolutionPresents() const noexcept {
     return high_resolution_presents_;
   }
@@ -388,6 +509,7 @@ private:
     float screen_h{};
     float screen_offset_x{};
     float screen_offset_y{};
+    bool exact_depth{};
     bool valid{};
   };
 
@@ -425,11 +547,19 @@ private:
   [[nodiscard]] bool
   hasFallbackEdge(std::uint32_t first, std::uint32_t second,
                   const PgxpDrawContext &draw_context) const noexcept;
+  void recordMissingProjectionDma(
+      std::uint8_t opcode, std::span<const std::uint32_t> command,
+      std::span<const psx::GteProjectedVertex> projections,
+      std::span<const psx::GpuDmaWordSource> dma_sources) noexcept;
   void dispatch(std::span<const std::uint32_t> command,
                 std::span<const psx::GteProjectedVertex> projections,
                 bool precise_candidate, bool allow_precise,
                 bool allow_precise_screen, bool use_projective_depth,
-                bool record_statistics = true);
+                bool record_statistics = true,
+                const std::array<PGXPVData, 4U> *prepared_vertices = nullptr,
+                std::uint32_t ordering_depth =
+                    psx::GpuDmaWordSource::invalid_ordering_depth,
+                std::uint32_t ordering_span = 0U);
   void clearWrapped(std::uint16_t x, std::uint16_t y, std::uint16_t width,
                     std::uint16_t height, std::uint32_t color);
   void uploadWrapped(std::uint16_t x, std::uint16_t y, std::uint16_t width,
@@ -448,7 +578,8 @@ private:
       std::span<const std::uint32_t> command,
       std::span<const psx::GpuDmaWordSource> dma_sources,
       const PgxpDrawContext &draw_context, std::uint32_t texture_window);
-  void notePresentationReplayVramCommand();
+  void
+  notePresentationReplayVramCommand(std::span<const std::uint32_t> command);
   void promotePresentationReplayFrame(std::uint16_t source_x,
                                       std::uint16_t source_y,
                                       std::uint16_t width, std::uint16_t height,
@@ -456,12 +587,20 @@ private:
                                       bool interlaced);
   void rebuildPresentationReplayPlan();
   void resetPresentationReplayHistory() noexcept;
+  struct PresentationReplayClearReference {
+    std::size_t page{};
+    std::size_t event{};
+  };
   struct PresentationReplayInterpolationPlan {
     static constexpr std::size_t invalid_index = static_cast<std::size_t>(-1);
 
     std::size_t previous_page{invalid_index};
     std::size_t current_page{invalid_index};
     std::vector<std::size_t> previous_projection_for_current_word;
+    std::vector<std::uint8_t> interpolation_mode_for_current_word;
+    std::vector<std::size_t> previous_command_for_current_word;
+    std::vector<PresentationReplayClearReference> current_deferred_clear_events;
+    std::uint8_t previous_frame_age{1U};
     bool ready{};
   };
   std::vector<std::uint32_t> pending_;
@@ -469,6 +608,7 @@ private:
   std::vector<std::uint64_t> pending_projection_identities_;
   std::vector<psx::GpuDmaWordSource> pending_dma_sources_;
   PresentationReplayFrame pending_presentation_replay_frame_;
+  PresentationReplayFrame ancestor_presentation_replay_frame_;
   PresentationReplayFrame previous_presentation_replay_frame_;
   PresentationReplayFrame current_presentation_replay_frame_;
   PresentationReplayInterpolationPlan presentation_replay_plan_;
@@ -479,8 +619,23 @@ private:
   std::uint64_t interpolated_presentation_replay_frames_{};
   std::uint64_t rejected_presentation_replay_frames_{};
   std::uint64_t replayed_presentation_state_commands_{};
+  std::uint8_t last_presentation_replay_reject_reason_{};
+  bool last_presentation_replay_match_input_valid_{};
+  bool last_presentation_replay_relative_provenance_proven_{};
+  std::size_t last_presentation_replay_previous_polygons_{};
+  std::size_t last_presentation_replay_current_polygons_{};
+  std::size_t last_presentation_replay_previous_relative_polygons_{};
+  std::size_t last_presentation_replay_current_relative_polygons_{};
+  std::size_t last_presentation_replay_relative_common_keys_{};
+  std::size_t last_presentation_replay_relative_candidates_{};
+  std::size_t last_presentation_replay_relative_static_rejects_{};
+  std::size_t last_presentation_replay_relative_topology_rejects_{};
+  std::size_t last_presentation_replay_raw_matches_{};
+  std::size_t last_presentation_replay_relative_matches_{};
+  std::size_t last_presentation_replay_total_matches_{};
   std::uint32_t presentation_mask_setting_{};
   bool presentation_interpolation_enabled_{};
+  bool model_animation_interpolation_enabled_{};
   std::vector<CanonicalProjectionEntry> canonical_projection_table_;
   std::uint32_t canonical_projection_generation_{};
   bool canonical_projection_overflow_{};
@@ -503,6 +658,7 @@ private:
   bool coherence_policy_active_{};
   bool coherence_edge_near_only_{};
   bool coherence_edge_snapping_enabled_{};
+  bool coplanar_clipping_recovery_enabled_{};
   bool coherence_near_only_enabled_{};
   bool shared_mesh_canonicalization_enabled_{true};
   bool shared_mesh_prepass_enabled_{true};
@@ -512,6 +668,9 @@ private:
   bool projective_depth_enabled_{true};
   bool quad_recovery_enabled_{};
   bool atomic_fallback_enabled_{true};
+  mohu::LevelLightingFrame level_lighting_{};
+  std::uint8_t level_lighting_campaign_{};
+  bool level_lighting_application_logged_{};
   std::uint64_t command_buffer_epoch_{};
   std::uint64_t submitted_commands_{};
   std::vector<std::uint16_t> transfer_words_;
@@ -563,6 +722,11 @@ private:
   std::uint64_t shared_mesh_synthetic_vertices_{};
   std::uint64_t shared_mesh_packet_fallback_vertices_{};
   std::array<std::uint64_t, 0x20U> missing_projection_by_opcode_{};
+  std::array<MissingProjectionDmaDiagnostic, missing_projection_dma_capacity>
+      missing_projection_dma_diagnostics_{};
+  std::uint64_t missing_projection_dma_unavailable_primitives_{};
+  std::uint64_t missing_projection_dma_mixed_primitives_{};
+  std::uint64_t missing_projection_dma_overflow_primitives_{};
   std::uint64_t high_resolution_presents_{};
   std::uint64_t fallback_presents_{};
 };

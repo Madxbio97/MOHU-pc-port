@@ -287,8 +287,7 @@ bool CdRomController::canReadDmaWords(std::uint64_t word_count) const noexcept {
   return word_count <= available_bytes / sizeof(std::uint32_t);
 }
 
-bool CdRomController::prepareDmaRead(
-    std::uint64_t word_count) noexcept {
+bool CdRomController::prepareDmaRead(std::uint64_t word_count) noexcept {
   // PsyQ's high-level CdRead path forces CdlModeSize1 for its continuity
   // checks, then requests a complete 2048-byte payload without first consuming
   // the 12-byte header. Low-level raw readers consume that header separately,
@@ -296,8 +295,7 @@ bool CdRomController::prepareDmaRead(
   constexpr std::uint64_t psyq_payload_words =
       CdRomMedia::sector_size / sizeof(std::uint32_t);
   if (word_count == psyq_payload_words &&
-      (state_.mode & mode_whole_sector) != 0U &&
-      state_.data_position == 0U &&
+      (state_.mode & mode_whole_sector) != 0U && state_.data_position == 0U &&
       state_.data_end == CdRomState::raw_sector_size) {
     state_.data_position = static_cast<std::uint16_t>(sector_header_size);
   }
@@ -387,8 +385,7 @@ bool CdRomController::validateState(const CdRomState &state) const noexcept {
       state.interrupt_flags > interrupt_error || !byteFlag(state.motor_on) ||
       !byteFlag(state.reading) || !byteFlag(state.seeking) ||
       !byteFlag(state.muted) || !byteFlag(state.adpcm_muted) ||
-      !byteFlag(state.setloc_pending) ||
-      !byteFlag(state.xa_current_set) ||
+      !byteFlag(state.setloc_pending) || !byteFlag(state.xa_current_set) ||
       state.recent_lba_cursor >= state.recent_lbas.size() ||
       state.recent_lba_count > state.recent_lbas.size() ||
       !byteFlag(state.data_valid) || !byteFlag(state.data_requested) ||
@@ -555,8 +552,16 @@ std::uint32_t CdRomController::commandCompletionDelay() const noexcept {
 }
 
 std::uint32_t CdRomController::sectorDelay() const noexcept {
-  return (state_.mode & mode_double_speed) != 0U ? sector_double_speed_ticks
-                                                 : sector_single_speed_ticks;
+  const auto double_speed = (state_.mode & mode_double_speed) != 0U;
+  const auto base =
+      double_speed ? sector_double_speed_ticks : sector_single_speed_ticks;
+  // Match DuckStation's guard: single-speed and XA traffic keep hardware
+  // timing, while double-speed data reads may use the host filesystem.
+  const auto xa_enabled = (state_.mode & mode_xa_adpcm_enabled) != 0U;
+  if (!double_speed || xa_enabled || data_read_speedup_ <= 1U) {
+    return base;
+  }
+  return std::max<std::uint32_t>(1U, base / data_read_speedup_);
 }
 
 bool CdRomController::parametersMatch(std::uint8_t count) const noexcept {
@@ -1008,15 +1013,14 @@ CdRomController::SectorLoadResult CdRomController::loadSector() noexcept {
   state_.recent_lbas[state_.recent_lba_cursor] = state_.current_lba;
   state_.recent_lba_cursor = static_cast<std::uint8_t>(
       (state_.recent_lba_cursor + 1U) % state_.recent_lbas.size());
-  state_.recent_lba_count = static_cast<std::uint8_t>(
-      std::min<std::size_t>(state_.recent_lba_count + 1U,
-                            state_.recent_lbas.size()));
+  state_.recent_lba_count = static_cast<std::uint8_t>(std::min<std::size_t>(
+      state_.recent_lba_count + 1U, state_.recent_lbas.size()));
   ++state_.sectors_read;
   ++state_.current_lba;
 
-  const auto duplicated_subheader = std::equal(
-      raw_sector.begin() + 16U, raw_sector.begin() + 20U,
-      raw_sector.begin() + 20U, raw_sector.begin() + 24U);
+  const auto duplicated_subheader =
+      std::equal(raw_sector.begin() + 16U, raw_sector.begin() + 20U,
+                 raw_sector.begin() + 20U, raw_sector.begin() + 24U);
   const auto file = std::to_integer<std::uint8_t>(raw_sector[16U]);
   const auto channel = std::to_integer<std::uint8_t>(raw_sector[17U]);
   const auto submode = std::to_integer<std::uint8_t>(raw_sector[18U]);
@@ -1035,9 +1039,8 @@ CdRomController::SectorLoadResult CdRomController::loadSector() noexcept {
         // A handful of discs contain junk channel 255 sectors. Hardware-like
         // automatic selection ignores those unless software explicitly asks
         // for channel 255 through Setfilter.
-        if (channel == 0xffU &&
-            ((state_.mode & mode_filter_enabled) == 0U ||
-             state_.filter_channel != 0xffU)) {
+        if (channel == 0xffU && ((state_.mode & mode_filter_enabled) == 0U ||
+                                 state_.filter_channel != 0xffU)) {
           matches_current = false;
         } else {
           state_.xa_current_file = file;
@@ -1059,8 +1062,7 @@ CdRomController::SectorLoadResult CdRomController::loadSector() noexcept {
         }
         if (xa_audio_sink_ != nullptr) {
           xa_audio_sink_->consumeXaSector(
-              raw_sector,
-              state_.muted != 0U || state_.adpcm_muted != 0U);
+              raw_sector, state_.muted != 0U || state_.adpcm_muted != 0U);
         }
       }
     }

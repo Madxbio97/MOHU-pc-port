@@ -783,10 +783,12 @@ void drawPauseDim(const game::PauseRect &bounds) {
 bool drawPauseMenu(const game::PauseMenu &menu,
                    const PauseTextureAtlas &textures,
                    const HudTextureAtlas &interface_textures,
+                   std::vector<MenuHitRegion> &hit_regions,
                    std::uint64_t animation_tick,
                    const InputPromptBindings &bindings) {
   GR_SetBlendMode(BM_NONE);
   GR_EnableDepth(0);
+  hit_regions.clear();
   const auto full_screen =
       menu.screen() == game::PauseScreen::map && menu.expanded();
   if (full_screen) {
@@ -801,7 +803,7 @@ bool drawPauseMenu(const game::PauseMenu &menu,
       .t = menu.screen() == game::PauseScreen::root ||
                    menu.controllerBindingPending()
                ? InputPromptAction::pause
-                                                    : InputPromptAction::cancel,
+               : InputPromptAction::cancel,
   };
   const auto draw_text =
       [&interface_textures, &bindings, prompt_tokens](
@@ -813,6 +815,13 @@ bool drawPauseMenu(const game::PauseMenu &menu,
                      interface_textures, bindings, prompt_tokens);
       };
   const auto commands = menu.buildRenderCommands();
+  for (const auto &command : commands) {
+    if (command.kind == game::PauseRenderKind::menu_item && command.enabled) {
+      hit_regions.push_back(MenuHitRegion{command.bounds.x, command.bounds.y,
+                                          command.bounds.width,
+                                          command.bounds.height, command.id});
+    }
+  }
   std::optional<game::PauseRect> map_command_bounds;
   std::optional<game::PauseRect> map_draw_bounds;
   auto texture_uploaded = false;

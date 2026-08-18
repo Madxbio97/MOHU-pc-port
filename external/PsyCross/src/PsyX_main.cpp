@@ -55,6 +55,154 @@ static Uint64 g_frameLimitRemainder = 0;
 static Uint64 g_frameLimitRemainderAccumulator = 0;
 static Uint64 g_frameLimitNextCounter = 0;
 
+typedef struct PsyXPresentationPerfDiagnostics
+{
+	Uint64 frequency;
+	Uint64 windowStarted;
+	Uint64 previousFrameStarted;
+	Uint64 frames;
+	Uint64 fullFrames;
+	Uint64 cachedFrames;
+	Uint64 intervalCount;
+	Uint64 intervalTicks;
+	Uint64 maximumIntervalTicks;
+	Uint64 slow20ms;
+	Uint64 slow33ms;
+	Uint64 pollTicks;
+	Uint64 syncTicks;
+	Uint64 beginTicks;
+	Uint64 clearTicks;
+	Uint64 renderTicks;
+	Uint64 feedbackTicks;
+	Uint64 swapTicks;
+	Uint64 paceTicks;
+	Uint64 flushTicks;
+	Uint64 maximumSwapTicks;
+	Uint64 maximumRenderTicks;
+	Uint64 maximumPaceTicks;
+} PsyXPresentationPerfDiagnostics;
+
+static PsyXPresentationPerfDiagnostics g_presentationPerf;
+
+static int PsyX_PerfDiagnosticsEnabled()
+{
+	static int enabled = -1;
+	if (enabled < 0)
+	{
+		const char* value = getenv("SF_PERF_DIAGNOSTICS");
+		enabled = value == NULL || value[0] == '\0' || strcmp(value, "0") != 0;
+	}
+	return enabled;
+}
+
+static void PsyX_PerfAddTicks(Uint64* total, Uint64* maximum, Uint64 ticks)
+{
+	*total += ticks;
+	if (maximum != NULL && ticks > *maximum)
+		*maximum = ticks;
+}
+
+static double PsyX_PerfMilliseconds(Uint64 ticks, Uint64 divisor)
+{
+	if (g_presentationPerf.frequency == 0 || divisor == 0)
+		return 0.0;
+	return (double)ticks * 1000.0 /
+		((double)g_presentationPerf.frequency * (double)divisor);
+}
+
+static void PsyX_PerfBeginPresentation(Uint64 started)
+{
+	PsyXPresentationPerfDiagnostics* diagnostics = &g_presentationPerf;
+	if (diagnostics->frequency == 0)
+		diagnostics->frequency = SDL_GetPerformanceFrequency();
+	if (diagnostics->windowStarted == 0)
+		diagnostics->windowStarted = started;
+	if (diagnostics->previousFrameStarted != 0)
+	{
+		const Uint64 interval = started - diagnostics->previousFrameStarted;
+		diagnostics->intervalTicks += interval;
+		diagnostics->intervalCount++;
+		if (interval > diagnostics->maximumIntervalTicks)
+			diagnostics->maximumIntervalTicks = interval;
+		if (diagnostics->frequency != 0 &&
+			interval > diagnostics->frequency / 50)
+			diagnostics->slow20ms++;
+		if (diagnostics->frequency != 0 &&
+			interval > diagnostics->frequency / 30)
+			diagnostics->slow33ms++;
+	}
+	diagnostics->previousFrameStarted = started;
+}
+
+static void PsyX_PerfResetWindow(Uint64 now)
+{
+	const Uint64 frequency = g_presentationPerf.frequency;
+	const Uint64 previousFrameStarted =
+		g_presentationPerf.previousFrameStarted;
+	memset(&g_presentationPerf, 0, sizeof(g_presentationPerf));
+	g_presentationPerf.frequency = frequency;
+	g_presentationPerf.windowStarted = now;
+	g_presentationPerf.previousFrameStarted = previousFrameStarted;
+}
+
+static void PsyX_PerfCompletePresentation(int fullFrame, Uint64 now)
+{
+	PsyXPresentationPerfDiagnostics* diagnostics = &g_presentationPerf;
+	diagnostics->frames++;
+	if (fullFrame)
+		diagnostics->fullFrames++;
+	else
+		diagnostics->cachedFrames++;
+	if (diagnostics->frequency == 0 || diagnostics->windowStarted == 0 ||
+		now - diagnostics->windowStarted < diagnostics->frequency * 2)
+		return;
+
+	const Uint64 windowTicks = now - diagnostics->windowStarted;
+	const Uint64 accountedTicks = diagnostics->pollTicks +
+		diagnostics->syncTicks + diagnostics->beginTicks +
+		diagnostics->clearTicks + diagnostics->renderTicks +
+		diagnostics->feedbackTicks + diagnostics->swapTicks +
+		diagnostics->paceTicks + diagnostics->flushTicks;
+	const Uint64 outsideTicks =
+		windowTicks > accountedTicks ? windowTicks - accountedTicks : 0;
+	const double windowSeconds =
+		(double)windowTicks / (double)diagnostics->frequency;
+
+	PsyX_Log_Info(
+		"[PerfDiag][present] window=%.3fs fps=%.2f frames=%llu full=%llu "
+		"cached=%llu interval_ms(avg/max)=%.3f/%.3f slow20=%llu slow33=%llu "
+		"swap_interval=%d frame_limit=%d\n",
+		windowSeconds, (double)diagnostics->frames / windowSeconds,
+		(unsigned long long)diagnostics->frames,
+		(unsigned long long)diagnostics->fullFrames,
+		(unsigned long long)diagnostics->cachedFrames,
+		PsyX_PerfMilliseconds(diagnostics->intervalTicks,
+			diagnostics->intervalCount),
+		PsyX_PerfMilliseconds(diagnostics->maximumIntervalTicks, 1),
+		(unsigned long long)diagnostics->slow20ms,
+		(unsigned long long)diagnostics->slow33ms, g_effectiveSwapInterval,
+		g_frameLimit);
+	PsyX_Log_Info(
+		"[PerfDiag][phases] avg_ms poll=%.3f sync=%.3f begin=%.3f "
+		"clear=%.3f render=%.3f feedback=%.3f swap=%.3f pace=%.3f "
+		"flush=%.3f outside=%.3f max_ms(render/swap/pace)=%.3f/%.3f/%.3f\n",
+		PsyX_PerfMilliseconds(diagnostics->pollTicks, diagnostics->frames),
+		PsyX_PerfMilliseconds(diagnostics->syncTicks, diagnostics->frames),
+		PsyX_PerfMilliseconds(diagnostics->beginTicks, diagnostics->fullFrames),
+		PsyX_PerfMilliseconds(diagnostics->clearTicks, diagnostics->fullFrames),
+		PsyX_PerfMilliseconds(diagnostics->renderTicks, diagnostics->fullFrames),
+		PsyX_PerfMilliseconds(diagnostics->feedbackTicks,
+			diagnostics->fullFrames),
+		PsyX_PerfMilliseconds(diagnostics->swapTicks, diagnostics->frames),
+		PsyX_PerfMilliseconds(diagnostics->paceTicks, diagnostics->frames),
+		PsyX_PerfMilliseconds(diagnostics->flushTicks, diagnostics->frames),
+		PsyX_PerfMilliseconds(outsideTicks, diagnostics->frames),
+		PsyX_PerfMilliseconds(diagnostics->maximumRenderTicks, 1),
+		PsyX_PerfMilliseconds(diagnostics->maximumSwapTicks, 1),
+		PsyX_PerfMilliseconds(diagnostics->maximumPaceTicks, 1));
+	PsyX_PerfResetWindow(now);
+}
+
 static Uint64 PsyX_NextFrameLimitInterval()
 {
 	if (g_frameLimit <= 0 || g_frameLimitFrequency == 0)
@@ -946,16 +1094,37 @@ static void PsyX_UpdatePresentationSync()
 
 char PsyX_BeginScene()
 {
+	const int diagnostics = PsyX_PerfDiagnosticsEnabled();
+	const Uint64 frameStarted =
+		diagnostics ? SDL_GetPerformanceCounter() : 0;
 	PsyX_Sys_DoPollEvent();
+	Uint64 phaseStarted = diagnostics ? SDL_GetPerformanceCounter() : 0;
 
 	if (begin_scene_flag)
 		return 0;
 
 	assert(!begin_scene_flag);
 
+	if (diagnostics)
+	{
+		PsyX_PerfBeginPresentation(frameStarted);
+		g_presentationPerf.pollTicks += phaseStarted - frameStarted;
+	}
 	PsyX_UpdatePresentationSync();
+	if (diagnostics)
+	{
+		const Uint64 now = SDL_GetPerformanceCounter();
+		g_presentationPerf.syncTicks += now - phaseStarted;
+		phaseStarted = now;
+	}
 
 	GR_BeginScene();
+	if (diagnostics)
+	{
+		const Uint64 now = SDL_GetPerformanceCounter();
+		g_presentationPerf.beginTicks += now - phaseStarted;
+		phaseStarted = now;
+	}
 
 	if (activeDrawEnv.isbg)
 	{
@@ -969,9 +1138,20 @@ char PsyX_BeginScene()
 		GR_Clear(clipenv.x, clipenv.y, clipenv.w, clipenv.h, r, g, b);
 	}
 
+	if (diagnostics)
+	{
+		const Uint64 now = SDL_GetPerformanceCounter();
+		g_presentationPerf.clearTicks += now - phaseStarted;
+		phaseStarted = now;
+	}
 	begin_scene_flag = 1;
 
 	PsyX_Log_Flush();
+	if (diagnostics)
+	{
+		const Uint64 now = SDL_GetPerformanceCounter();
+		g_presentationPerf.flushTicks += now - phaseStarted;
+	}
 
 	return 1;
 }
@@ -983,33 +1163,97 @@ void PsyX_EndScene()
 
 	assert(begin_scene_flag);
 	begin_scene_flag = 0;
+	const int diagnostics = PsyX_PerfDiagnosticsEnabled();
+	Uint64 phaseStarted = diagnostics ? SDL_GetPerformanceCounter() : 0;
 
 #if USE_PGXP
 	PGXP_ClearCache();
 #endif
 
 	GR_EndScene();
+	if (diagnostics)
+	{
+		const Uint64 now = SDL_GetPerformanceCounter();
+		PsyX_PerfAddTicks(&g_presentationPerf.renderTicks,
+			&g_presentationPerf.maximumRenderTicks, now - phaseStarted);
+		phaseStarted = now;
+	}
 
 	if (g_cfg_framebufferFeedback)
 		GR_StoreFrameBuffer(activeDispEnv.disp.x, activeDispEnv.disp.y,
 							activeDispEnv.disp.w, activeDispEnv.disp.h);
+	if (diagnostics)
+	{
+		const Uint64 now = SDL_GetPerformanceCounter();
+		g_presentationPerf.feedbackTicks += now - phaseStarted;
+		phaseStarted = now;
+	}
 
 	GR_SwapWindow();
+	if (diagnostics)
+	{
+		const Uint64 now = SDL_GetPerformanceCounter();
+		PsyX_PerfAddTicks(&g_presentationPerf.swapTicks,
+			&g_presentationPerf.maximumSwapTicks, now - phaseStarted);
+		phaseStarted = now;
+	}
 	PsyX_PaceCompletedFrame();
+	if (diagnostics)
+	{
+		const Uint64 now = SDL_GetPerformanceCounter();
+		PsyX_PerfAddTicks(&g_presentationPerf.paceTicks,
+			&g_presentationPerf.maximumPaceTicks, now - phaseStarted);
+		PsyX_PerfCompletePresentation(1, now);
+	}
 }
 
 char PsyX_PresentCachedFrame()
 {
+	const int diagnostics = PsyX_PerfDiagnosticsEnabled();
+	const Uint64 frameStarted =
+		diagnostics ? SDL_GetPerformanceCounter() : 0;
 	PsyX_Sys_DoPollEvent();
+	Uint64 phaseStarted = diagnostics ? SDL_GetPerformanceCounter() : 0;
 
 	if (begin_scene_flag)
 		return 0;
 
 	assert(!begin_scene_flag);
+	if (diagnostics)
+	{
+		PsyX_PerfBeginPresentation(frameStarted);
+		g_presentationPerf.pollTicks += phaseStarted - frameStarted;
+	}
 	PsyX_UpdatePresentationSync();
+	if (diagnostics)
+	{
+		const Uint64 now = SDL_GetPerformanceCounter();
+		g_presentationPerf.syncTicks += now - phaseStarted;
+		phaseStarted = now;
+	}
 	GR_SwapWindow();
+	if (diagnostics)
+	{
+		const Uint64 now = SDL_GetPerformanceCounter();
+		PsyX_PerfAddTicks(&g_presentationPerf.swapTicks,
+			&g_presentationPerf.maximumSwapTicks, now - phaseStarted);
+		phaseStarted = now;
+	}
 	PsyX_PaceCompletedFrame();
+	if (diagnostics)
+	{
+		const Uint64 now = SDL_GetPerformanceCounter();
+		PsyX_PerfAddTicks(&g_presentationPerf.paceTicks,
+			&g_presentationPerf.maximumPaceTicks, now - phaseStarted);
+		phaseStarted = now;
+	}
 	PsyX_Log_Flush();
+	if (diagnostics)
+	{
+		const Uint64 now = SDL_GetPerformanceCounter();
+		g_presentationPerf.flushTicks += now - phaseStarted;
+		PsyX_PerfCompletePresentation(0, now);
+	}
 	return 1;
 }
 
@@ -1159,26 +1403,18 @@ void PsyX_EnableSwapInterval(int enable)
 	PsyX_ResetFrameLimiter();
 }
 
-int PsyX_ResolveSwapInterval(int requestedInterval, int displayRefreshRate,
-	int frameLimit)
+int PsyX_ResolveSwapInterval(int requestedInterval, int, int)
 {
-	if (requestedInterval <= 0)
-		return 0;
-	if (frameLimit <= 0 || displayRefreshRate <= 0)
-		return requestedInterval;
-	if (displayRefreshRate < frameLimit ||
-		displayRefreshRate % frameLimit != 0)
-	{
-		return 0;
-	}
-
-	const int interval = displayRefreshRate / frameLimit;
-	return interval > 0 ? interval : 0;
+	// SDL only defines immediate, one-VBlank and adaptive swap intervals.
+	// Some OpenGL drivers accept larger values but then present immediately.
+	// Keep VSync at one VBlank and let the independent deadline limiter select
+	// the requested presentation rate.
+	return requestedInterval > 0 ? 1 : 0;
 }
 
-int PsyX_ShouldUseSoftwareFrameLimit(int effectiveSwapInterval, int frameLimit)
+int PsyX_ShouldUseSoftwareFrameLimit(int, int frameLimit)
 {
-	return effectiveSwapInterval <= 0 && frameLimit > 0;
+	return frameLimit > 0;
 }
 
 void PsyX_SetFrameLimit(int framesPerSecond)

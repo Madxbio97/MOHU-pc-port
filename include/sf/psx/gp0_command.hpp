@@ -184,6 +184,38 @@ gp0PolygonCoordinateWords(std::uint8_t opcode) noexcept {
   return {1U, 4U, 7U, 10U};
 }
 
+[[nodiscard]] constexpr std::array<std::size_t, 4U>
+gp0PolygonColorWords(std::uint8_t opcode, std::size_t &count) noexcept {
+  if (opcode < 0x20U || opcode >= 0x40U) {
+    count = 0U;
+    return {};
+  }
+  if ((opcode & 0x10U) == 0U) {
+    count = 1U;
+    return {0U, 0U, 0U, 0U};
+  }
+  count = (opcode & 0x08U) != 0U ? 4U : 3U;
+  return (opcode & 0x04U) != 0U
+             ? std::array<std::size_t, 4U>{0U, 3U, 6U, 9U}
+             : std::array<std::size_t, 4U>{0U, 2U, 4U, 6U};
+}
+
+// Interpolates the authored GTE vertex-light result while retaining the
+// current packet code byte. amount uses exact Q8 endpoints [0, 256].
+[[nodiscard]] constexpr std::uint32_t
+gp0InterpolateRgb(std::uint32_t previous, std::uint32_t current,
+                  std::uint16_t amount) noexcept {
+  const auto clamped = static_cast<std::uint32_t>(
+      amount > 256U ? 256U : amount);
+  const auto inverse = 256U - clamped;
+  const auto channel = [=](std::uint32_t shift) noexcept {
+    const auto left = (previous >> shift) & 0xffU;
+    const auto right = (current >> shift) & 0xffU;
+    return ((left * inverse + right * clamped + 128U) >> 8U) << shift;
+  };
+  return (current & 0xff000000U) | channel(0U) | channel(8U) | channel(16U);
+}
+
 [[nodiscard]] constexpr Gp0CommandClass
 gp0CommandClass(std::uint8_t opcode) noexcept {
   if (opcode == 0x02U) {

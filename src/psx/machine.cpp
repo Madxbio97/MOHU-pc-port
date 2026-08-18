@@ -21,7 +21,13 @@ constexpr std::uint32_t ram_address_mask =
     static_cast<std::uint32_t>(R3000Runtime::ram_size - 1U);
 constexpr std::uint64_t maximum_dma_words = 16U * 1024U * 1024U;
 constexpr std::uint64_t maximum_linked_list_nodes = 65'536U;
+constexpr std::uint64_t maximum_dma_request_blocks = 65'536U;
 constexpr std::size_t spu_control_register_index = 0x1aaU / 2U;
+constexpr std::uint32_t spu_transfer_address_offset = 0x1a6U;
+constexpr std::uint32_t spu_control_offset = 0x1aaU;
+constexpr std::uint64_t dma_payload_transfer_committed = 1U;
+constexpr std::uint64_t dma_payload_spu_request_continues = 2U;
+constexpr std::uint64_t spu_transfer_ticks_per_halfword = 16U;
 // Scheduled deadlines and MMIO flush exactly. This fallback only bounds
 // free-running device advancement when no earlier event is pending.
 constexpr std::uint64_t maximum_cpu_slice_ticks = 4'096U;
@@ -72,6 +78,15 @@ std::size_t channelIndex(DmaChannel channel) noexcept {
 
 DmaChannel channelFromIndex(std::size_t index) noexcept {
   return static_cast<DmaChannel>(static_cast<std::uint8_t>(index));
+}
+
+std::uint64_t decodedDmaBlockPart(std::uint32_t value) noexcept {
+  const auto raw = static_cast<std::uint16_t>(value);
+  return raw == 0U ? std::uint64_t{1U} << 16U : raw;
+}
+
+std::uint64_t dmaRamTicks(std::uint64_t words) noexcept {
+  return words + (words + 15U) / 16U;
 }
 
 bool spuInterruptLine(const SpuState &state) noexcept {
@@ -130,6 +145,86 @@ R3000RunResult PsxMachine::step() noexcept {
   return result;
 }
 
+R3000RunResult
+PsxMachine::runCached(std::uint64_t instruction_budget) noexcept {
+  std::uint64_t executed{};
+  std::uint64_t batched_ticks{};
+  const auto commit_ticks = [this, &batched_ticks]() noexcept {
+    if (batched_ticks == 0U) {
+      return;
+    }
+    queueCpuTicks(batched_ticks);
+    batched_ticks = 0U;
+  };
+  while (executed < instruction_budget) {
+    const auto block = cpu_.cachedBlock();
+    if (block.instructions.empty()) {
+      commit_ticks();
+      if (cpu_.executionBreakpoint(cpu_.state().pc)) {
+        return {R3000StopReason::running, executed, cpu_.state().pc, 0U};
+      }
+      auto result = step();
+      executed += result.instructions;
+      if (result.reason != R3000StopReason::running ||
+          result.instructions == 0U) {
+        result.instructions = executed;
+        return result;
+      }
+      continue;
+    }
+
+    for (std::size_t index{};
+         index < block.instructions.size() && executed < instruction_budget;
+         ++index) {
+      const auto &instruction = block.instructions[index];
+      if (batched_ticks != 0U &&
+          (instruction.synchronization_boundary || cpu_.interruptPending() ||
+           batched_ticks >= cpu_ticks_until_flush_)) {
+        commit_ticks();
+      }
+
+      const auto expected_pc =
+          block.start_pc + static_cast<std::uint32_t>(index * 4U);
+      if (cpu_.state().pc != expected_pc) {
+        break;
+      }
+
+      auto result = cpu_.stepCachedInstruction(instruction);
+      if (result.reason == R3000StopReason::running &&
+          result.instructions != 0U) {
+        ++batched_ticks;
+      }
+      executed += result.instructions;
+      if (result.reason != R3000StopReason::running ||
+          result.instructions == 0U) {
+        commit_ticks();
+        result.instructions = executed;
+        return result;
+      }
+      if (batched_ticks >= cpu_ticks_until_flush_) {
+        commit_ticks();
+      }
+      if (cpu_.codeCacheEpoch() != block.cache_epoch) {
+        break;
+      }
+    }
+  }
+  commit_ticks();
+  return {R3000StopReason::running, executed, cpu_.state().pc, 0U};
+}
+
+std::uint64_t
+PsxMachine::fastForwardIdleTicks(std::uint64_t maximum_ticks) noexcept {
+  if (maximum_ticks == 0U || cpu_.interruptPending()) {
+    return 0U;
+  }
+  const auto ticks = std::min(maximum_ticks, cpu_ticks_until_flush_);
+  if (ticks != 0U) {
+    queueCpuTicks(ticks);
+  }
+  return ticks;
+}
+
 void PsxMachine::advanceTicks(std::uint64_t ticks) noexcept {
   flushPendingCpuTicks();
   constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
@@ -176,22 +271,53 @@ PsxMachine::dmaCompletionTick(DmaChannel channel) const noexcept {
   return std::nullopt;
 }
 
+bool PsxMachine::advanceToDmaCompletion(DmaChannel channel) noexcept {
+  for (std::uint64_t block = 0U; block < maximum_dma_request_blocks; ++block) {
+    const auto token = dma_.scheduledToken(channel);
+    if (token == 0U) {
+      return true;
+    }
+    const auto deadline = dmaCompletionTick(channel);
+    if (!deadline.has_value()) {
+      return false;
+    }
+
+    const auto now = currentTick();
+    advanceTicks(*deadline > now ? *deadline - now : 0U);
+    if (dma_.scheduledToken(channel) == token) {
+      return false;
+    }
+  }
+  return dma_.scheduledToken(channel) == 0U;
+}
+
 bool PsxMachine::completePendingDmaTransfer(DmaChannel channel) noexcept {
-  const auto token = dma_.scheduledToken(channel);
-  if (token == 0U) {
-    return true;
+  for (std::uint64_t block = 0U; block < maximum_dma_request_blocks; ++block) {
+    const auto token = dma_.scheduledToken(channel);
+    if (token == 0U) {
+      return true;
+    }
+
+    auto pending = MachineEvent{};
+    auto found = false;
+    const auto scheduler = scheduler_.captureState();
+    for (std::size_t index = 0U; index < scheduler.event_count; ++index) {
+      const auto &candidate = scheduler.events[index];
+      if (candidate.type == MachineEventType::dma_complete &&
+          candidate.index == channelIndex(channel) &&
+          candidate.token == token) {
+        pending = candidate;
+        found = true;
+        break;
+      }
+    }
+    if (!found || !scheduler_.cancel(token)) {
+      return false;
+    }
+    pending.deadline = scheduler_.now();
+    dispatchEvent(pending);
   }
-  if (!scheduler_.cancel(token)) {
-    return false;
-  }
-  dispatchEvent(MachineEvent{
-      .deadline = scheduler_.now(),
-      .token = token,
-      .payload = 0U,
-      .type = MachineEventType::dma_complete,
-      .index = static_cast<std::uint8_t>(channelIndex(channel)),
-  });
-  return dma_.scheduledToken(channel) != token;
+  return dma_.scheduledToken(channel) == 0U;
 }
 
 bool PsxMachine::completePendingDmaTransfers() noexcept {
@@ -355,10 +481,16 @@ bool PsxMachine::validateState(const PsxMachineState &state) const noexcept {
       return false;
     }
     if (event.type == MachineEventType::dma_complete) {
-      if (event.index >= DmaController::channel_count || event.payload != 0U) {
+      if (event.index >= DmaController::channel_count) {
         return false;
       }
       const auto channel = channelFromIndex(event.index);
+      if (event.payload != 0U &&
+          (channel != DmaChannel::spu ||
+           (event.payload != dma_payload_transfer_committed &&
+            event.payload != dma_payload_spu_request_continues))) {
+        return false;
+      }
       if (dma.scheduledToken(channel) != event.token ||
           found_tokens[event.index]) {
         return false;
@@ -540,6 +672,27 @@ void PsxMachine::setXaOutputMixer(
   spu_.setCdInputMixer(matrix);
 }
 
+bool PsxMachine::idleSafeReadMmio(std::uint32_t physical_address,
+                                  R3000AccessWidth width) const noexcept {
+  const auto last_byte = physical_address + accessBits(width) / 8U - 1U;
+  if (physical_address >= interrupt_base && last_byte < interrupt_base + 8U) {
+    return true;
+  }
+  if (physical_address >= dma_base && last_byte < dma_base + 0x78U) {
+    return true;
+  }
+  if (physical_address >= sio_base + 4U && last_byte < sio_base + 0x10U) {
+    return true;
+  }
+  if (physical_address == cdrom_base && width == R3000AccessWidth::byte) {
+    return true;
+  }
+  if (physical_address == gpu_base + 4U && width == R3000AccessWidth::word) {
+    return true;
+  }
+  return physical_address == mdec_base + 4U && width == R3000AccessWidth::word;
+}
+
 bool PsxMachine::readMmio(std::uint32_t physical_address,
                           R3000AccessWidth width,
                           std::uint32_t &value) noexcept {
@@ -688,7 +841,8 @@ bool PsxMachine::readMmio(std::uint32_t physical_address,
 bool PsxMachine::writeMmio(std::uint32_t physical_address,
                            R3000AccessWidth width, std::uint32_t value,
                            const GteProjectedVertex *projected,
-                           std::uint64_t projection_identity) noexcept {
+                           std::uint64_t projection_identity,
+                           std::uint32_t producer_pc) noexcept {
   flushPendingCpuTicks();
   if ((physical_address == gpu_base || physical_address == gpu_base + 4U) &&
       width == R3000AccessWidth::word) {
@@ -729,12 +883,16 @@ bool PsxMachine::writeMmio(std::uint32_t physical_address,
         ++controller_sio_.ignored_busy_writes;
         return true;
       }
-      const auto port_one_selected =
-          (controller_sio_.control & 0x2003U) == 0x0003U;
+      const auto controller_selected =
+          (controller_sio_.control & 0x0003U) == 0x0003U;
+      const auto port_index = static_cast<std::size_t>(
+          (controller_sio_.control >> 13U) & 1U);
       auto acknowledged = false;
-      if (port_one_selected) {
-        ++controller_sio_.port_one_bytes;
-        acknowledged = writeControllerByte(static_cast<std::uint8_t>(value));
+      if (controller_selected &&
+          controller_sio_.ports[port_index].connected) {
+        ++controller_sio_.port_bytes[port_index];
+        acknowledged = writeControllerByte(static_cast<std::uint8_t>(value),
+                                            controller_sio_.ports[port_index]);
       } else {
         controller_sio_.phase = 0U;
         controller_sio_.command = 0U;
@@ -806,6 +964,13 @@ bool PsxMachine::writeMmio(std::uint32_t physical_address,
     if (first_offset + byte_count > Spu::register_span) {
       return false;
     }
+    const auto last_offset = first_offset + byte_count - 1U;
+    if (first_offset <= spu_control_offset + 1U &&
+        last_offset >= spu_transfer_address_offset &&
+        dma_.scheduledToken(DmaChannel::spu) != 0U &&
+        !completePendingDmaTransfer(DmaChannel::spu)) {
+      return false;
+    }
 
     if (width == R3000AccessWidth::byte) {
       const auto register_offset = first_offset & ~1U;
@@ -818,18 +983,19 @@ bool PsxMachine::writeMmio(std::uint32_t physical_address,
       const auto merged = static_cast<std::uint16_t>(
           (previous & ~mask) |
           ((static_cast<std::uint16_t>(value) << shift) & mask));
-      if (!spu_.writeRegister(register_offset, merged)) {
+      if (!spu_.writeRegister(register_offset, merged, producer_pc)) {
         return false;
       }
     } else {
       if ((first_offset & 1U) != 0U ||
-          !spu_.writeRegister(first_offset,
-                              static_cast<std::uint16_t>(value))) {
+          !spu_.writeRegister(first_offset, static_cast<std::uint16_t>(value),
+                              producer_pc)) {
         return false;
       }
       if (width == R3000AccessWidth::word &&
           !spu_.writeRegister(first_offset + 2U,
-                              static_cast<std::uint16_t>(value >> 16U))) {
+                              static_cast<std::uint16_t>(value >> 16U),
+                              producer_pc)) {
         return false;
       }
     }
@@ -879,6 +1045,15 @@ bool PsxMachine::writeMmio(std::uint32_t physical_address,
     std::array<std::uint64_t, DmaController::channel_count> previous_tokens{};
     for (std::size_t index = 0U; index < previous_tokens.size(); ++index) {
       previous_tokens[index] = dma_.scheduledToken(channelFromIndex(index));
+    }
+    constexpr auto spu_dma_register_begin = 4U * 0x10U;
+    constexpr auto spu_dma_register_end = spu_dma_register_begin + 0x08U;
+    const auto dma_offset = aligned - dma_base;
+    if (dma_offset >= spu_dma_register_begin &&
+        dma_offset <= spu_dma_register_end &&
+        previous_tokens[channelIndex(DmaChannel::spu)] != 0U &&
+        !completePendingDmaTransfer(DmaChannel::spu)) {
+      return false;
     }
     if (!dma_.writeRegister(aligned - dma_base, placed_value, write_mask)) {
       return false;
@@ -947,7 +1122,8 @@ void PsxMachine::advanceDevicesTo(std::uint64_t tick) noexcept {
   scheduler_.advanceTo(tick);
 }
 
-bool PsxMachine::writeControllerByte(std::uint8_t value) noexcept {
+bool PsxMachine::writeControllerByte(std::uint8_t value,
+                                     ControllerPortState &port) noexcept {
   constexpr std::uint8_t digital_pad_id = 0x41U;
   constexpr std::uint8_t analog_pad_id = 0x73U;
   constexpr std::uint8_t configuration_id = 0xf3U;
@@ -966,7 +1142,7 @@ bool PsxMachine::writeControllerByte(std::uint8_t value) noexcept {
     controller_sio_.command = value;
     const auto supported =
         value == 0x42U || value == 0x43U ||
-        (controller_sio_.configuration_mode &&
+        (port.configuration_mode &&
          (value == 0x44U || value == 0x45U || value == 0x46U ||
           value == 0x47U || value == 0x48U || value == 0x4bU ||
           value == 0x4cU || value == 0x4dU));
@@ -979,9 +1155,9 @@ bool PsxMachine::writeControllerByte(std::uint8_t value) noexcept {
 
     acknowledged = true;
     controller_sio_.packet_id =
-        controller_sio_.configuration_mode
+        port.configuration_mode
             ? configuration_id
-            : (controller_sio_.analog_mode ? analog_pad_id : digital_pad_id);
+            : (port.analog_mode ? analog_pad_id : digital_pad_id);
     controller_sio_.response = controller_sio_.packet_id;
     controller_sio_.phase = 2U;
     break;
@@ -999,12 +1175,12 @@ bool PsxMachine::writeControllerByte(std::uint8_t value) noexcept {
       controller_sio_.command_parameter = value;
     }
     if (controller_sio_.command == 0x43U && payload_index == 0U) {
-      controller_sio_.configuration_mode = value != 0U;
+      port.configuration_mode = value != 0U;
     } else if (controller_sio_.command == 0x44U) {
       if (payload_index == 0U && value <= 0x01U) {
-        controller_sio_.analog_mode = value == 0x01U;
+        port.analog_mode = value == 0x01U;
       } else if (payload_index == 1U) {
-        controller_sio_.analog_locked = (value & 0x03U) == 0x03U;
+        port.analog_locked = (value & 0x03U) == 0x03U;
       }
     }
 
@@ -1021,8 +1197,8 @@ bool PsxMachine::writeControllerByte(std::uint8_t value) noexcept {
       const auto set_input_response = [&] {
         const auto reported_buttons =
             controller_sio_.packet_id == digital_pad_id
-                ? static_cast<std::uint16_t>(controller_sio_.buttons | 0x0006U)
-                : controller_sio_.buttons;
+                ? static_cast<std::uint16_t>(port.buttons | 0x0006U)
+                : port.buttons;
         switch (payload_index) {
         case 0U:
           controller_sio_.response =
@@ -1033,7 +1209,7 @@ bool PsxMachine::writeControllerByte(std::uint8_t value) noexcept {
               static_cast<std::uint8_t>(reported_buttons >> 8U);
           break;
         default:
-          controller_sio_.response = controller_sio_.analog[payload_index - 2U];
+          controller_sio_.response = port.analog[payload_index - 2U];
           break;
         }
       };
@@ -1048,7 +1224,7 @@ bool PsxMachine::writeControllerByte(std::uint8_t value) noexcept {
               0x01U, 0x02U, 0x00U, 0x02U, 0x01U, 0x00U};
           controller_sio_.response =
               payload_index == 2U
-                  ? static_cast<std::uint8_t>(controller_sio_.analog_mode)
+                  ? static_cast<std::uint8_t>(port.analog_mode)
                   : model_response[payload_index];
           break;
         }
@@ -1085,9 +1261,8 @@ bool PsxMachine::writeControllerByte(std::uint8_t value) noexcept {
                   : 0x00U;
           break;
         case 0x4dU:
-          controller_sio_.response =
-              controller_sio_.rumble_protocol[payload_index];
-          controller_sio_.rumble_protocol[payload_index] = value;
+          controller_sio_.response = port.rumble_protocol[payload_index];
+          port.rumble_protocol[payload_index] = value;
           break;
         default:
           controller_sio_.response = 0x00U;
@@ -1269,7 +1444,17 @@ void PsxMachine::dispatchEvent(const MachineEvent &event) noexcept {
   if (dma_.scheduledToken(channel) != event.token) {
     return;
   }
-  if (!executeDmaTransfer(channel)) {
+  if (channel == DmaChannel::spu &&
+      event.payload == dma_payload_spu_request_continues) {
+    static_cast<void>(dma_.cancelScheduled(channel, event.token));
+    syncSpuInterruptLine();
+    kickDmaChannels();
+    return;
+  }
+  const auto transfer_committed =
+      channel == DmaChannel::spu &&
+      event.payload == dma_payload_transfer_committed;
+  if (!transfer_committed && !executeDmaTransfer(channel)) {
     static_cast<void>(dma_.cancelScheduled(channel, event.token));
     if (channel == DmaChannel::spu) {
       spu_.setDmaTransferBusy(false);
@@ -1390,6 +1575,9 @@ void PsxMachine::kickDmaChannels() noexcept {
     }
 
     std::uint64_t delay{};
+    std::uint64_t transfer_words{};
+    std::uint64_t total_words{};
+    auto spu_request_continues = false;
     if (dma_.syncMode(channel) == DmaSyncMode::linked_list) {
       if (channel != DmaChannel::gpu || !linkedListTicks(delay)) {
         if (internal_cdrom) {
@@ -1407,17 +1595,33 @@ void PsxMachine::kickDmaChannels() noexcept {
         }
         continue;
       }
+      total_words = *words;
+      transfer_words = total_words;
       if (internal_cdrom && !cdrom_.canReadDmaWords(*words)) {
         static_cast<void>(dma_.complete(channel));
         syncDmaInterruptLine();
         continue;
       }
-      delay = channel == DmaChannel::spu ? *words * 4U : *words;
+      if (channel == DmaChannel::spu &&
+          dma_.syncMode(channel) == DmaSyncMode::request) {
+        const auto bcr = dma_.bcr(channel);
+        transfer_words = decodedDmaBlockPart(bcr);
+        spu_request_continues = decodedDmaBlockPart(bcr >> 16U) > 1U;
+      }
+      delay = channel == DmaChannel::spu
+                  ? (spu_request_continues
+                         ? transfer_words * 2U * spu_transfer_ticks_per_halfword
+                         : dmaRamTicks(transfer_words))
+                  : total_words;
     }
     delay = scaleDeviceTicks(std::max<std::uint64_t>(1U, delay));
+    const auto payload = channel != DmaChannel::spu ? 0U
+                         : spu_request_continues
+                             ? dma_payload_spu_request_continues
+                             : dma_payload_transfer_committed;
     const auto token =
         scheduler_.scheduleAfter(delay, MachineEventType::dma_complete,
-                                 static_cast<std::uint8_t>(index));
+                                 static_cast<std::uint8_t>(index), payload);
     if (token != 0U) {
       refreshCpuSliceLimit();
       if (!dma_.markScheduled(channel, token)) {
@@ -1427,7 +1631,25 @@ void PsxMachine::kickDmaChannels() noexcept {
           syncDmaInterruptLine();
         }
       } else if (channel == DmaChannel::spu) {
-        spu_.setDmaTransferBusy(true);
+        if (spu_.state().transfer_busy == 0U) {
+          spu_.setDmaTransferBusy(
+              true, dma_.madr(channel) & ram_address_mask & ~3U, total_words);
+        }
+        auto transferred = executeLinearDma(channel, transfer_words);
+        if (transferred && dma_.syncMode(channel) == DmaSyncMode::request) {
+          const auto bcr = dma_.bcr(channel);
+          const auto blocks = decodedDmaBlockPart(bcr >> 16U);
+          const auto remaining = blocks - 1U;
+          transferred = dma_.setBcr(
+              channel, (bcr & 0x0000ffffU) |
+                           (static_cast<std::uint32_t>(remaining) << 16U));
+        }
+        if (!transferred) {
+          static_cast<void>(scheduler_.cancel(token));
+          static_cast<void>(dma_.cancelScheduled(channel, token));
+          spu_.setDmaTransferBusy(false);
+        }
+        syncSpuInterruptLine();
       }
     } else if (internal_cdrom) {
       static_cast<void>(dma_.complete(channel));
@@ -1447,13 +1669,18 @@ bool PsxMachine::executeDmaTransfer(DmaChannel channel) noexcept {
 }
 
 bool PsxMachine::executeLinearDma(DmaChannel channel) noexcept {
+  const auto words = dma_.estimatedWordCount(channel);
+  return words.has_value() && executeLinearDma(channel, *words);
+}
+
+bool PsxMachine::executeLinearDma(DmaChannel channel,
+                                  std::uint64_t word_count) noexcept {
   const auto index = channelIndex(channel);
   if (index >= dma_ports_.size() ||
       (dma_ports_[index] == nullptr && channel != DmaChannel::cdrom)) {
     return false;
   }
-  const auto words = dma_.estimatedWordCount(channel);
-  if (!words.has_value() || *words > maximum_dma_words) {
+  if (word_count > maximum_dma_words) {
     return false;
   }
 
@@ -1467,10 +1694,10 @@ bool PsxMachine::executeLinearDma(DmaChannel channel) noexcept {
     return false;
   }
   if (!from_ram && channel == DmaChannel::cdrom && port == nullptr &&
-      !cdrom_.prepareDmaRead(*words)) {
+      !cdrom_.prepareDmaRead(word_count)) {
     return false;
   }
-  for (std::uint64_t word_index = 0U; word_index < *words; ++word_index) {
+  for (std::uint64_t word_index = 0U; word_index < word_count; ++word_index) {
     const auto ram_address = address & ram_address_mask & ~3U;
     std::uint32_t value{};
     if (from_ram) {
@@ -1517,6 +1744,8 @@ bool PsxMachine::executeLinkedListDma(DmaChannel channel) noexcept {
   auto address = dma_.madr(channel) & ram_address_mask & ~3U;
   const auto transfer_root = address;
   std::uint64_t transferred_words{};
+  auto ordering_depth = GpuDmaWordSource::invalid_ordering_depth;
+
   for (std::uint64_t node = 0U; node < maximum_linked_list_nodes; ++node) {
     std::uint32_t header{};
     if (!cpu_.read32(address, header)) {
@@ -1525,6 +1754,20 @@ bool PsxMachine::executeLinkedListDma(DmaChannel channel) noexcept {
     const auto word_count = static_cast<std::uint32_t>(header >> 24U);
     if (transferred_words + word_count > maximum_dma_words) {
       return false;
+    }
+    // ClearOTagR links the root entry toward progressively nearer buckets.
+    // Empty OT entries are zero-word DMA nodes; remember the exact bucket
+    // while traversing the primitive nodes attached to it. This preserves
+    // retail painter provenance without inspecting packet coordinates.
+    if (word_count == 0U && address <= transfer_root) {
+      const auto byte_distance = transfer_root - address;
+      if ((byte_distance & 3U) == 0U) {
+        const auto candidate = byte_distance / 4U;
+        if (ordering_depth == GpuDmaWordSource::invalid_ordering_depth ||
+            candidate >= ordering_depth) {
+          ordering_depth = candidate;
+        }
+      }
     }
     for (std::uint32_t index = 0U; index < word_count; ++index) {
       const auto word_address =
@@ -1540,7 +1783,7 @@ bool PsxMachine::executeLinkedListDma(DmaChannel channel) noexcept {
         written = gpu_port_->writeGp0FromRam(
             value,
             GpuDmaWordSource{word_address, transfer_root,
-                             GpuDmaSourceKind::linked_list},
+                             GpuDmaSourceKind::linked_list, ordering_depth},
             provenance.projected, provenance.identity);
       } else {
         written = port->writeDmaWord(value);

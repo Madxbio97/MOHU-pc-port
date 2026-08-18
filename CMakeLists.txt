@@ -86,6 +86,8 @@ add_library(sf_psx
     src/psx/interrupt_controller.cpp
     src/psx/machine.cpp
     src/psx/mdec.cpp
+    src/psx/r3000_code_cache.cpp
+    src/psx/r3000_fast_interpreter.cpp
     src/psx/r3000_runtime.cpp
     src/psx/spu.cpp
     src/psx/timers.cpp
@@ -147,8 +149,10 @@ endif()
 sf_set_project_warnings(sf_game)
 
 add_library(mohu_runtime
+    src/mohu/frontend_menu.cpp
     src/mohu/gpu_command_stream.cpp
     src/mohu/gpu_primitive_matcher.cpp
+    src/mohu/level_lighting.cpp
     src/mohu/runtime.cpp
 )
 add_library(mohu::runtime ALIAS mohu_runtime)
@@ -227,6 +231,7 @@ if(SF_ENABLE_PSYCROSS)
         src/platform/psycross_movie_player.cpp
         src/platform/psycross_retail_briefing.cpp
         src/platform/psycross_runtime_guards.cpp
+        src/platform/psycross_skybox.cpp
         src/platform/psycross_scene_viewer.cpp
         src/platform/psycross_scene_effects.inc
         src/platform/psycross_scene_hud.inc
@@ -294,6 +299,26 @@ if(SF_ENABLE_PSYCROSS)
             PRIVATE user32 comdlg32 gdiplus)
     endif()
     sf_set_project_warnings(medal_of_honor_underground)
+    set(mohu_skybox_assets
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/midnight_paris.tga"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/french_village_night.tga"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/desert_morning.tga"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/desert_storm.tga"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/sandstorm.tga"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/greek_coast_night.tga"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/wewelsburg_fog.tga"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/wewelsburg_night.tga"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/monte_cassino_night.tga"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/french_mountains_night.tga"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/french_mountains_morning.tga"
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/skyboxes/paris_outskirts_night.tga")
+    add_custom_command(TARGET medal_of_honor_underground POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:medal_of_honor_underground>/assets/skyboxes"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${mohu_skybox_assets}
+            "$<TARGET_FILE_DIR:medal_of_honor_underground>/assets/skyboxes"
+        COMMAND_EXPAND_LISTS VERBATIM)
 
 endif()
 

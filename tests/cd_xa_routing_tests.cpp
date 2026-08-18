@@ -24,10 +24,10 @@ constexpr std::uint8_t interrupt_data_ready = 1U;
 constexpr std::uint8_t interrupt_acknowledge = 3U;
 constexpr std::uint8_t mode_filter_enabled = 1U << 3U;
 constexpr std::uint8_t mode_xa_adpcm_enabled = 1U << 6U;
+constexpr std::uint8_t mode_double_speed = 1U << 7U;
 constexpr std::uint32_t cdrom_base = 0x1f801800U;
 
-using Sector =
-    std::array<std::byte, sf::psx::CdRomMedia::raw_sector_size>;
+using Sector = std::array<std::byte, sf::psx::CdRomMedia::raw_sector_size>;
 
 void require(bool condition, const char *message) {
   if (!condition) {
@@ -72,8 +72,8 @@ Sector makeXaSector(std::uint8_t file, std::uint8_t channel,
   constexpr std::size_t words_per_group = 28U;
   for (std::size_t group_index = 0U; group_index < sound_group_count;
        ++group_index) {
-    auto *group = sector.data() + payload_offset +
-                  group_index * sound_group_size;
+    auto *group =
+        sector.data() + payload_offset + group_index * sound_group_size;
     std::fill_n(group + 4U, 8U, std::byte{0x0cU});
     for (std::size_t word = 0U; word < words_per_group; ++word) {
       writeLe32(group + 16U + word * sizeof(std::uint32_t), packed_samples);
@@ -148,9 +148,9 @@ public:
       std::span<const std::byte, sf::psx::CdRomMedia::raw_sector_size> sector,
       bool muted) noexcept override {
     if (call_count < calls.size()) {
-      calls[call_count] = XaSinkCall{
-          std::to_integer<std::uint8_t>(sector[16U]),
-          std::to_integer<std::uint8_t>(sector[17U]), muted};
+      calls[call_count] =
+          XaSinkCall{std::to_integer<std::uint8_t>(sector[16U]),
+                     std::to_integer<std::uint8_t>(sector[17U]), muted};
     }
     ++call_count;
   }
@@ -172,8 +172,7 @@ void selectIndex(sf::psx::CdRomController &controller, std::uint8_t index) {
           "Could not select a CD-ROM register bank");
 }
 
-void writeParameter(sf::psx::CdRomController &controller,
-                    std::uint8_t value) {
+void writeParameter(sf::psx::CdRomController &controller, std::uint8_t value) {
   selectIndex(controller, 0U);
   require(controller.writeRegister(2U, value),
           "Could not write a CD-ROM command parameter");
@@ -235,6 +234,37 @@ void fireSector(sf::psx::CdRomController &controller) {
   controller.eventSector(request.generation);
 }
 
+void testGuardedDataReadSpeedup() {
+  FakeCdRomMedia media{{makeDataSector(0x31U), makeDataSector(0x32U)}};
+  sf::psx::CdRomController data_controller{&media};
+  data_controller.setDataReadSpeedup(4U);
+  setMode(data_controller, mode_double_speed);
+  startRead(data_controller);
+  require(data_controller.sectorSchedule().delay_ticks ==
+              sf::psx::CdRomController::sector_double_speed_ticks / 4U,
+          "Double-speed data read did not use the configured speedup");
+
+  FakeXaAudioSink sink;
+  sf::psx::CdRomController xa_controller{&media};
+  xa_controller.setXaAudioSink(&sink);
+  xa_controller.setDataReadSpeedup(4U);
+  setMode(xa_controller,
+          static_cast<std::uint8_t>(mode_double_speed | mode_xa_adpcm_enabled));
+  startRead(xa_controller);
+  require(xa_controller.sectorSchedule().delay_ticks ==
+              sf::psx::CdRomController::sector_double_speed_ticks,
+          "CD speedup changed XA/movie timing");
+
+  sf::psx::CdRomController single_speed_controller{&media};
+  single_speed_controller.setDataReadSpeedup(255U);
+  startRead(single_speed_controller);
+  require(single_speed_controller.dataReadSpeedup() ==
+                  sf::psx::CdRomController::maximum_data_read_speedup &&
+              single_speed_controller.sectorSchedule().delay_ticks ==
+                  sf::psx::CdRomController::sector_single_speed_ticks,
+          "CD speedup escaped its bound or changed single-speed timing");
+}
+
 void testXaRoutingFilterAndControllerSnapshot() {
   FakeCdRomMedia media{{makeXaSector(1U, 2U, 0x11111111U),
                         makeXaSector(1U, 3U, 0x22222222U),
@@ -243,9 +273,8 @@ void testXaRoutingFilterAndControllerSnapshot() {
   sf::psx::CdRomController controller{&media};
   controller.setXaAudioSink(&sink);
 
-  setMode(controller,
-          static_cast<std::uint8_t>(mode_xa_adpcm_enabled |
-                                    mode_filter_enabled));
+  setMode(controller, static_cast<std::uint8_t>(mode_xa_adpcm_enabled |
+                                                mode_filter_enabled));
   setFilter(controller, 1U, 2U);
   startRead(controller);
 
@@ -314,8 +343,7 @@ void testMuteCommandsReachXaSink() {
           "Muted XA sector incorrectly entered the data path");
 
   executeCommand(controller, command_demute);
-  require(!controller.muted(),
-          "Demute did not update the CD-ROM mute state");
+  require(!controller.muted(), "Demute did not update the CD-ROM mute state");
   acknowledge(controller, interrupt_acknowledge);
   sink.clear();
   fireSector(controller);
@@ -328,9 +356,8 @@ void testSetFilterReleasesAutomaticXaLockWithoutFlushingDecoder() {
   FakeXaAudioSink sink;
   sf::psx::CdRomController controller{&media};
   controller.setXaAudioSink(&sink);
-  setMode(controller,
-          static_cast<std::uint8_t>(mode_xa_adpcm_enabled |
-                                    mode_filter_enabled));
+  setMode(controller, static_cast<std::uint8_t>(mode_xa_adpcm_enabled |
+                                                mode_filter_enabled));
   setFilter(controller, 1U, 2U);
   startRead(controller);
 
@@ -342,8 +369,7 @@ void testSetFilterReleasesAutomaticXaLockWithoutFlushingDecoder() {
   const auto resets_before_filter_change = sink.reset_count;
   setFilter(controller, 1U, 3U);
   const auto changed = controller.captureState();
-  require(changed.xa_current_set == 0U &&
-              changed.xa_current_file == 0U &&
+  require(changed.xa_current_set == 0U && changed.xa_current_file == 0U &&
               changed.xa_current_channel == 0U,
           "Setfilter retained the previous automatic XA stream lock");
   require(sink.reset_count == resets_before_filter_change,
@@ -357,10 +383,8 @@ void testSetFilterReleasesAutomaticXaLockWithoutFlushingDecoder() {
 
 void testAutomaticXaFileLockAndEofHandoff() {
   constexpr std::uint8_t xa_audio_eof_submode = 0xe4U;
-  FakeCdRomMedia media{{makeXaSector(2U, 4U),
-                        makeXaSector(2U, 5U),
-                        makeXaSector(2U, 4U, 0x22222222U,
-                                     xa_audio_eof_submode),
+  FakeCdRomMedia media{{makeXaSector(2U, 4U), makeXaSector(2U, 5U),
+                        makeXaSector(2U, 4U, 0x22222222U, xa_audio_eof_submode),
                         makeXaSector(2U, 5U)}};
   FakeXaAudioSink sink;
   sf::psx::CdRomController controller{&media};
@@ -396,8 +420,7 @@ void testNonAudioDataKeepsInt1AndDmaPath() {
   sf::psx::CdRomController controller{&media};
 
   selectIndex(controller, 1U);
-  require(controller.writeRegister(2U, 0x01U),
-          "Could not enable CD-ROM INT1");
+  require(controller.writeRegister(2U, 0x01U), "Could not enable CD-ROM INT1");
   selectIndex(controller, 0U);
   setMode(controller, mode_xa_adpcm_enabled);
   startRead(controller);
@@ -411,8 +434,8 @@ void testNonAudioDataKeepsInt1AndDmaPath() {
 
   selectIndex(controller, 0U);
   require(controller.writeRegister(3U, 0x80U) && controller.dmaRequest() &&
-              controller.canReadDmaWords(
-                  sf::psx::CdRomMedia::sector_size / sizeof(std::uint32_t)),
+              controller.canReadDmaWords(sf::psx::CdRomMedia::sector_size /
+                                         sizeof(std::uint32_t)),
           "Non-audio sector did not expose the DMA3 FIFO");
 
   std::uint32_t first_word{};
@@ -456,7 +479,7 @@ void testCdInputVolumeMatrixRegisters() {
           "Could not write/apply CD volume matrix bank 3");
   const auto applied = controller.captureState();
   require(applied.pending_cd_volume_matrix ==
-              std::array<std::uint8_t, 4U>{0x40U, 0x20U, 0x10U, 0x30U} &&
+                  std::array<std::uint8_t, 4U>{0x40U, 0x20U, 0x10U, 0x30U} &&
               applied.cd_volume_matrix == applied.pending_cd_volume_matrix &&
               applied.adpcm_muted == 1U && controller.validateState(applied),
           "CD volume apply/mute register semantics are incorrect");
@@ -485,8 +508,7 @@ void machineAcknowledge(sf::psx::R3000Runtime &runtime,
 }
 
 void machineExecuteCommand(sf::psx::R3000Runtime &runtime,
-                           sf::psx::PsxMachine &machine,
-                           std::uint8_t command) {
+                           sf::psx::PsxMachine &machine, std::uint8_t command) {
   machineWrite(runtime, cdrom_base + 1U, command,
                "Could not issue a machine CD-ROM command");
   machine.advanceTicks(sf::psx::CdRomController::command_delay_ticks);
@@ -561,8 +583,7 @@ void testMachineXaDecoderSpuQueueAndSnapshot() {
   *expected = machine->captureState();
   require(expected->spu != nullptr && checkpoint->spu != nullptr &&
               expected->cdrom.current_lba == 2U &&
-              expected->spu->cd_frame_count <
-                  checkpoint->spu->cd_frame_count &&
+              expected->spu->cd_frame_count < checkpoint->spu->cd_frame_count &&
               expected->xa_decoder == checkpoint->xa_decoder,
           "Busy XA FIFO decoded a sector and corrupted predictor history");
 
@@ -594,6 +615,7 @@ void testMachineXaDecoderSpuQueueAndSnapshot() {
 
 int main() {
   try {
+    testGuardedDataReadSpeedup();
     testXaRoutingFilterAndControllerSnapshot();
     testMuteCommandsReachXaSink();
     testSetFilterReleasesAutomaticXaLockWithoutFlushingDecoder();

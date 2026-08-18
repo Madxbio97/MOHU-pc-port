@@ -94,6 +94,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
                 gameplay.player().yaw);
 
   std::vector<OT_TAG> ordering_table(ordering_table_size);
+  std::vector<OT_TAG> viewmodel_ordering_table(ordering_table_size);
   std::vector<OT_TAG> prefetch_ordering_table(ordering_table_size);
   std::vector<OT_TAG> prefetch_fire_ordering_table(ordering_table_size);
   std::vector<OT_TAG> optic_trail_ordering_table(ordering_table_size);
@@ -279,6 +280,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
           .controller_pitch_sensitivity = 1.0,
       }};
   RelativeMouseCapture mouse_capture;
+  MenuCursor menu_cursor;
   auto &pause_settings = pause_settings_;
   if (!pause_settings_initialized_) {
     game::applyControllerPreset(pause_settings,
@@ -354,6 +356,8 @@ SceneViewerResult PsyCrossSceneViewer::run(
   ui_audio.setVolumePercent(pause_settings.sound_effects_volume);
   ui_audio.setVoiceVolumePercent(pause_settings.voice_volume);
   game::PauseMenu pause_menu;
+  std::vector<MenuHitRegion> pause_hit_regions;
+  pause_hit_regions.reserve(16U);
   std::optional<game::RetailCheat> latched_pause_cheat;
   std::uint64_t pause_animation_tick = 0U;
   const auto set_retail_cheat = [&](game::RetailCheat cheat, bool enabled) {
@@ -476,6 +480,18 @@ SceneViewerResult PsyCrossSceneViewer::run(
     const auto interpolation_amount = std::clamp(
         simulation_accumulator_seconds / retail_simulation_step_seconds, 0.0,
         1.0);
+    // The authored animation clock advances after the first presentation of a
+    // completed guest tick. Keep the interval origin stable on all following
+    // native presentations, then interpolate only the model pose inside it.
+    const auto animation_interval_start = [effect_updates](
+                                              std::uint64_t tick) noexcept {
+      return effect_updates == 0U && tick != 0U ? tick - 1U : tick;
+    };
+    const auto model_animation_tick = animation_interval_start(actor_tick);
+    const auto player_animation_tick =
+        animation_interval_start(gameplay.playerAnimationTick());
+    const auto player_presentation_animation_tick =
+        animation_interval_start(gameplay.playerPresentationAnimationTick());
     const auto presented_weapon_switch_frames = game::interpolateHudCountdown(
         previous_weapon_switch_countdown, current_weapon_switch_countdown,
         interpolation_amount);
@@ -592,7 +608,8 @@ SceneViewerResult PsyCrossSceneViewer::run(
     const auto stats = renderWorld(
         gameplay, textures, hud_textures, fire_animation,
         textures.firePlacement(), effect_textures, actor_animations, actor_tick,
-        gameplay.playerAnimationTick(), weapon_presentation_edges.events(),
+        model_animation_tick, player_animation_tick,
+        player_presentation_animation_tick, weapon_presentation_edges.events(),
         weapon_presentation_edges.muzzleFlashes(), muzzle_flash_edges.flashes(),
         weapon_presentation_edges.lines(),
         weapon_presentation_edges.particles(),
@@ -600,7 +617,8 @@ SceneViewerResult PsyCrossSceneViewer::run(
         weapon_presentation_edges.rawPackets(), glass_shatter.shards(),
         interpolation_amount, previous_render_presentation,
         current_render_presentation, presentation, view, ordering_table,
-        prefetch_ordering_table, optic_trail_ordering_table,
+        viewmodel_ordering_table, prefetch_ordering_table,
+        optic_trail_ordering_table,
         optic_subject_ordering_table, shadow_ordering_table,
         scrim_ordering_table, scanner_xray_ordering_table,
         guest_overlay_ordering_table, prefetch_fire_ordering_table,
@@ -718,6 +736,24 @@ SceneViewerResult PsyCrossSceneViewer::run(
         static_cast<int>(primitives.volumetric_effects.size()),
         presentation.camera.projection, screen_width, screen_height,
         static_cast<float>(volumetric_effect_time_seconds));
+    const auto viewmodel_visible =
+        gameplay.playerAlive() && !gameplay.cinematic() &&
+        !presentation.first_person_aim &&
+        playerCameraVisibility(presentation.camera, presentation.player.x,
+                               presentation.player.y,
+                               presentation.player.z) ==
+            PlayerCameraVisibility::translucent;
+    if (viewmodel_visible) {
+      // The camera-local body and held weapon are a viewmodel. Give them a
+      // fresh depth layer after every scene-dependent pass so walls cannot
+      // occlude them, while their own triangles still self-occlude normally.
+      GR_SetBlendMode(BM_NONE);
+      GR_EnableDepth(1);
+      GR_ClearDepthBuffer();
+      GR_SetDepthState(1, 1);
+      DrawOTag(
+          reinterpret_cast<u_long *>(&viewmodel_ordering_table.back()));
+    }
     drawVirusScannerFilter(presentation.first_person_aim &&
                            presentation.optic_mode == 4U);
     // Static EMD/GMD scanner material stays in the ordinary depth-sorted OT.
@@ -1380,6 +1416,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
           controllerButtonLabels(controller_snapshot));
       stop_controller_rumble();
       pause_aspect_mode.emplace(PresentationContent::authored_4_3);
+      menu_cursor.set(true);
       paused = true;
       // Preserve the guest SPU/XA clock and queued PCM, but fade every host
       // output to silence while the ACD is open. Restoring the gain on exit
@@ -1391,7 +1428,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
       pause_analog_y = current_pause_y;
       pause_animation_tick = 0U;
       static_cast<void>(drawPauseMenu(pause_menu, pause_textures, hud_textures,
-                                      pause_animation_tick++,
+                                      pause_hit_regions, pause_animation_tick++,
                                       active_prompt_bindings));
       end_presented_frame();
       continue;
@@ -1431,6 +1468,11 @@ SceneViewerResult PsyCrossSceneViewer::run(
 
       const auto acd_navigation_ready =
           pause_animation_tick > acd_reveal_duration;
+      const auto pointer = menu_cursor.sample(game::PauseMenu::screen_width,
+                                              game::PauseMenu::screen_height);
+      const auto pointer_hit = menuHitTest(pointer, pause_hit_regions);
+      const auto pointer_confirm =
+          pointer.primary_pressed && pointer_hit.has_value();
       auto pause_input = game::PauseMenuInput{
           .previous = acd_navigation_ready &&
                       ((pressed & up_button) != 0 || analog_up_edge),
@@ -1440,15 +1482,20 @@ SceneViewerResult PsyCrossSceneViewer::run(
                   ((pressed & left_button) != 0 || analog_left_edge),
           .right = acd_navigation_ready &&
                    ((pressed & right_button) != 0 || analog_right_edge),
-          .confirm = acd_navigation_ready &&
-                     ((pressed & confirm_button) != 0 || interact_pressed),
+          .confirm =
+              acd_navigation_ready && ((pressed & confirm_button) != 0 ||
+                                       interact_pressed || pointer_confirm),
           .cancel = acd_navigation_ready &&
                     ((pressed & cancel_button) != 0 ||
                      (pause_pressed &&
-                      pause_menu.screen() != game::PauseScreen::root)),
+                      pause_menu.screen() != game::PauseScreen::root) ||
+                     pointer.secondary_pressed),
           .pause =
               controller_pause_pressed ||
               (pause_pressed && pause_menu.screen() == game::PauseScreen::root),
+          .pointer_selection = acd_navigation_ready && pointer.moved
+                                   ? pointer_hit
+                                   : std::optional<std::size_t>{},
       };
 
       const auto cheat_context = [&] {
@@ -1571,6 +1618,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
         ui_audio.reset();
         pause_aspect_mode.reset();
         paused = false;
+        menu_cursor.set(false);
         gameplay_audio->setGainPercent(100U);
         if (!apply_pause_settings(pause_settings)) {
           return SceneViewerResult{previous_buttons,
@@ -1671,6 +1719,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
         stop_controller_rumble();
         pause_aspect_mode.reset();
         paused = false;
+        menu_cursor.set(false);
         gameplay_audio->setGainPercent(100U);
         if (!apply_pause_settings(pause_settings)) {
           return SceneViewerResult{previous_buttons,
@@ -1703,6 +1752,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
         stop_controller_rumble();
         pause_aspect_mode.reset();
         paused = false;
+        menu_cursor.set(false);
         gameplay_audio->setGainPercent(100U);
         if (!apply_pause_settings(pause_settings)) {
           return SceneViewerResult{previous_buttons,
@@ -1739,7 +1789,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
       }
 
       static_cast<void>(drawPauseMenu(pause_menu, pause_textures, hud_textures,
-                                      pause_animation_tick++,
+                                      pause_hit_regions, pause_animation_tick++,
                                       active_prompt_bindings));
       end_presented_frame();
       continue;

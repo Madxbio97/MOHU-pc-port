@@ -416,21 +416,91 @@ struct ResolvedHmdPose {
   double ground_y{};
 };
 
+struct CapturedHmdAnimationPose {
+  std::vector<assets::HmdAnimationTransform> transforms;
+  std::vector<std::uint8_t> valid;
+
+  void capture(const game::ActorPose &pose, std::size_t part_count) {
+    transforms.resize(part_count);
+    valid.assign(part_count, 0U);
+    for (auto part = std::size_t{}; part < part_count; ++part) {
+      const auto *transform = pose.transform(part);
+      if (transform == nullptr) {
+        continue;
+      }
+      transforms[part] = *transform;
+      valid[part] = 1U;
+    }
+  }
+
+  [[nodiscard]] const assets::HmdAnimationTransform *
+  transform(std::size_t part) const noexcept {
+    return part < transforms.size() && part < valid.size() && valid[part] != 0U
+               ? &transforms[part]
+               : nullptr;
+  }
+};
+
 // HMD pose resolution runs for every visible actor on every presentation
 // frame. Keep its transient tables alive across calls: at 240 Hz the former
 // local vectors otherwise allocated and freed several times per actor even
 // though gameplay animation advances at only 20 Hz.
 struct HmdPoseScratch {
   ResolvedHmdPose pose;
+  CapturedHmdAnimationPose interpolation_from;
   std::vector<std::uint8_t> resolved;
   std::vector<std::uint8_t> referenced;
   const assets::HmdModel *referenced_model{};
 };
 
+[[nodiscard]] std::int16_t interpolateHmdAngle(std::int16_t from,
+                                               std::int16_t to,
+                                               double amount) noexcept {
+  constexpr auto full_turn = std::int32_t{4096};
+  constexpr auto half_turn = full_turn / 2;
+  auto delta = (static_cast<std::int32_t>(to) -
+                static_cast<std::int32_t>(from)) %
+               full_turn;
+  if (delta > half_turn) {
+    delta -= full_turn;
+  } else if (delta < -half_turn) {
+    delta += full_turn;
+  }
+  auto value = static_cast<std::int32_t>(std::lround(
+      static_cast<double>(from) + static_cast<double>(delta) * amount));
+  value %= full_turn;
+  if (value > half_turn - 1) {
+    value -= full_turn;
+  } else if (value < -half_turn) {
+    value += full_turn;
+  }
+  return static_cast<std::int16_t>(value);
+}
+
+[[nodiscard]] assets::HmdAnimationTransform interpolateHmdTransform(
+    const assets::HmdAnimationTransform &from,
+    const assets::HmdAnimationTransform &to, double amount) noexcept {
+  amount = std::clamp(amount, 0.0, 1.0);
+  auto result = assets::HmdAnimationTransform{};
+  for (auto component = std::size_t{}; component < 3U; ++component) {
+    result.rotation[component] = interpolateHmdAngle(
+        from.rotation[component], to.rotation[component], amount);
+    result.translation[component] = static_cast<std::int16_t>(std::clamp(
+        std::lround(std::lerp(static_cast<double>(from.translation[component]),
+                              static_cast<double>(to.translation[component]),
+                              amount)),
+        static_cast<long>(std::numeric_limits<std::int16_t>::min()),
+        static_cast<long>(std::numeric_limits<std::int16_t>::max())));
+  }
+  return result;
+}
+
 const ResolvedHmdPose &resolveHmdPose(const assets::HmdModel &model,
                                       const game::ActorPose *animation_pose,
                                       HmdPoseScratch &scratch,
-                                      std::vector<Vector3> *posed_vertices = nullptr) {
+                                      std::vector<Vector3> *posed_vertices = nullptr,
+                                      const CapturedHmdAnimationPose *from = nullptr,
+                                      double interpolation_amount = 1.0) {
   auto &result = scratch.pose;
   result.parts.resize(model.parts().size());
   scratch.resolved.assign(model.parts().size(), 0U);
@@ -450,8 +520,17 @@ const ResolvedHmdPose &resolveHmdPose(const assets::HmdModel &model,
       const auto *animated = animation_pose == nullptr
                                  ? nullptr
                                  : animation_pose->transform(index);
-      const auto local = animated == nullptr ? localHmdBindPose(part)
-                                             : localHmdAnimationPose(*animated);
+      auto interpolated = assets::HmdAnimationTransform{};
+      if (animated != nullptr && from != nullptr) {
+        if (const auto *previous = from->transform(index)) {
+          interpolated = interpolateHmdTransform(
+              *previous, *animated, interpolation_amount);
+          animated = &interpolated;
+        }
+      }
+      const auto local =
+          animated == nullptr ? localHmdBindPose(part)
+                              : localHmdAnimationPose(*animated);
       result.parts[index] =
           part.parent < 0
               ? local
@@ -1936,11 +2015,14 @@ const ResolvedHmdPose *prepareHmdWorldVertices(
     const assets::HmdModel &model, const game::SceneObject &object,
     const game::ActorPose *animation_pose, HmdPoseScratch &pose_scratch,
     std::vector<Vector3> &result,
-    std::vector<Vector3> *world_normals = nullptr) {
+    std::vector<Vector3> *world_normals = nullptr,
+    const CapturedHmdAnimationPose *interpolation_from = nullptr,
+    double interpolation_amount = 1.0) {
   const auto direct_legacy_pose = hasLegacyHmdBones(model, object);
   if (!direct_legacy_pose) {
     const auto *resolved_pose = &resolveHmdPose(
-        model, animation_pose, pose_scratch, &result);
+        model, animation_pose, pose_scratch, &result, interpolation_from,
+        interpolation_amount);
     for (auto &vertex : result) {
       if (!object.legacy_hmd_root_space) {
         vertex.y -= resolved_pose->ground_y;

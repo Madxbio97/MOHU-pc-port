@@ -84,18 +84,32 @@ public:
   }
 };
 
-struct ControllerSioState {
-  std::uint16_t mode{};
-  std::uint16_t control{};
-  std::uint16_t baud{};
+inline constexpr std::size_t controller_port_count = 2U;
+
+struct ControllerPortState {
   std::uint16_t buttons{0xffffU};
   // DualShock wire order: right X/Y, then left X/Y.
   std::array<std::uint8_t, 4U> analog{0x80U, 0x80U, 0x80U, 0x80U};
   std::array<std::uint8_t, 6U> rumble_protocol{0xffU, 0xffU, 0xffU,
                                                0xffU, 0xffU, 0xffU};
+  bool connected{};
+  bool configuration_mode{};
+  bool analog_mode{};
+  bool analog_locked{};
+
+  [[nodiscard]] friend bool operator==(const ControllerPortState &,
+                                       const ControllerPortState &) = default;
+};
+
+struct ControllerSioState {
+  std::uint16_t mode{};
+  std::uint16_t control{};
+  std::uint16_t baud{};
+  std::array<ControllerPortState, controller_port_count> ports{
+      ControllerPortState{.connected = true}, ControllerPortState{}};
   std::uint64_t data_writes{};
   std::uint64_t ignored_busy_writes{};
-  std::uint64_t port_one_bytes{};
+  std::array<std::uint64_t, controller_port_count> port_bytes{};
   std::uint64_t transfer_completions{};
   std::uint64_t ack_pulses{};
   std::uint64_t control_writes{};
@@ -107,9 +121,6 @@ struct ControllerSioState {
   std::uint8_t packet_id{};
   std::uint8_t phase{};
   std::uint8_t command_parameter{};
-  bool configuration_mode{};
-  bool analog_mode{};
-  bool analog_locked{};
   bool transfer_acknowledged{};
   bool ack_input{};
   bool irq_pending{};
@@ -187,6 +198,12 @@ public:
 
   void reset() noexcept;
   [[nodiscard]] R3000RunResult step() noexcept;
+  [[nodiscard]] R3000RunResult
+  runCached(std::uint64_t instruction_budget) noexcept;
+  // Skip only a CPU loop already proven side-effect-free by R3000Runtime.
+  // The bound ends at the next device event or periodic hardware flush.
+  [[nodiscard]] std::uint64_t
+  fastForwardIdleTicks(std::uint64_t maximum_ticks) noexcept;
   void advanceTicks(std::uint64_t ticks) noexcept;
   // Commit already-accounted interpreter ticks to hardware devices without
   // consuming any additional guest CPU time.
@@ -202,12 +219,29 @@ public:
   void setVBlank(bool active) noexcept;
   void pulseVBlank() noexcept;
   void setControllerButtons(std::uint16_t active_low_buttons) noexcept {
-    controller_sio_.buttons = active_low_buttons;
+    setControllerState(0U, active_low_buttons,
+                       controller_sio_.ports[0U].analog, true);
   }
   void setControllerState(std::uint16_t active_low_buttons,
                           std::array<std::uint8_t, 4U> analog) noexcept {
-    controller_sio_.buttons = active_low_buttons;
-    controller_sio_.analog = analog;
+    setControllerState(0U, active_low_buttons, analog, true);
+  }
+  void setControllerState(std::size_t port,
+                          std::uint16_t active_low_buttons,
+                          std::array<std::uint8_t, 4U> analog,
+                          bool connected = true) noexcept {
+    if (port >= controller_sio_.ports.size()) {
+      return;
+    }
+    auto &state = controller_sio_.ports[port];
+    state.buttons = active_low_buttons;
+    state.analog = analog;
+    state.connected = connected;
+  }
+  void setControllerConnected(std::size_t port, bool connected) noexcept {
+    if (port < controller_sio_.ports.size()) {
+      controller_sio_.ports[port].connected = connected;
+    }
   }
   [[nodiscard]] const ControllerSioState &controllerSio() const noexcept {
     return controller_sio_;
@@ -222,6 +256,9 @@ public:
   }
   [[nodiscard]] std::optional<std::uint64_t>
   dmaCompletionTick(DmaChannel channel) const noexcept;
+  // Advance the hardware timeline until every block of one scheduled DMA
+  // request has completed.
+  [[nodiscard]] bool advanceToDmaCompletion(DmaChannel channel) noexcept;
   // Complete one already-scheduled transfer without advancing the hardware
   // timeline. Frame-owned DMA sidecars must remain alive until GPU DMA has
   // consumed the command list that refers to them.
@@ -254,9 +291,13 @@ private:
                               R3000AccessWidth width,
                               std::uint32_t &value) noexcept override;
   [[nodiscard]] bool
-  writeMmio(std::uint32_t physical_address, R3000AccessWidth width,
-            std::uint32_t value, const GteProjectedVertex *projected,
-            std::uint64_t projection_identity) noexcept override;
+  idleSafeReadMmio(std::uint32_t physical_address,
+                   R3000AccessWidth width) const noexcept override;
+  [[nodiscard]] bool writeMmio(std::uint32_t physical_address,
+                               R3000AccessWidth width, std::uint32_t value,
+                               const GteProjectedVertex *projected,
+                               std::uint64_t projection_identity,
+                               std::uint32_t producer_pc) noexcept override;
   void consumeXaSector(
       std::span<const std::byte, CdRomMedia::raw_sector_size> sector,
       bool muted) noexcept override;
@@ -266,7 +307,8 @@ private:
   void advanceDevicesTo(std::uint64_t tick) noexcept;
   void refreshCpuSliceLimit() noexcept;
   void flushPendingCpuTicks() noexcept;
-  [[nodiscard]] bool writeControllerByte(std::uint8_t value) noexcept;
+  [[nodiscard]] bool writeControllerByte(std::uint8_t value,
+                                         ControllerPortState &port) noexcept;
   void scheduleControllerTransfer(bool acknowledged) noexcept;
   void cancelControllerTransfer() noexcept;
   void cancelControllerAckRelease() noexcept;
@@ -284,6 +326,8 @@ private:
   void kickDmaChannels() noexcept;
   [[nodiscard]] bool executeDmaTransfer(DmaChannel channel) noexcept;
   [[nodiscard]] bool executeLinearDma(DmaChannel channel) noexcept;
+  [[nodiscard]] bool executeLinearDma(DmaChannel channel,
+                                      std::uint64_t word_count) noexcept;
   [[nodiscard]] bool executeLinkedListDma(DmaChannel channel) noexcept;
   [[nodiscard]] bool executeOtcDma() noexcept;
   [[nodiscard]] bool linkedListTicks(std::uint64_t &ticks) const noexcept;

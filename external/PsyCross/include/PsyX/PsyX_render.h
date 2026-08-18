@@ -140,7 +140,10 @@ typedef struct {
 
   u_char u, v, bright, dither;
   u_char r, g, b, a;
+  u_char light_r, light_g, light_b, light_enable;
   u_char umin, vmin, umax, vmax;
+  uint ordering_depth;
+  uint ordering_span;
 
   char tcx, tcy, _p0, _p1;
   float precise_u, precise_v;
@@ -217,6 +220,7 @@ typedef enum {
   a_zw,
   a_texcoord,
   a_color,
+  a_lighting,
   a_extra,
   a_texbounds,
   a_precise_uv,
@@ -292,6 +296,10 @@ extern void GR_ReadVRAMAliasPage(int page, unsigned short *dst);
 extern unsigned long long GR_GetVRAMWriteSequence();
 extern int GR_ReadVRAMWriteEvents(unsigned long long after_sequence,
                                   GrVRAMWriteEvent *events, int capacity);
+/* Non-zero only after the exact two-part MRETURN background has reached
+ * guest VRAM. Used to correlate its retail FT4 packets with later VRAM
+ * writes without tracing unrelated loading screens. */
+extern unsigned long long GR_GetMReturnTraceGeneration(void);
 
 extern void GR_StoreFrameBuffer(int x, int y, int w, int h);
 extern void GR_UpdateVRAM();
@@ -323,6 +331,12 @@ extern TextureID GR_CreateRGBATexture(int width, int height,
                                       u_char *data /*= nullptr*/);
 extern void GR_UpdateRGBATexture(TextureID texture, int width, int height,
                                  const u_char *data);
+extern void GR_SetGuestSkybox(TextureID texture, int width, int height,
+                              int enabled);
+extern void GR_SetGuestSkyboxView(float yaw, float pitch,
+                                  float verticalFov);
+extern int GR_CompositeGuestSkyboxBeforeWorld(void);
+extern unsigned long long GR_GetGuestSkyboxCompositeCount(void);
 extern u_char GR_Expand5BitColor(u_char value);
 extern void GR_CalculateReversedDepthProjection(float zNear, float zFar,
                                                 float *scale, float *bias);
@@ -362,6 +376,12 @@ extern int GR_BeginGuestPresentationReplay(const RECT16 *target);
 /* Flushes queued replay primitives, then clears only the isolated target. */
 extern int GR_ClearGuestPresentationReplay(unsigned char r, unsigned char g,
                                            unsigned char b);
+/* Clears one guest-space rectangle inside the isolated target. Pixels outside
+ * the replay target are clipped and authoritative VRAM is never touched. */
+extern int GR_ClearGuestPresentationReplayRect(int x, int y, int width,
+                                               int height, unsigned char r,
+                                               unsigned char g,
+                                               unsigned char b);
 /* Flushes and closes the isolated target without any guest VRAM side effect.
  * A failed target switch makes the completed replay unavailable. */
 extern int GR_EndGuestPresentationReplay(void);
@@ -393,6 +413,12 @@ extern void GR_SetSceneFogParameters(int enable, unsigned char red,
                                      int dqa, int dqb, int projection,
                                      unsigned int terrainDepthCue);
 extern void GR_EnableSceneFog(int enable);
+extern void GR_SetSceneFogDensity(float density);
+extern void GR_SetPrimitiveLighting(int enable, unsigned char red,
+                                    unsigned char green,
+                                    unsigned char blue);
+extern void GR_SetPrimitiveOrderingDepth(int enable, unsigned int depth,
+                                         unsigned int span);
 extern void GR_ApplySceneSMAA(void);
 extern void GR_ApplySceneFXAA(void);
 extern void GR_ApplySceneAntialiasing(void);
@@ -422,6 +448,7 @@ extern void GR_Clear(int x, int y, int w, int h, unsigned char r,
 extern void GR_ClearVRAM(int x, int y, int w, int h, unsigned char r,
                          unsigned char g, unsigned char b);
 extern void GR_UpdateVertexBuffer(const GrVertex *vertices, int count);
+extern void GR_RebindVertexBuffer(unsigned int uploads_ago);
 extern void GR_DrawTriangles(int start_vertex, int triangles);
 
 extern void GR_PushDebugLabel(const char *label);

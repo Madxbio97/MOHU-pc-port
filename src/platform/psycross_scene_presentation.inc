@@ -333,6 +333,104 @@ void depthCuePrimitive(POLY_GT4 &primitive,
   depthCueColor(primitive.r3, primitive.g3, primitive.b3, depth_cues[3]);
 }
 
+struct PresentationQuaternion {
+  double w{1.0};
+  double x{};
+  double y{};
+  double z{};
+};
+
+[[nodiscard]] PresentationQuaternion normalizedQuaternion(
+    PresentationQuaternion value) noexcept {
+  const auto length = std::sqrt(value.w * value.w + value.x * value.x +
+                                value.y * value.y + value.z * value.z);
+  if (!std::isfinite(length) || length <= 0.000001) {
+    return {};
+  }
+  value.w /= length;
+  value.x /= length;
+  value.y /= length;
+  value.z /= length;
+  return value;
+}
+
+[[nodiscard]] PresentationQuaternion transformQuaternion(
+    const assets::MissionTransform &transform) noexcept {
+  std::array<double, 9U> matrix{};
+  for (auto index = std::size_t{}; index < matrix.size(); ++index) {
+    matrix[index] = static_cast<double>(transform.rotation[index]) / 4096.0;
+  }
+  auto result = PresentationQuaternion{};
+  const auto trace = matrix[0U] + matrix[4U] + matrix[8U];
+  if (trace > 0.0) {
+    const auto scale = std::sqrt(trace + 1.0) * 2.0;
+    result.w = scale * 0.25;
+    result.x = (matrix[7U] - matrix[5U]) / scale;
+    result.y = (matrix[2U] - matrix[6U]) / scale;
+    result.z = (matrix[3U] - matrix[1U]) / scale;
+  } else if (matrix[0U] > matrix[4U] && matrix[0U] > matrix[8U]) {
+    const auto scale =
+        std::sqrt(1.0 + matrix[0U] - matrix[4U] - matrix[8U]) * 2.0;
+    result.w = (matrix[7U] - matrix[5U]) / scale;
+    result.x = scale * 0.25;
+    result.y = (matrix[1U] + matrix[3U]) / scale;
+    result.z = (matrix[2U] + matrix[6U]) / scale;
+  } else if (matrix[4U] > matrix[8U]) {
+    const auto scale =
+        std::sqrt(1.0 + matrix[4U] - matrix[0U] - matrix[8U]) * 2.0;
+    result.w = (matrix[2U] - matrix[6U]) / scale;
+    result.x = (matrix[1U] + matrix[3U]) / scale;
+    result.y = scale * 0.25;
+    result.z = (matrix[5U] + matrix[7U]) / scale;
+  } else {
+    const auto scale =
+        std::sqrt(1.0 + matrix[8U] - matrix[0U] - matrix[4U]) * 2.0;
+    result.w = (matrix[3U] - matrix[1U]) / scale;
+    result.x = (matrix[2U] + matrix[6U]) / scale;
+    result.y = (matrix[5U] + matrix[7U]) / scale;
+    result.z = scale * 0.25;
+  }
+  return normalizedQuaternion(result);
+}
+
+[[nodiscard]] PresentationQuaternion interpolateQuaternion(
+    PresentationQuaternion from, PresentationQuaternion to,
+    double amount) noexcept {
+  const auto dot = from.w * to.w + from.x * to.x + from.y * to.y +
+                   from.z * to.z;
+  if (dot < 0.0) {
+    to.w = -to.w;
+    to.x = -to.x;
+    to.y = -to.y;
+    to.z = -to.z;
+  }
+  return normalizedQuaternion({
+      std::lerp(from.w, to.w, amount), std::lerp(from.x, to.x, amount),
+      std::lerp(from.y, to.y, amount), std::lerp(from.z, to.z, amount)});
+}
+
+void storeQuaternionRotation(PresentationQuaternion value,
+                             assets::MissionTransform &result) noexcept {
+  value = normalizedQuaternion(value);
+  const auto xx = value.x * value.x;
+  const auto yy = value.y * value.y;
+  const auto zz = value.z * value.z;
+  const auto xy = value.x * value.y;
+  const auto xz = value.x * value.z;
+  const auto yz = value.y * value.z;
+  const auto wx = value.w * value.x;
+  const auto wy = value.w * value.y;
+  const auto wz = value.w * value.z;
+  const std::array matrix{
+      1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy),
+      2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx),
+      2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)};
+  for (auto index = std::size_t{}; index < matrix.size(); ++index) {
+    result.rotation[index] = static_cast<std::int16_t>(std::clamp(
+        std::lround(matrix[index] * 4096.0), -32768L, 32767L));
+  }
+}
+
 assets::MissionTransform
 interpolateTransform(const assets::MissionTransform &previous,
                      const assets::MissionTransform &current, double amount) {
@@ -346,14 +444,10 @@ interpolateTransform(const assets::MissionTransform &previous,
   }
 
   auto result = current;
-  for (std::size_t index = 0; index < result.rotation.size(); ++index) {
-    result.rotation[index] = static_cast<std::int16_t>(std::clamp<long>(
-        std::lround(std::lerp(static_cast<double>(previous.rotation[index]),
-                              static_cast<double>(current.rotation[index]),
-                              amount)),
-        std::numeric_limits<std::int16_t>::min(),
-        std::numeric_limits<std::int16_t>::max()));
-  }
+  storeQuaternionRotation(
+      interpolateQuaternion(transformQuaternion(previous),
+                            transformQuaternion(current), amount),
+      result);
   const auto translation = [amount](std::int32_t from, std::int32_t to) {
     return static_cast<std::int32_t>(std::clamp<long long>(
         std::llround(std::lerp(static_cast<double>(from),

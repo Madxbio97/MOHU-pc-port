@@ -742,6 +742,65 @@ void testMohUndergroundRuntimePadMapping() {
           "Neutral MOHU keyboard state changed the physical pad snapshot");
 }
 
+void testMohUndergroundControllerBindings() {
+  using sf::game::ControllerAction;
+  using sf::game::ControllerStickLayout;
+  using sf::platform::RuntimePadInput;
+
+  const RuntimePadInput physical{
+      .active_low_buttons = static_cast<std::uint16_t>(
+          0xffffU & ~sf::game::controller_cross_button & ~0x0008U),
+      .analog = {17U, 34U, 99U, 88U},
+  };
+  require(sf::platform::applyMohUndergroundControllerBindings(
+              physical, sf::platform::ControllerButtonBindings{}) == physical,
+          "Default controller bindings changed the physical pad");
+
+  auto rebound = sf::platform::ControllerButtonBindings{};
+  const auto rebind = sf::game::rebindControllerButton(
+      rebound, ControllerAction::shoot, sf::game::controller_cross_button);
+  require(rebind == sf::game::ControllerRebindResult::swapped,
+          "Controller test binding did not swap occupied buttons");
+  const auto mapped =
+      sf::platform::applyMohUndergroundControllerBindings(physical, rebound);
+  require((mapped.active_low_buttons & sf::game::controller_square_button) ==
+              0U &&
+              (mapped.active_low_buttons & sf::game::controller_cross_button) !=
+                  0U,
+          "Rebound physical button did not reach the requested guest action");
+  require((mapped.active_low_buttons & 0x0008U) == 0U,
+          "Controller remap discarded a non-bindable Start press");
+
+  auto swapped_sticks = sf::platform::ControllerButtonBindings{};
+  swapped_sticks.stick_layout =
+      ControllerStickLayout::character_right_camera_left;
+  const auto swapped = sf::platform::applyMohUndergroundControllerBindings(
+      physical, swapped_sticks);
+  require(swapped.analog == std::array<std::uint8_t, 4U>{99U, 88U, 17U, 34U},
+          "Player stick layout was not applied to the guest axes");
+
+  auto player_one_bindings = sf::platform::ControllerButtonBindings{};
+  auto player_two_bindings = sf::platform::ControllerButtonBindings{};
+  static_cast<void>(sf::game::rebindControllerButton(
+      player_two_bindings, ControllerAction::shoot,
+      sf::game::controller_cross_button));
+  const auto player_one = sf::platform::applyMohUndergroundControllerBindings(
+      physical, player_one_bindings);
+  const auto player_two = sf::platform::applyMohUndergroundControllerBindings(
+      physical, player_two_bindings);
+  require((player_one.active_low_buttons & sf::game::controller_cross_button) ==
+              0U &&
+              (player_two.active_low_buttons &
+               sf::game::controller_square_button) == 0U,
+          "Player 1 and player 2 controller bindings were not independent");
+
+  auto disconnected = physical;
+  disconnected.connected = false;
+  require(sf::platform::applyMohUndergroundControllerBindings(
+              disconnected, rebound) == disconnected,
+          "Controller remap changed a disconnected pad");
+}
+
 void testMohUndergroundRuntimeMouseLook() {
   using sf::platform::RuntimePadInput;
   const RuntimePadInput neutral;
@@ -756,13 +815,13 @@ void testMohUndergroundRuntimeMouseLook() {
 
   const auto full = sf::platform::applyMohUndergroundRuntimeMouseLook(
       neutral, 10, -8, true, 100U, analog_actions);
-  require(full.analog == std::array<std::uint8_t, 4U>{196U, 70U, 128U, 128U},
+  require(full.analog == std::array<std::uint8_t, 4U>{206U, 60U, 128U, 128U},
           "Focused MOHU mouse look produced the wrong 100-percent stick "
           "sample without aim gating");
 
   const auto half = sf::platform::applyMohUndergroundRuntimeMouseLook(
       neutral, 10, -8, true, 50U, analog_actions);
-  require(half.analog == std::array<std::uint8_t, 4U>{176U, 85U, 128U, 128U},
+  require(half.analog == std::array<std::uint8_t, 4U>{181U, 80U, 128U, 128U},
           "MOHU mouse sensitivity did not scale both look axes");
 
   const auto saturated = sf::platform::applyMohUndergroundRuntimeMouseLook(
@@ -777,7 +836,7 @@ void testMohUndergroundRuntimeMouseLook() {
   };
   const auto combined = sf::platform::applyMohUndergroundRuntimeMouseLook(
       physical, -2, 3, true, 100U, analog_actions);
-  require(combined.analog == std::array<std::uint8_t, 4U>{104U, 159U, 99U, 88U},
+  require(combined.analog == std::array<std::uint8_t, 4U>{102U, 163U, 99U, 88U},
           "MOHU mouse look did not combine with the physical right stick");
 
   const auto extremes = sf::platform::applyMohUndergroundRuntimeMouseLook(
@@ -797,34 +856,22 @@ void testMohUndergroundRuntimeMouseLook() {
   require((aimed.active_low_buttons & 0x00f0U) == 0x00f0U &&
               (aimed.active_low_buttons & 0x0200U) == 0U &&
               aimed.analog ==
-                  std::array<std::uint8_t, 4U>{128U, 128U, 186U, 78U},
+                  std::array<std::uint8_t, 4U>{128U, 128U, 196U, 68U},
           "MOHU mouse aim still moved the chase camera");
 
   const auto turning = sf::platform::applyMohUndergroundRuntimeMouseLook(
       neutral, -10, 8, true, 100U, directional_actions);
   require(turning.active_low_buttons == 0xffffU &&
               turning.analog ==
-                  std::array<std::uint8_t, 4U>{60U, 186U, 60U, 128U},
+                  std::array<std::uint8_t, 4U>{50U, 196U, 50U, 128U},
           "MOHU chase mouse look was not continuous on camera and player axes");
 
   const auto fine_turning = sf::platform::applyMohUndergroundRuntimeMouseLook(
       neutral, 1, 0, true, 100U, directional_actions);
   require(fine_turning.active_low_buttons == 0xffffU &&
               fine_turning.analog ==
-                  std::array<std::uint8_t, 4U>{160U, 128U, 160U, 128U},
+                  std::array<std::uint8_t, 4U>{161U, 128U, 161U, 128U},
           "Fine camera motion did not retain proportional player follow");
-
-  const auto steer_right = sf::platform::applyMohUndergroundRuntimeMouseLook(
-      neutral, 0, 0, true, 100U, directional_actions, 1.0);
-  const auto steer_left = sf::platform::applyMohUndergroundRuntimeMouseLook(
-      neutral, 0, 0, true, 100U, directional_actions, -1.0);
-  const auto opposed_steering =
-      sf::platform::applyMohUndergroundRuntimeMouseLook(
-          neutral, 10, 0, true, 100U, directional_actions, -1.0);
-  require(steer_right.analog[0U] == 166U && steer_left.analog[0U] == 90U &&
-              opposed_steering.analog[0U] == 186U,
-          "WASD camera steering was not smooth, directional, or subordinate "
-          "to mouse look");
 
   const auto released = sf::platform::applyMohUndergroundRuntimeMouseLook(
       neutral, 0, 0, true, 100U, directional_actions);
@@ -1400,6 +1447,7 @@ int main() {
     testDeviceAwareInputPromptText();
     testBoundKeyboardMouseActionMatrix();
     testMohUndergroundRuntimePadMapping();
+    testMohUndergroundControllerBindings();
     testMohUndergroundRuntimeMouseLook();
     testPcActionsAndEdges();
     testFirstPersonMousePrecisionTuning();

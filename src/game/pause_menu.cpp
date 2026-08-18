@@ -392,9 +392,9 @@ PauseMenuCommand PauseMenu::update(const PauseMenuInput &input) {
     binding_pending_ = false;
     return resumeCommand();
   }
-  const auto has_navigation_input = input.previous || input.next ||
-                                    input.left || input.right ||
-                                    input.confirm || input.cancel;
+  const auto has_navigation_input =
+      input.previous || input.next || input.left || input.right ||
+      input.confirm || input.cancel || input.pointer_selection.has_value();
   if (transition_.input_delay > 0 && has_navigation_input) {
     return {};
   }
@@ -402,6 +402,23 @@ PauseMenuCommand PauseMenu::update(const PauseMenuInput &input) {
   const auto old_screen = screen();
   const auto old_section = sectionSelection();
   const auto old_selection = selection();
+  if (input.pointer_selection) {
+    const auto requested = static_cast<std::uint32_t>(*input.pointer_selection);
+    const auto commands = buildRenderCommands();
+    const auto active = std::ranges::find_if(
+        commands, [requested](const PauseRenderCommand &command) {
+          return command.kind == PauseRenderKind::menu_item &&
+                 command.enabled && command.id == requested;
+        });
+    if (active != commands.end()) {
+      current().selection = *input.pointer_selection;
+      if (old_screen == PauseScreen::root &&
+          current().selection != old_selection) {
+        current().page = 0U;
+      }
+    }
+  }
+
   PauseMenuCommand result;
   switch (screen()) {
   case PauseScreen::root:
@@ -1373,12 +1390,11 @@ std::vector<PauseRenderCommand> PauseMenu::buildRenderCommands() const {
       const auto cheat = retailCheatAt(index);
       const auto selected = index == state.selection;
       const auto y = static_cast<std::int16_t>(51 + index * 21);
-      auto &item = addLeft(PauseRenderKind::menu_item,
-                           PauseRect{56, y, 126, 11},
-                           retailCheatDisplayName(cheat),
-                           selected ? PauseColorRole::selected
-                                    : PauseColorRole::normal,
-                           PauseTextAlignment::left);
+      auto &item =
+          addLeft(PauseRenderKind::menu_item, PauseRect{56, y, 126, 11},
+                  retailCheatDisplayName(cheat),
+                  selected ? PauseColorRole::selected : PauseColorRole::normal,
+                  PauseTextAlignment::left);
       item.id = static_cast<std::uint32_t>(index);
       item.selected = selected;
       addLeft(PauseRenderKind::text, PauseRect{184, y, 29, 11},
@@ -1455,9 +1471,8 @@ std::vector<PauseRenderCommand> PauseMenu::buildRenderCommands() const {
         std::string{"Preset config: "} +
             std::string{controllerPresetName(settings_.controller_preset)},
         std::string{"Controller Configuration:"},
-        std::string{"Stick Layout: "} +
-            std::string{
-                controllerStickLayoutName(settings_.bindings.stick_layout)},
+        std::string{"Stick Layout: "} + std::string{controllerStickLayoutName(
+                                            settings_.bindings.stick_layout)},
         std::string{"Invert Aim: "} + (settings_.invert_aim ? "yes" : "no"),
         std::string{"Vibration: "} + (settings_.vibration ? "yes" : "no"),
         std::string{"Reset"},
@@ -1497,9 +1512,9 @@ std::vector<PauseRenderCommand> PauseMenu::buildRenderCommands() const {
     }
     addInformation(PauseRenderKind::text, PauseRect{240, 44, 101, 60},
                    "Controller\nBindings");
-    addHint(PauseAcdLayout::hint,
-            binding_pending_ ? "Press new button for action  %t cancel"
-                             : "%x select   %t back");
+    addHint(PauseAcdLayout::hint, binding_pending_
+                                      ? "Press new button for action  %t cancel"
+                                      : "%x select   %t back");
     break;
   }
   case PauseScreen::brightness: {
@@ -1899,7 +1914,6 @@ void applyControllerPreset(PauseSettings &settings, ControllerPreset preset) {
   settings.bindings.stick_layout = stick_layout;
   settings.controller_preset = preset;
 }
-
 
 std::uint32_t controllerButtonForAction(const PauseSettings &settings,
                                         ControllerAction action) noexcept {

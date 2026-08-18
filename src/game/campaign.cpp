@@ -12,8 +12,7 @@ CampaignProgress::CampaignProgress(
     std::optional<std::uint32_t> pending_eol_mission) noexcept
     : save_slot_(save_slot), mission_index_(mission_index),
       maximum_unlocked_mission_(maximum_unlocked_mission),
-      opening_movie_handled_(opening_movie_handled),
-      difficulty_(difficulty),
+      opening_movie_handled_(opening_movie_handled), difficulty_(difficulty),
       pending_eol_mission_(pending_eol_mission) {}
 
 CampaignSaveResult
@@ -23,6 +22,9 @@ CampaignSaveMenu::update(const CampaignSaveInput &input,
     return {};
   }
   if (phase_ == CampaignSavePhase::prompt) {
+    if (input.pointer_selection && *input.pointer_selection < 2U) {
+      save_selected_ = *input.pointer_selection == 0U;
+    }
     if (input.previous || input.next) {
       save_selected_ = !save_selected_;
     }
@@ -40,6 +42,10 @@ CampaignSaveMenu::update(const CampaignSaveInput &input,
     if (input.cancel) {
       phase_ = CampaignSavePhase::prompt;
       return {};
+    }
+    if (input.pointer_selection &&
+        *input.pointer_selection < title_save_slot_count) {
+      slot_selection_ = *input.pointer_selection;
     }
     if (input.next) {
       slot_selection_ = (slot_selection_ + 1U) % title_save_slot_count;
@@ -60,6 +66,9 @@ CampaignSaveMenu::update(const CampaignSaveInput &input,
     return {};
   }
 
+  if (input.pointer_selection && *input.pointer_selection < 2U) {
+    overwrite_selected_ = *input.pointer_selection == 0U;
+  }
   if (input.previous || input.next) {
     overwrite_selected_ = !overwrite_selected_;
   }
@@ -104,17 +113,15 @@ CampaignProgress::startNew(TitleSaveSlots &slots, std::uint32_t mission_index,
                         opening_movie_already_played, difficulty);
 }
 
-std::optional<CampaignProgress>
-CampaignProgress::startNewInSlot(TitleSaveSlots &slots, std::size_t save_slot,
-                                 std::uint32_t mission_index,
-                                 bool opening_movie_already_played,
-                                 CampaignDifficulty difficulty) noexcept {
+std::optional<CampaignProgress> CampaignProgress::startNewInSlot(
+    TitleSaveSlots &slots, std::size_t save_slot, std::uint32_t mission_index,
+    bool opening_movie_already_played, CampaignDifficulty difficulty) noexcept {
   if (save_slot >= slots.size() || mission_index >= missionCatalog().size() ||
       !validCampaignDifficulty(difficulty)) {
     return std::nullopt;
   }
-  slots[save_slot] = TitleSaveSlot{true, mission_index, false, std::nullopt,
-                                   std::nullopt, difficulty};
+  slots[save_slot] = TitleSaveSlot{true,         mission_index, false,
+                                   std::nullopt, std::nullopt,  difficulty};
   return CampaignProgress{save_slot, mission_index, mission_index,
                           opening_movie_already_played, difficulty};
 }
@@ -135,10 +142,10 @@ CampaignProgress::resume(const TitleSaveSlots &slots,
   // Loading a mission starts before its native SOL handoff. This includes
   // Georgia Street: only New Game has already played SOL/SUBWAY.STR in the
   // title overlay.
-  return CampaignProgress{save_slot, slot.mission_index, slot.mission_index,
-                          slot.pending_eol_mission.has_value(),
-                          slot.difficulty,
-                          slot.pending_eol_mission};
+  return CampaignProgress{
+      save_slot,          slot.mission_index,
+      slot.mission_index, slot.pending_eol_mission.has_value(),
+      slot.difficulty,    slot.pending_eol_mission};
 }
 
 bool CampaignProgress::openingMovieRequired(
@@ -166,8 +173,9 @@ bool CampaignProgress::stageMissionCompletionInSlot(
     carry.reset();
   }
   save_slot_ = save_slot;
-  slots[save_slot] = TitleSaveSlot{true, mission_index_, false, mission_index_,
-                                   std::move(carry), difficulty_};
+  slots[save_slot] =
+      TitleSaveSlot{true,           mission_index_,   false,
+                    mission_index_, std::move(carry), difficulty_};
   pending_eol_mission_ = mission_index_;
   opening_movie_handled_ = true;
   return true;
@@ -191,12 +199,14 @@ CampaignProgress::completeMission(TitleSaveSlots &slots) noexcept {
   const auto saved_carry = saved.carry;
   const auto result = advance();
   if (result == CampaignAdvance::campaign_complete) {
-    slots[*save_slot_] = TitleSaveSlot{true, completed_mission, true,
-                                       std::nullopt, std::nullopt,
-                                       difficulty_};
+    slots[*save_slot_] = TitleSaveSlot{
+        true, completed_mission, true, std::nullopt, std::nullopt, difficulty_};
   } else if (result == CampaignAdvance::next_mission) {
     slots[*save_slot_] = TitleSaveSlot{
-        true, mission_index_, false, std::nullopt,
+        true,
+        mission_index_,
+        false,
+        std::nullopt,
         campaignMissionsShareCarry(completed_mission, mission_index_)
             ? saved_carry
             : std::nullopt,

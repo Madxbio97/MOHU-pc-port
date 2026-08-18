@@ -33,6 +33,7 @@ struct CampaignSaveInput {
   bool next{};
   bool confirm{};
   bool cancel{};
+  std::optional<std::size_t> pointer_selection;
 };
 
 struct CampaignSaveResult {
@@ -69,22 +70,17 @@ private:
 // the next package, its SOL movie and the durable title save slot.
 class CampaignProgress final {
 public:
-  [[nodiscard]] static std::optional<CampaignProgress>
-  startUnsaved(std::uint32_t mission_index,
-               bool opening_movie_already_played,
-               CampaignDifficulty difficulty =
-                   CampaignDifficulty::original) noexcept;
-  [[nodiscard]] static std::optional<CampaignProgress>
-  startNew(TitleSaveSlots &slots, std::uint32_t mission_index,
-           bool opening_movie_already_played,
-           CampaignDifficulty difficulty =
-               CampaignDifficulty::original) noexcept;
-  [[nodiscard]] static std::optional<CampaignProgress>
-  startNewInSlot(TitleSaveSlots &slots, std::size_t save_slot,
-                 std::uint32_t mission_index,
-                 bool opening_movie_already_played,
-                 CampaignDifficulty difficulty =
-                     CampaignDifficulty::original) noexcept;
+  [[nodiscard]] static std::optional<CampaignProgress> startUnsaved(
+      std::uint32_t mission_index, bool opening_movie_already_played,
+      CampaignDifficulty difficulty = CampaignDifficulty::original) noexcept;
+  [[nodiscard]] static std::optional<CampaignProgress> startNew(
+      TitleSaveSlots &slots, std::uint32_t mission_index,
+      bool opening_movie_already_played,
+      CampaignDifficulty difficulty = CampaignDifficulty::original) noexcept;
+  [[nodiscard]] static std::optional<CampaignProgress> startNewInSlot(
+      TitleSaveSlots &slots, std::size_t save_slot, std::uint32_t mission_index,
+      bool opening_movie_already_played,
+      CampaignDifficulty difficulty = CampaignDifficulty::original) noexcept;
   [[nodiscard]] static std::optional<CampaignProgress>
   resume(const TitleSaveSlots &slots, std::size_t save_slot) noexcept;
 

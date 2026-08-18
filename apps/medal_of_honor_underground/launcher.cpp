@@ -1,6 +1,7 @@
 #include "launcher.hpp"
 
 #include "sf/game/localization.hpp"
+#include "sf/psx/memory_card_hle.hpp"
 
 #ifdef _WIN32
 
@@ -58,6 +59,8 @@ constexpr int dossier_control_id = 1014;
 constexpr int vsync_control_id = 1016;
 constexpr int frame_limit_control_id = 1017;
 constexpr int controller_protocol_control_id = 1021;
+constexpr int controller_player_1_device_control_id = 1025;
+constexpr int controller_player_2_device_control_id = 1026;
 constexpr int deployment_page_control_id = 1022;
 constexpr int graphics_page_control_id = 1023;
 constexpr int input_page_control_id = 1024;
@@ -246,6 +249,15 @@ public:
   operator=(const LauncherControllerCapture &) = delete;
   ~LauncherControllerCapture() { shutdown(); }
 
+  void setDeviceIndex(int index) noexcept {
+    if (device_index_ == index) {
+      return;
+    }
+    cancelCapture();
+    closeController();
+    device_index_ = index;
+  }
+
   bool initialize(ControllerProtocol protocol) noexcept {
     if (initialized_) {
       return true;
@@ -280,13 +292,14 @@ public:
       closeController();
     }
     if (joystick_ == nullptr) {
-      openFirstController();
+      openSelectedController();
     }
     return previous_instance != instance_id_ || previous_family != family_ ||
            previous_name != name_;
   }
 
   [[nodiscard]] bool connected() const noexcept { return joystick_ != nullptr; }
+  [[nodiscard]] int deviceIndex() const noexcept { return device_index_; }
   [[nodiscard]] ControllerPromptFamily family() const noexcept {
     return family_;
   }
@@ -363,30 +376,34 @@ private:
     }
   }
 
-  void openFirstController() noexcept {
-    for (auto device_index = 0; device_index < SDL_NumJoysticks();
-         ++device_index) {
-      if (SDL_IsGameController(device_index) == SDL_TRUE) {
-        controller_ = SDL_GameControllerOpen(device_index);
-        if (controller_ != nullptr) {
-          joystick_ = SDL_GameControllerGetJoystick(controller_);
-        }
-      } else {
-        joystick_ = SDL_JoystickOpen(device_index);
-      }
-      if (joystick_ == nullptr) {
-        continue;
-      }
-      instance_id_ = SDL_JoystickInstanceID(joystick_);
-      const auto *device_name = controller_ != nullptr
-                                    ? SDL_GameControllerName(controller_)
-                                    : SDL_JoystickName(joystick_);
-      name_ = widenUtf8(device_name != nullptr ? device_name : "Controller");
-      family_ = controller_ != nullptr
-                    ? familyFromController(controller_, name_)
-                    : controllerFamilyFromName(name_);
+  void openSelectedController() noexcept {
+    const auto device_index = device_index_;
+    if (device_index < 0 || device_index >= SDL_NumJoysticks()) {
       return;
     }
+    if (SDL_IsGameController(device_index) == SDL_TRUE) {
+      controller_ = SDL_GameControllerOpen(device_index);
+      if (controller_ != nullptr) {
+        joystick_ = SDL_GameControllerGetJoystick(controller_);
+      }
+    }
+    if (joystick_ == nullptr) {
+      if (controller_ != nullptr) {
+        SDL_GameControllerClose(controller_);
+        controller_ = nullptr;
+      }
+      joystick_ = SDL_JoystickOpen(device_index);
+    }
+    if (joystick_ == nullptr) {
+      return;
+    }
+    instance_id_ = SDL_JoystickInstanceID(joystick_);
+    const auto *device_name = controller_ != nullptr
+                                  ? SDL_GameControllerName(controller_)
+                                  : SDL_JoystickName(joystick_);
+    name_ = widenUtf8(device_name != nullptr ? device_name : "Controller");
+    family_ = controller_ != nullptr ? familyFromController(controller_, name_)
+                                     : controllerFamilyFromName(name_);
   }
 
   void closeController() noexcept {
@@ -477,6 +494,7 @@ private:
   }
 
   bool initialized_{};
+  int device_index_{};
   SDL_GameController *controller_{};
   SDL_Joystick *joystick_{};
   SDL_JoystickID instance_id_{-1};
@@ -509,6 +527,8 @@ struct LauncherState {
   HWND antialiasing_combo{};
   HWND frame_limit_combo{};
   HWND controller_protocol_combo{};
+  HWND controller_player_1_device_combo{};
+  HWND controller_player_2_device_combo{};
   HWND game_image_edit{};
   int desktop_width{};
   int desktop_height{};
@@ -530,7 +550,11 @@ struct LauncherState {
 
 struct ControlsState {
   KeyboardMouseBindings *input{};
+  std::array<ControllerButtonBindings *, runtime_controller_count>
+      controllers{};
+  std::array<int, 2U> controller_device_indices{0, 1};
   ControllerButtonBindings *controller{};
+  std::size_t controller_slot{};
   std::uint32_t *mouse_sensitivity_percent{};
   HWND list{};
   HWND change_button{};
@@ -645,8 +669,9 @@ bool writeProfileInteger(const std::filesystem::path &path,
   return WritePrivateProfileStringW(section, key, text.c_str(), path.c_str()) !=
          FALSE;
 }
-bool writeControllerBindingsFile(const std::filesystem::path &path,
-                                 const ControllerButtonBindings &bindings) {
+bool writeControllerBindingsFile(
+    const std::filesystem::path &path, const ControllerButtonBindings &bindings,
+    const wchar_t *section = L"ControllerBindings") {
   if (!game::areControllerBindingsValid(bindings)) {
     return false;
   }
@@ -664,9 +689,8 @@ bool writeControllerBindingsFile(const std::filesystem::path &path,
   section_data.append(std::to_wstring(static_cast<int>(bindings.stick_layout)));
   section_data.push_back(L'\0');
   section_data.push_back(L'\0');
-  const auto stored =
-      WritePrivateProfileSectionW(L"ControllerBindings", section_data.c_str(),
-                                  path.c_str()) != FALSE;
+  const auto stored = WritePrivateProfileSectionW(section, section_data.c_str(),
+                                                  path.c_str()) != FALSE;
   const auto flushed = WritePrivateProfileStringW(nullptr, nullptr, nullptr,
                                                   path.c_str()) != FALSE;
   return stored && flushed;
@@ -784,6 +808,18 @@ void loadSettingsFile(GraphicsSettings &graphics, KeyboardMouseBindings &input,
     graphics.controller_protocol =
         static_cast<ControllerProtocol>(controller_protocol);
   }
+  for (std::size_t player{}; player < graphics.controller_device_indices.size();
+       ++player) {
+    const auto key = player == 0U ? L"Player1Device" : L"Player2Device";
+    const auto device = readProfileInteger(
+        path, L"Controller", key, graphics.controller_device_indices[player]);
+    if (isValidControllerDeviceIndex(device)) {
+      graphics.controller_device_indices[player] = device;
+    }
+  }
+  if (!areControllerDeviceRoutesValid(graphics.controller_device_indices)) {
+    graphics.controller_device_indices = {0, 1};
+  }
   graphics.controller_vibration =
       readProfileInteger(path, L"Controller", L"Vibration",
                          graphics.controller_vibration ? 1 : 0) != 0;
@@ -853,20 +889,25 @@ void loadSettingsFile(GraphicsSettings &graphics, KeyboardMouseBindings &input,
     static_cast<void>(writeRuntimeActionBindingsFile(path, runtime_actions));
   }
 
-  auto loaded_controller = graphics.controller_bindings;
-  for (const auto &metadata : game::controllerActionCatalog()) {
-    const auto key = widenAscii(metadata.config_key);
-    const auto loaded = static_cast<std::uint32_t>(readProfileInteger(
-        path, L"ControllerBindings", key.c_str(),
-        static_cast<int>(loaded_controller[metadata.action])));
-    loaded_controller[metadata.action] = loaded;
-  }
-  loaded_controller.stick_layout = static_cast<game::ControllerStickLayout>(
-      readProfileInteger(path, L"ControllerBindings", L"StickLayout",
-                         static_cast<int>(loaded_controller.stick_layout)));
-  if (game::areControllerBindingsValid(loaded_controller)) {
-    graphics.controller_bindings = loaded_controller;
-  }
+  const auto load_controller_bindings = [&](const wchar_t *section,
+                                            auto fallback) {
+    for (const auto &metadata : game::controllerActionCatalog()) {
+      const auto key = widenAscii(metadata.config_key);
+      fallback[metadata.action] = static_cast<std::uint32_t>(
+          readProfileInteger(path, section, key.c_str(),
+                             static_cast<int>(fallback[metadata.action])));
+    }
+    fallback.stick_layout = static_cast<game::ControllerStickLayout>(
+        readProfileInteger(path, section, L"StickLayout",
+                           static_cast<int>(fallback.stick_layout)));
+    return game::areControllerBindingsValid(fallback)
+               ? fallback
+               : ControllerButtonBindings{};
+  };
+  graphics.controller_bindings = load_controller_bindings(
+      L"ControllerBindings", graphics.controller_bindings);
+  graphics.controller_bindings_player_2 = load_controller_bindings(
+      L"ControllerBindingsPlayer2", graphics.controller_bindings_player_2);
   migrateKeyboardMouseBindings(input, stored_keyboard_mouse_bindings_version);
 }
 
@@ -909,6 +950,10 @@ void saveSettingsFile(
                                                                          : 1);
   writeProfileInteger(path, L"Controller", L"Protocol",
                       static_cast<int>(graphics.controller_protocol));
+  writeProfileInteger(path, L"Controller", L"Player1Device",
+                      graphics.controller_device_indices[0U]);
+  writeProfileInteger(path, L"Controller", L"Player2Device",
+                      graphics.controller_device_indices[1U]);
   writeProfileInteger(path, L"Controller", L"Vibration",
                       graphics.controller_vibration ? 1 : 0);
   writeProfileInteger(path, L"KeyboardMouse", L"MouseSensitivity",
@@ -926,6 +971,9 @@ void saveSettingsFile(
   static_cast<void>(writeRuntimeActionBindingsFile(path, runtime_actions));
   static_cast<void>(
       writeControllerBindingsFile(path, graphics.controller_bindings));
+  static_cast<void>(
+      writeControllerBindingsFile(path, graphics.controller_bindings_player_2,
+                                  L"ControllerBindingsPlayer2"));
   saveGameImagePath(cue_path);
 }
 
@@ -1150,10 +1198,14 @@ std::wstring controllerButtonName(ControllerPromptFamily family,
 }
 
 std::wstring controllerDeviceDescription(const ControlsState &state) {
-  if (!state.controller_capture.connected()) {
-    return L"No controller detected.";
+  const auto player = L"Player " + std::to_wstring(state.controller_slot + 1U);
+  if (state.controller_capture.deviceIndex() == disabled_controller_device) {
+    return player + L": physical controller disabled.";
   }
-  auto result = std::wstring{state.controller_capture.name()};
+  if (!state.controller_capture.connected()) {
+    return player + L": no controller detected.";
+  }
+  auto result = player + L": " + std::wstring{state.controller_capture.name()};
   if (!result.empty()) {
     result += L"  /  ";
   }
@@ -1580,9 +1632,12 @@ void drawControlsFrame(HWND window, ControlsState &state) {
   SetTextColor(dc, launcher_muted_text_color);
   SelectObject(dc, state.ui_font);
   RECT subtitle{31, 60, client.right - 28, 86};
-  const auto *subtitle_text = state.controller_mode
-                                  ? L"OSS FIELD TERMINAL  /  CONTROLLER"
-                                  : L"OSS FIELD TERMINAL  /  KEYBOARD + MOUSE";
+  const auto *subtitle_text = L"OSS FIELD TERMINAL  /  KEYBOARD + MOUSE";
+  if (state.controller_mode) {
+    subtitle_text = state.controller_slot == 0U
+                        ? L"OSS FIELD TERMINAL  /  CONTROLLER 1"
+                        : L"OSS FIELD TERMINAL  /  CONTROLLER 2";
+  }
   DrawTextW(dc, subtitle_text, -1, &subtitle,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
@@ -1614,6 +1669,10 @@ LRESULT CALLBACK controlsWindowProc(HWND window, UINT message, WPARAM w_param,
         100, input_device_control_id, state->ui_font);
     SendMessageW(state->input_device_combo, CB_ADDSTRING, 0,
                  reinterpret_cast<LPARAM>(L"Keyboard + Mouse"));
+    SendMessageW(state->input_device_combo, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(L"Controller 1"));
+    SendMessageW(state->input_device_combo, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(L"Controller 2"));
     SendMessageW(state->input_device_combo, CB_SETCURSEL, 0, 0);
     state->list = createControl(
         window, L"LISTBOX", L"",
@@ -1722,8 +1781,17 @@ LRESULT CALLBACK controlsWindowProc(HWND window, UINT message, WPARAM w_param,
   case WM_COMMAND:
     if (LOWORD(w_param) == input_device_control_id &&
         HIWORD(w_param) == CBN_SELCHANGE) {
-      state->controller_mode =
-          SendMessageW(state->input_device_combo, CB_GETCURSEL, 0, 0) == 1;
+      const auto selection =
+          SendMessageW(state->input_device_combo, CB_GETCURSEL, 0, 0);
+      state->controller_mode = selection > 0;
+      if (state->controller_mode) {
+        state->controller_slot =
+            std::min<std::size_t>(static_cast<std::size_t>(selection - 1),
+                                  state->controllers.size() - 1U);
+        state->controller = state->controllers[state->controller_slot];
+        state->controller_capture.setDeviceIndex(
+            state->controller_device_indices[state->controller_slot]);
+      }
       state->selected = 0U;
       state->capture.reset();
       state->controller_capture.cancelCapture();
@@ -1840,7 +1908,9 @@ LRESULT CALLBACK controlsWindowProc(HWND window, UINT message, WPARAM w_param,
 }
 
 void showControlsWindow(HWND owner, KeyboardMouseBindings &input,
-                        ControllerButtonBindings &controller,
+                        ControllerButtonBindings &controller_player_1,
+                        ControllerButtonBindings &controller_player_2,
+                        const std::array<int, 2U> &controller_device_indices,
                         ControllerProtocol protocol,
                         std::uint32_t &mouse_sensitivity_percent) {
   const auto instance = GetModuleHandleW(nullptr);
@@ -1860,15 +1930,19 @@ void showControlsWindow(HWND owner, KeyboardMouseBindings &input,
   RECT bounds{0, 0, controls_client_width, controls_client_height};
   AdjustWindowRectEx(&bounds, style, FALSE, extended_style);
   auto staged_input = input;
-  auto staged_controller = controller;
+  auto staged_controller_player_1 = controller_player_1;
+  auto staged_controller_player_2 = controller_player_2;
   const auto staged_mouse_sensitivity_option =
       nearestMouseSensitivityOption(mouse_sensitivity_percent);
   auto staged_mouse_sensitivity =
       mouse_sensitivity_options[staged_mouse_sensitivity_option].percent;
-  ControlsState state{.input = &staged_input,
-                      .controller = &staged_controller,
-                      .mouse_sensitivity_percent = &staged_mouse_sensitivity,
-                      .protocol = protocol};
+  ControlsState state{
+      .input = &staged_input,
+      .controllers = {&staged_controller_player_1, &staged_controller_player_2},
+      .controller_device_indices = controller_device_indices,
+      .controller = &staged_controller_player_1,
+      .mouse_sensitivity_percent = &staged_mouse_sensitivity,
+      .protocol = protocol};
   state.title_font =
       CreateFontW(-32, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                   OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
@@ -1947,7 +2021,8 @@ void showControlsWindow(HWND owner, KeyboardMouseBindings &input,
   }
   if (state.accepted) {
     input = staged_input;
-    controller = staged_controller;
+    controller_player_1 = staged_controller_player_1;
+    controller_player_2 = staged_controller_player_2;
     mouse_sensitivity_percent = staged_mouse_sensitivity;
   }
   DeleteObject(state.panel_brush);
@@ -2546,6 +2621,38 @@ void populateControllerProtocols(LauncherState &state) {
   SendMessageW(state.controller_protocol_combo, CB_SETDROPPEDWIDTH, 230, 0);
 }
 
+void populateControllerDevices(LauncherState &state) {
+  constexpr std::array<const wchar_t *, 3U> labels{L"Disabled (keyboard/mouse)",
+                                                   L"Physical controller 1",
+                                                   L"Physical controller 2"};
+  const std::array controls{state.controller_player_1_device_combo,
+                            state.controller_player_2_device_combo};
+  for (std::size_t player{}; player < controls.size(); ++player) {
+    for (const auto *label : labels) {
+      SendMessageW(controls[player], CB_ADDSTRING, 0,
+                   reinterpret_cast<LPARAM>(label));
+    }
+    const auto device = state.settings.controller_device_indices[player];
+    const auto selected = isValidControllerDeviceIndex(device) ? device + 1 : 0;
+    SendMessageW(controls[player], CB_SETCURSEL, selected, 0);
+    SendMessageW(controls[player], CB_SETDROPPEDWIDTH, 250, 0);
+  }
+}
+
+void updateControllerDeviceSettings(LauncherState &state) noexcept {
+  const std::array controls{state.controller_player_1_device_combo,
+                            state.controller_player_2_device_combo};
+  auto routes = state.settings.controller_device_indices;
+  for (std::size_t player{}; player < controls.size(); ++player) {
+    routes[player] =
+        static_cast<int>(SendMessageW(controls[player], CB_GETCURSEL, 0, 0)) -
+        1;
+  }
+  if (areControllerDeviceRoutesValid(routes)) {
+    state.settings.controller_device_indices = routes;
+  }
+}
+
 std::wstring windowText(HWND control) {
   const auto length = GetWindowTextLengthW(control);
   if (length <= 0) {
@@ -2662,6 +2769,7 @@ void acceptSettings(HWND window, LauncherState &state) {
     state.settings.controller_protocol =
         static_cast<ControllerProtocol>(controller_protocol);
   }
+  updateControllerDeviceSettings(state);
   state.language = game::GameLanguage::english;
   state.accepted = true;
   DestroyWindow(window);
@@ -2913,14 +3021,28 @@ LRESULT CALLBACK launcherWindowProc(HWND window, UINT message, WPARAM w_param,
         createPageControl(window, *state, LauncherPage::input, L"COMBOBOX", L"",
                           WS_TABSTOP | CBS_DROPDOWNLIST, 224, 254, 270, 128,
                           controller_protocol_control_id, state->ui_font);
+    createPageControl(window, *state, LauncherPage::input, L"STATIC",
+                      L"Player 1 device", 0, 54, 304, 160, 22, 0,
+                      state->ui_font);
+    state->controller_player_1_device_combo = createPageControl(
+        window, *state, LauncherPage::input, L"COMBOBOX", L"",
+        WS_TABSTOP | CBS_DROPDOWNLIST, 224, 298, 270, 100,
+        controller_player_1_device_control_id, state->ui_font);
+    createPageControl(window, *state, LauncherPage::input, L"STATIC",
+                      L"Player 2 device", 0, 54, 344, 160, 22, 0,
+                      state->ui_font);
+    state->controller_player_2_device_combo = createPageControl(
+        window, *state, LauncherPage::input, L"COMBOBOX", L"",
+        WS_TABSTOP | CBS_DROPDOWNLIST, 224, 338, 270, 100,
+        controller_player_2_device_control_id, state->ui_font);
     createPageControl(
         window, *state, LauncherPage::input, L"STATIC",
         L"Configure the complete keyboard, mouse and controller action table. "
         L"Mouse look and WASD movement use the PC shooter layout.",
-        SS_LEFT, 54, 324, 440, 72, 0, state->ui_font);
+        SS_LEFT, 54, 386, 440, 54, 0, state->ui_font);
     createPageControl(window, *state, LauncherPage::input, L"BUTTON",
                       L"CONTROL ASSIGNMENTS", WS_TABSTOP | BS_OWNERDRAW, 54,
-                      424, 440, 44, controls_control_id, state->heading_font);
+                      454, 440, 44, controls_control_id, state->heading_font);
     createPageControl(window, *state, LauncherPage::input, L"STATIC",
                       L"STANDARD FIELD LAYOUT", 0, 568, 204, 300, 28, 0,
                       state->heading_font);
@@ -2943,6 +3065,7 @@ LRESULT CALLBACK launcherWindowProc(HWND window, UINT message, WPARAM w_param,
     populateAntialiasingModes(*state);
     populateFrameLimits(*state);
     populateControllerProtocols(*state);
+    populateControllerDevices(*state);
     CheckDlgButton(window, fullscreen_control_id,
                    state->settings.fullscreen ||
                            selectedResolutionIsDesktop(*state)
@@ -2987,6 +3110,22 @@ LRESULT CALLBACK launcherWindowProc(HWND window, UINT message, WPARAM w_param,
                                                          : BST_UNCHECKED);
       return 0;
     }
+    if ((LOWORD(w_param) == controller_player_1_device_control_id ||
+         LOWORD(w_param) == controller_player_2_device_control_id) &&
+        HIWORD(w_param) == CBN_SELCHANGE) {
+      const auto changed_player =
+          LOWORD(w_param) == controller_player_1_device_control_id ? 0U : 1U;
+      const auto other_player = 1U - changed_player;
+      const std::array controls{state->controller_player_1_device_combo,
+                                state->controller_player_2_device_combo};
+      const auto selected =
+          SendMessageW(controls[changed_player], CB_GETCURSEL, 0, 0);
+      if (selected > 0 && SendMessageW(controls[other_player], CB_GETCURSEL, 0,
+                                       0) == selected) {
+        SendMessageW(controls[other_player], CB_SETCURSEL, 0, 0);
+      }
+      return 0;
+    }
     if (HIWORD(w_param) != BN_CLICKED) {
       return 0;
     }
@@ -3015,8 +3154,11 @@ LRESULT CALLBACK launcherWindowProc(HWND window, UINT message, WPARAM w_param,
               static_cast<int>(ControllerProtocol::raw_input)) {
         protocol = static_cast<ControllerProtocol>(selected_protocol);
       }
+      updateControllerDeviceSettings(*state);
       showControlsWindow(window, state->input,
-                         state->settings.controller_bindings, protocol,
+                         state->settings.controller_bindings,
+                         state->settings.controller_bindings_player_2,
+                         state->settings.controller_device_indices, protocol,
                          state->settings.mouse_sensitivity_percent);
       return 0;
     }
@@ -3068,10 +3210,13 @@ void loadLauncherSettings(GraphicsSettings &graphics,
   }
 }
 
-std::filesystem::path defaultMemoryCardImagePath() noexcept {
+std::filesystem::path defaultMemoryCardImagePath(std::uint8_t slot) noexcept {
   try {
+    if (slot >= sf::psx::memory_card_slot_count) {
+      return {};
+    }
     return launcherSettingsPath(false).parent_path() / L"Saves" /
-           L"SLUS-01270.mcr";
+           (slot == 0U ? L"SLUS-01270.mcr" : L"SLUS-01270-slot2.mcr");
   } catch (...) {
     return {};
   }
@@ -3220,10 +3365,13 @@ void loadLauncherSettings(GraphicsSettings &, KeyboardMouseBindings &,
                           MohUndergroundRuntimeActionBindings &,
                           game::GameLanguage &) noexcept {}
 
-std::filesystem::path defaultMemoryCardImagePath() noexcept {
+std::filesystem::path defaultMemoryCardImagePath(std::uint8_t slot) noexcept {
   try {
+    if (slot >= sf::psx::memory_card_slot_count) {
+      return {};
+    }
     return std::filesystem::current_path() / "MedalOfHonorUndergroundPC" /
-           "Saves" / "SLUS-01270.mcr";
+           "Saves" / (slot == 0U ? "SLUS-01270.mcr" : "SLUS-01270-slot2.mcr");
   } catch (...) {
     return {};
   }

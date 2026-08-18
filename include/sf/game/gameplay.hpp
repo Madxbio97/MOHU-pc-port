@@ -70,10 +70,10 @@ buildWorldPresentationEnvelope(std::span<const std::uint16_t> retained,
                                std::span<const std::uint16_t> active,
                                bool reset_for_new_room);
 
-inline constexpr std::size_t world_terrain_lookahead_steps = 3U;
+inline constexpr std::size_t world_terrain_lookahead_steps = 5U;
 
 // Native terrain may prepare one authored look-ahead step at a time before
-// the retail portal switch. The session chains three connected steps;
+// the retail portal switch. The session chains five connected steps;
 // objects, collision and gameplay continue using the visible envelope above.
 [[nodiscard]] std::vector<std::uint16_t>
 buildWorldTerrainEnvelope(std::span<const std::uint16_t> visible,

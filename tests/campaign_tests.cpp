@@ -185,6 +185,20 @@ void testRetailSavePromptAndTransientCampaign() {
               sf::game::CampaignSaveDecision::continue_without_saving,
           "Declining the save prompt did not continue the campaign");
 
+  sf::game::CampaignSaveMenu pointer_menu;
+  static_cast<void>(
+      pointer_menu.update({.pointer_selection = 1U}, empty_slots));
+  require(!pointer_menu.saveSelected(),
+          "Save prompt pointer hover did not select No");
+  static_cast<void>(
+      pointer_menu.update({.pointer_selection = 0U}, empty_slots));
+  static_cast<void>(pointer_menu.update({.confirm = true}, empty_slots));
+  static_cast<void>(
+      pointer_menu.update({.pointer_selection = 4U}, empty_slots));
+  require(pointer_menu.phase() == sf::game::CampaignSavePhase::slots &&
+              pointer_menu.slotSelection() == 4U,
+          "Save slot pointer hover did not select its authored row");
+
   sf::game::TitleSaveSlots occupied_slots{};
   occupied_slots[0] = sf::game::TitleSaveSlot{true, 8U, false};
   sf::game::CampaignSaveMenu overwrite;
@@ -318,32 +332,26 @@ void testSaveMigrationAndCompletedSlotUi() {
                   sf::game::CampaignDifficulty::original,
           "V2 campaign save did not migrate to the current slot model");
 
-  constexpr std::string_view version_three_save{
-      "SFPC_SAVE_V3\n"
-      "0 1 4 0 0 0\n"
-      "1 0 0 0 0 0\n"
-      "2 0 0 0 0 0\n"
-      "3 0 0 0 0 0\n"
-      "4 0 0 0 0 0\n"};
-  const auto version_three =
-      sf::game::parseTitleSaveSlots(version_three_save);
-  require(version_three &&
-              (*version_three)[0].difficulty ==
-                  sf::game::CampaignDifficulty::original,
+  constexpr std::string_view version_three_save{"SFPC_SAVE_V3\n"
+                                                "0 1 4 0 0 0\n"
+                                                "1 0 0 0 0 0\n"
+                                                "2 0 0 0 0 0\n"
+                                                "3 0 0 0 0 0\n"
+                                                "4 0 0 0 0 0\n"};
+  const auto version_three = sf::game::parseTitleSaveSlots(version_three_save);
+  require(version_three && (*version_three)[0].difficulty ==
+                               sf::game::CampaignDifficulty::original,
           "V3 campaign save did not default to Original difficulty");
 
-  constexpr std::string_view version_four_save{
-      "SFPC_SAVE_V4\n"
-      "0 1 9 0 0 0 0\n"
-      "1 0 0 0 0 0 0\n"
-      "2 0 0 0 0 0 0\n"
-      "3 0 0 0 0 0 0\n"
-      "4 0 0 0 0 0 0\n"};
-  const auto version_four =
-      sf::game::parseTitleSaveSlots(version_four_save);
-  require(version_four &&
-              (*version_four)[0].difficulty ==
-                  sf::game::CampaignDifficulty::original,
+  constexpr std::string_view version_four_save{"SFPC_SAVE_V4\n"
+                                               "0 1 9 0 0 0 0\n"
+                                               "1 0 0 0 0 0 0\n"
+                                               "2 0 0 0 0 0 0\n"
+                                               "3 0 0 0 0 0 0\n"
+                                               "4 0 0 0 0 0 0\n"};
+  const auto version_four = sf::game::parseTitleSaveSlots(version_four_save);
+  require(version_four && (*version_four)[0].difficulty ==
+                              sf::game::CampaignDifficulty::original,
           "V4 campaign save did not default to Original difficulty");
 
   const auto current_bytes = sf::game::serializeTitleSaveSlots(*version_two);
@@ -427,21 +435,19 @@ void testCampaignDifficultyPersistence() {
   auto unsaved = sf::game::CampaignProgress::startUnsaved(
       0U, true, CampaignDifficulty::hard_mode);
   sf::game::TitleSaveSlots target{};
-  require(unsaved &&
-              unsaved->stageMissionCompletionInSlot(target, 3U) &&
+  require(unsaved && unsaved->stageMissionCompletionInSlot(target, 3U) &&
               target[3].difficulty == CampaignDifficulty::hard_mode,
           "Saving an unsaved Hard Mode campaign lost its difficulty");
 
   require(!sf::game::CampaignProgress::startUnsaved(
               0U, true, static_cast<CampaignDifficulty>(255U)),
           "Campaign accepted an invalid difficulty");
-  constexpr std::string_view invalid_difficulty{
-      "SFPC_SAVE_V5\n"
-      "0 1 0 0 0 0 0 3\n"
-      "1 0 0 0 0 0 0 0\n"
-      "2 0 0 0 0 0 0 0\n"
-      "3 0 0 0 0 0 0 0\n"
-      "4 0 0 0 0 0 0 0\n"};
+  constexpr std::string_view invalid_difficulty{"SFPC_SAVE_V5\n"
+                                                "0 1 0 0 0 0 0 3\n"
+                                                "1 0 0 0 0 0 0 0\n"
+                                                "2 0 0 0 0 0 0 0\n"
+                                                "3 0 0 0 0 0 0 0\n"
+                                                "4 0 0 0 0 0 0 0\n"};
   require(!sf::game::parseTitleSaveSlots(invalid_difficulty),
           "V5 parser accepted an invalid difficulty");
 }
@@ -577,8 +583,7 @@ void testExplicitFullSaveOverwrite() {
               full == before,
           "New Game changed a slot before difficulty selection");
   static_cast<void>(menu.update({}));
-  require(menu.update({.confirm = true}) ==
-                  sf::game::TitleCommand::new_game &&
+  require(menu.update({.confirm = true}) == sf::game::TitleCommand::new_game &&
               menu.phase() == sf::game::TitlePhase::menu && full == before,
           "New Game requested or changed a slot before mission completion");
 }

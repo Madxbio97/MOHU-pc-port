@@ -476,6 +476,39 @@ private:
   std::optional<RuntimeVisualPublicationState> previous_;
 };
 
+struct RuntimeAtomicFrameObservation final {
+  bool valid{};
+  bool publication{};
+};
+
+class RuntimeAtomicFrameTracker final {
+public:
+  [[nodiscard]] RuntimeAtomicFrameObservation
+  observe(std::uint64_t sequence,
+          std::uint64_t display_publication_sequence) noexcept {
+    if (observed_ && sequence <= sequence_) {
+      return {};
+    }
+    const auto publication =
+        !observed_ || display_publication_sequence != display_sequence_;
+    observed_ = true;
+    sequence_ = sequence;
+    display_sequence_ = display_publication_sequence;
+    return {.valid = true, .publication = publication};
+  }
+
+  void reset() noexcept {
+    observed_ = false;
+    sequence_ = 0U;
+    display_sequence_ = 0U;
+  }
+
+private:
+  std::uint64_t sequence_{};
+  std::uint64_t display_sequence_{};
+  bool observed_{};
+};
+
 enum class RuntimeHostPresentationMode : std::uint8_t {
   render,
   cached,
@@ -494,7 +527,8 @@ class RuntimePresentationInterpolationClock final {
 public:
   explicit RuntimePresentationInterpolationClock(
       double authored_frames_per_second = 30.0) noexcept
-      : authored_frames_per_second_(authored_frames_per_second) {
+      : authored_frames_per_second_(authored_frames_per_second),
+        authored_frame_seconds_(frameSeconds()) {
     reset();
   }
 
@@ -505,10 +539,28 @@ public:
   }
 
   void reset() noexcept {
-    elapsed_since_publication_seconds_ = valid() ? frameSeconds() : 0.0;
+    authored_frame_seconds_ = valid() ? frameSeconds() : 0.0;
+    elapsed_since_publication_seconds_ = authored_frame_seconds_;
+    publication_count_ = 0U;
   }
 
   void publishAuthoredFrame() noexcept {
+    if (valid() && publication_count_ != 0U &&
+        std::isfinite(elapsed_since_publication_seconds_)) {
+      constexpr auto minimum_interval_seconds = 1.0 / 120.0;
+      constexpr auto maximum_interval_seconds = 1.0 / 15.0;
+      const auto observed =
+          std::clamp(elapsed_since_publication_seconds_,
+                     minimum_interval_seconds, maximum_interval_seconds);
+      if (publication_count_ == 1U) {
+        authored_frame_seconds_ = observed;
+      } else {
+        constexpr auto adaptation = 0.25;
+        authored_frame_seconds_ +=
+            (observed - authored_frame_seconds_) * adaptation;
+      }
+    }
+    ++publication_count_;
     elapsed_since_publication_seconds_ = 0.0;
   }
 
@@ -519,17 +571,22 @@ public:
     if (!std::isfinite(elapsed_seconds) || elapsed_seconds < 0.0) {
       return alpha();
     }
+    constexpr auto maximum_observation_seconds = 1.0;
     elapsed_since_publication_seconds_ =
         std::min(elapsed_since_publication_seconds_ + elapsed_seconds,
-                 frameSeconds());
+                 maximum_observation_seconds);
     return alpha();
   }
 
   [[nodiscard]] double alpha() const noexcept {
-    return valid() ? std::clamp(elapsed_since_publication_seconds_ /
-                                    frameSeconds(),
-                                0.0, 1.0)
-                   : 1.0;
+    return valid() && authored_frame_seconds_ > 0.0
+               ? std::clamp(elapsed_since_publication_seconds_ /
+                                authored_frame_seconds_,
+                            0.0, 1.0)
+               : 1.0;
+  }
+  [[nodiscard]] double authoredFrameSeconds() const noexcept {
+    return authored_frame_seconds_;
   }
 
 private:
@@ -538,7 +595,9 @@ private:
   }
 
   double authored_frames_per_second_{30.0};
+  double authored_frame_seconds_{};
   double elapsed_since_publication_seconds_{};
+  std::uint64_t publication_count_{};
 };
 
 // OpenAL consumes a 44.1 kHz stream in wall-clock time, while an overloaded
@@ -617,12 +676,16 @@ public:
   explicit RuntimeGuestCadencePolicy(
       double guest_frames_per_second = 60.0,
       std::size_t maximum_catch_up_steps = runtime_guest_maximum_catch_up_steps,
-      std::size_t maximum_backlog_steps = 60U) noexcept
+      std::size_t maximum_backlog_steps = 60U,
+      std::size_t late_recovery_threshold_steps = 12U) noexcept
       : guest_frames_per_second_(guest_frames_per_second),
         maximum_catch_up_steps_(
             std::max<std::size_t>(maximum_catch_up_steps, 1U)),
         maximum_backlog_steps_(
-            std::max(maximum_backlog_steps, maximum_catch_up_steps_)) {
+            std::max(maximum_backlog_steps, maximum_catch_up_steps_)),
+        late_recovery_threshold_steps_(std::clamp(late_recovery_threshold_steps,
+                                                  maximum_catch_up_steps_,
+                                                  maximum_backlog_steps_)) {
     if (valid()) {
       accumulated_seconds_ = frameSeconds();
     }
@@ -657,7 +720,8 @@ public:
     accumulated_seconds_ = std::min(accumulated, maximum_accumulated);
     const auto accumulated_steps = static_cast<std::size_t>(
         std::floor((accumulated_seconds_ + epsilon) / frame_seconds));
-    if (!late_recovery_active_ && accumulated_steps > maximum_catch_up_steps_) {
+    if (!late_recovery_active_ &&
+        accumulated_steps > late_recovery_threshold_steps_) {
       late_recovery_active_ = true;
       late_recovery_started_for_last_advance_ = true;
       ++late_recovery_count_;
@@ -726,6 +790,7 @@ private:
   double maximum_elapsed_seconds_{};
   std::size_t maximum_catch_up_steps_{4U};
   std::size_t maximum_backlog_steps_{60U};
+  std::size_t late_recovery_threshold_steps_{12U};
   std::uint64_t late_recovery_count_{};
   bool late_recovery_active_{};
   bool late_recovery_started_for_last_advance_{};

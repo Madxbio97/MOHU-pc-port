@@ -7,8 +7,8 @@
 4. Run `ctest --preset windows-psycross-release`.
 5. Run manual gameplay, visual, audio and controller checks.
 6. Update `CHANGELOG.md` and tag the tested commit.
-7. Package the executable, required runtime DLLs, locales, licenses and user
-   documentation.
+7. Package the executable, required runtime DLLs, skyboxes, licenses and user
+   documentation with `tools/package_windows_release.ps1`.
 8. Verify the package on a clean Windows user profile.
 
 The release archive must never contain proprietary game data or user saves.

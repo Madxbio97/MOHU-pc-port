@@ -135,7 +135,12 @@ void testKeyBoundaryAndCaptureBuffers() {
   require(spu->state().voices[0].active == 0U &&
               spu->state().pending_key_on == 1U,
           "SPU applied KON before the 44.1 kHz boundary");
+  std::uint16_t pending_key{};
+  require(spu->readRegister(key_on_low, pending_key) && pending_key == 1U,
+          "Pending KON was not visible through its write latch");
   spu->mixFrames(1U);
+  require(spu->readRegister(key_on_low, pending_key) && pending_key == 0U,
+          "Consumed KON remained visible in its write latch");
   require(spu->state().voices[0].active == 1U &&
               spu->state().voices[0].adsr_phase ==
                   sf::psx::SpuAdsrPhase::attack &&
@@ -168,8 +173,7 @@ void testKeyBoundaryAndCaptureBuffers() {
   require(read_capture(0x000U) == 0x1234U &&
               read_capture(0x400U) ==
                   std::bit_cast<std::uint16_t>(std::int16_t{-0x2345}) &&
-              read_capture(0x800U) == 0U &&
-              read_capture(0xc00U) == 0U &&
+              read_capture(0x800U) == 0U && read_capture(0xc00U) == 0U &&
               capture->state().capture_buffer_position == 2U &&
               capture->interruptLine(),
           "SPU capture buffers did not store CD/voice samples or trigger IRQ");
@@ -180,6 +184,24 @@ void testKeyBoundaryAndCaptureBuffers() {
               capture->readRegister(status, status_value) &&
               (status_value & (1U << 11U)) != 0U,
           "SPUSTAT did not expose the second capture-buffer half");
+}
+
+void testInactiveVoiceStillTriggersEnabledSpuIrq() {
+  auto spu = std::make_unique<sf::psx::Spu>();
+  require(spu->writeRegister(control, control_enable),
+          "Could not prime inactive-voice SPU IRQ test");
+  spu->mixFrames(4U);
+  require(spu->writeRegister(transfer_address, sample_address_units) &&
+              spu->writeRegister(irq_address, 0U) &&
+              spu->writeRegister(control, control_enable | control_irq_enable),
+          "Could not configure inactive-voice SPU IRQ test");
+  require(spu->state().voices[0].active == 0U,
+          "Inactive-voice IRQ test unexpectedly keyed on a voice");
+  require(!spu->interruptLine(),
+          "Inactive-voice IRQ test triggered before its ADPCM read");
+  spu->mixFrames(1U);
+  require(spu->interruptLine(),
+          "IRQ-enabled inactive voice did not reread its current ADPCM block");
 }
 
 void testDmaTransfer() {
@@ -242,6 +264,23 @@ void testIrqLatchAndClear() {
   require(spu->readRegister(status, status_value) &&
               (status_value & (1U << 6U)) == 0U,
           "Cleared SPU IRQ remained visible in status");
+}
+
+void testLateIrqChecksDecodedVoiceBlock() {
+  auto spu = std::make_unique<sf::psx::Spu>();
+  require(spu->writeRegister(voice_start_address, 0U) &&
+              spu->writeRegister(control, control_enable) &&
+              spu->writeRegister(key_on_low, 1U),
+          "Could not configure late SPU IRQ voice");
+  spu->mixFrames(2U);
+  require(spu->state().voices[0].block_valid != 0U,
+          "Late SPU IRQ test did not decode its voice block");
+  require(spu->writeRegister(transfer_address, sample_address_units) &&
+              spu->writeRegister(irq_address, 0U) &&
+              spu->writeRegister(control, control_enable | control_irq_enable),
+          "Could not enable late SPU IRQ");
+  require(spu->interruptLine(),
+          "Late SPU IRQ did not detect the already decoded voice block");
 }
 
 void testCpuTickCadence() {
@@ -352,26 +391,24 @@ void testHardwarePitchClampAndPitchModulation() {
     std::fill(blocks.begin() + 18U, blocks.end(), std::byte{0x11U});
     writeRamBytes(*spu, sample_ram_base, blocks);
 
-    require(spu->writeRegister(voice_pitch, 0U) &&
-                spu->writeRegister(voice_start_address,
-                                   sample_address_units) &&
-                spu->writeRegister(voice_repeat_address,
-                                   sample_address_units) &&
-                spu->writeRegister(voice_pitch + 0x10U, 0x1000U) &&
-                spu->writeRegister(voice_start_address + 0x10U,
-                                   sample_address_units + 2U) &&
-                spu->writeRegister(voice_repeat_address + 0x10U,
-                                   sample_address_units + 2U) &&
-                spu->writeRegister(noise_mode_low, 1U) &&
-                spu->writeRegister(pitch_modulation_low, 2U) &&
-                spu->writeRegister(control,
-                                   static_cast<std::uint16_t>(control_enable |
-                                                              control_unmute |
-                                                              (0x3fU << 8U))) &&
-                spu->writeRegister(key_on_low, 3U) &&
-                spu->writeRegister(0x00cU, 0x7fffU) &&
-                spu->writeRegister(0x01cU, 0x7fffU),
-            "Could not configure SPU pitch modulation voices");
+    require(
+        spu->writeRegister(voice_pitch, 0U) &&
+            spu->writeRegister(voice_start_address, sample_address_units) &&
+            spu->writeRegister(voice_repeat_address, sample_address_units) &&
+            spu->writeRegister(voice_pitch + 0x10U, 0x1000U) &&
+            spu->writeRegister(voice_start_address + 0x10U,
+                               sample_address_units + 2U) &&
+            spu->writeRegister(voice_repeat_address + 0x10U,
+                               sample_address_units + 2U) &&
+            spu->writeRegister(noise_mode_low, 1U) &&
+            spu->writeRegister(pitch_modulation_low, 2U) &&
+            spu->writeRegister(control, static_cast<std::uint16_t>(
+                                            control_enable | control_unmute |
+                                            (0x3fU << 8U))) &&
+            spu->writeRegister(key_on_low, 3U) &&
+            spu->writeRegister(0x00cU, 0x7fffU) &&
+            spu->writeRegister(0x01cU, 0x7fffU),
+        "Could not configure SPU pitch modulation voices");
     spu->mixFrames(1U);
     spu->clearPcm();
     require(spu->writeRegister(0x00cU, 0x7fffU) &&
@@ -593,14 +630,13 @@ void testAdpcmAddressMaskAndLateLoopRegisterWrite() {
   std::fill(blocks.begin() + 34U, blocks.end(), std::byte{0x33U});
   writeRamBytes(*spu, sample_ram_base, blocks);
 
-  require(spu->writeRegister(voice_pitch, 0x1000U) &&
-              spu->writeRegister(voice_start_address,
-                                 sample_address_units + 1U) &&
-              spu->writeRegister(voice_repeat_address,
-                                 sample_address_units + 1U) &&
-              spu->writeRegister(control, control_enable) &&
-              spu->writeRegister(key_on_low, 1U),
-          "Could not configure odd-address SPU ADPCM voice");
+  require(
+      spu->writeRegister(voice_pitch, 0x1000U) &&
+          spu->writeRegister(voice_start_address, sample_address_units + 1U) &&
+          spu->writeRegister(voice_repeat_address, sample_address_units + 1U) &&
+          spu->writeRegister(control, control_enable) &&
+          spu->writeRegister(key_on_low, 1U),
+      "Could not configure odd-address SPU ADPCM voice");
   spu->mixFrames(1U);
   spu->clearPcm();
   require(spu->state().voices[0].block_address == sample_ram_base &&
@@ -611,8 +647,7 @@ void testAdpcmAddressMaskAndLateLoopRegisterWrite() {
   require(spu->state().voices[0].block_address == sample_ram_base + 16U &&
               spu->state().voices[0].first_block == 0U,
           "SPU did not finish the first ADPCM block");
-  require(spu->writeRegister(voice_repeat_address,
-                             sample_address_units + 4U),
+  require(spu->writeRegister(voice_repeat_address, sample_address_units + 4U),
           "Could not write a late SPU repeat address");
   spu->mixFrames(1U);
   std::uint16_t repeat_register{};
@@ -664,10 +699,8 @@ void testSnapshotRestoresNextPcmExactly() {
   require(spu->writeRegister(voice_volume_left, 0x2000U) &&
               spu->writeRegister(voice_volume_right, 0x2000U) &&
               spu->writeRegister(voice_pitch, 0x1800U) &&
-              spu->writeRegister(voice_start_address,
-                                 sample_address_units) &&
-              spu->writeRegister(voice_repeat_address,
-                                 sample_address_units) &&
+              spu->writeRegister(voice_start_address, sample_address_units) &&
+              spu->writeRegister(voice_repeat_address, sample_address_units) &&
               spu->writeRegister(main_volume_left, 0x3000U) &&
               spu->writeRegister(main_volume_right, 0x3000U) &&
               spu->writeRegister(cd_volume_left, 0x4000U) &&
@@ -766,6 +799,43 @@ void testInvalidStateRejection() {
   require(spu->state() == *baseline, "Rejected reverb state changed the SPU");
 }
 
+void testHostIdentityDiagnostics() {
+  auto spu = std::make_unique<sf::psx::Spu>();
+  spu->setDiagnosticsEnabled(true);
+  constexpr std::uint32_t source_address = 0x6000U;
+  constexpr std::uint32_t producer_pc = 0x80012340U;
+  require(spu->writeRegister(transfer_address, sample_address_units) &&
+              spu->writeRegister(control, 2U << 4U),
+          "Could not configure diagnostic DMA");
+  spu->setDmaTransferBusy(true, source_address, 1U);
+  require(spu->writeDmaWord(0x07001234U),
+          "Could not write diagnostic DMA payload");
+  spu->setDmaTransferBusy(false);
+  require(spu->writeRegister(voice_start_address, sample_address_units) &&
+              spu->writeRegister(voice_repeat_address, sample_address_units) &&
+              spu->writeRegister(control, control_enable) &&
+              spu->writeRegister(key_on_low, 1U, producer_pc),
+          "Could not configure diagnostic KON");
+  spu->mixFrames(1U);
+
+  std::array<sf::psx::SpuDiagnosticEvent, 4U> events{};
+  const auto count = spu->takeDiagnostics(events);
+  require(
+      count == 2U && events[0].type == sf::psx::SpuDiagnosticType::dma_write &&
+          events[0].ram_address == source_address &&
+          events[0].start_address == sample_ram_base &&
+          events[0].end_address == sample_ram_base + 4U &&
+          events[0].word_count == 1U && events[0].expected_word_count == 1U &&
+          events[1].type == sf::psx::SpuDiagnosticType::key_on &&
+          events[1].producer_pc == producer_pc && events[1].voice == 0U &&
+          events[1].start_address == sample_ram_base &&
+          events[1].adpcm_header == 0x34U && events[1].adpcm_flags == 0x12U &&
+          events[1].fingerprint != 0U,
+      "SPU identity diagnostics lost DMA or KON provenance");
+  require(spu->takeDiagnostics(events) == 0U && spu->droppedDiagnostics() == 0U,
+          "SPU identity diagnostic queue did not drain exactly");
+}
+
 void testVabSoundUsesRetailSampleAndSpuPath() {
   constexpr std::size_t descriptor_offset = 0x7a0U;
   constexpr std::size_t tone_offset = 0x820U;
@@ -850,8 +920,10 @@ int main() {
   try {
     testRegisterAccess();
     testKeyBoundaryAndCaptureBuffers();
+    testInactiveVoiceStillTriggersEnabledSpuIrq();
     testDmaTransfer();
     testIrqLatchAndClear();
+    testLateIrqChecksDecodedVoiceBlock();
     testCpuTickCadence();
     testIdleFastForward();
     testAdpcmFilterVectors();
@@ -864,6 +936,7 @@ int main() {
     testCdInputMixer();
     testSnapshotRestoresNextPcmExactly();
     testInvalidStateRejection();
+    testHostIdentityDiagnostics();
     testVabSoundUsesRetailSampleAndSpuPath();
   } catch (const std::exception &error) {
     std::cerr << "spu_tests failed: " << error.what() << '\n';

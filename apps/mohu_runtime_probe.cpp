@@ -1,3 +1,4 @@
+#include "mohu/frontend_menu.hpp"
 #include "mohu/runtime.hpp"
 
 #include <array>
@@ -112,6 +113,36 @@ int main(int argc, char **argv) {
               << static_cast<unsigned>(cd.response[1]) << " istat=0x"
               << std::hex << runtime.machine().interrupts().status()
               << " imask=0x" << runtime.machine().interrupts().mask();
+    const auto &card = runtime.biosState();
+    std::cout << " card_init=" << std::dec << card.memory_card_initialized
+              << " card_started=" << card.memory_card_started
+              << " card_fs=" << card.memory_card_filesystem_initialized
+              << " card_op="
+              << static_cast<unsigned>(card.memory_card_operation)
+              << " card_status=0x" << std::hex << card.memory_card_status
+              << " card_submit=" << std::dec << card.memory_card_submissions
+              << " card_complete=" << card.memory_card_completions
+              << " card_callbacks=" << card.event_callbacks_started << '/'
+              << card.event_callbacks_completed;
+    const auto print_guest_word = [&](const char *name, std::uint32_t address) {
+      std::uint32_t value{};
+      if (runtime.cpu().read32(address, value)) {
+        std::cout << ' ' << name << "=0x" << std::hex << value;
+      }
+    };
+    print_guest_word("card_task", 0x800985c0U);
+    print_guest_word("card_result", 0x800985c4U);
+    print_guest_word("card_done", 0x800985c8U);
+    print_guest_word("card_ports", 0x800985ccU);
+    print_guest_word("card_arg", 0x800985d0U);
+    print_guest_word("sw_ok", 0x80098690U);
+    print_guest_word("sw_err", 0x80098694U);
+    print_guest_word("sw_timeout", 0x80098698U);
+    print_guest_word("sw_new", 0x8009869cU);
+    print_guest_word("hw_ok", 0x800986a0U);
+    print_guest_word("hw_err", 0x800986a4U);
+    print_guest_word("hw_timeout", 0x800986a8U);
+    print_guest_word("hw_new", 0x800986acU);
     constexpr std::array traced_cd_commands{0x01U, 0x02U, 0x06U, 0x09U, 0x0aU,
                                             0x0eU, 0x13U, 0x14U, 0x15U, 0x1bU};
     for (const auto command : traced_cd_commands) {
@@ -195,6 +226,15 @@ int main(int argc, char **argv) {
     }
     for (const auto word : runtime.firstGpuWords()) {
       std::cout << " gp0=0x" << std::hex << word;
+    }
+    const auto menu = mohu::inspectFrontendMenu(runtime.cpu());
+    std::cout << " menu=" << std::dec << menu.active << "," << std::hex
+              << menu.screen_id << "," << std::dec << menu.selected << ","
+              << menu.target_count;
+    for (std::size_t index{}; index < menu.target_count; ++index) {
+      const auto &target = menu.targets[index];
+      std::cout << " menu_target=" << target.selection << ":" << target.x << ","
+                << target.y << "," << target.width << "x" << target.height;
     }
     std::cout << '\n';
     return 0;

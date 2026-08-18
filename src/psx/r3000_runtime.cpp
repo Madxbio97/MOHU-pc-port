@@ -74,6 +74,27 @@ bool subtractOverflows(std::uint32_t left, std::uint32_t right,
   return false;
 }
 
+bool sameDelayedLoad(const R3000DelayedLoadState &lhs,
+                     const R3000DelayedLoadState &rhs) noexcept {
+  return lhs.reg == rhs.reg && lhs.value == rhs.value && lhs.valid == rhs.valid;
+}
+
+bool sameCpuState(const R3000State &lhs, const R3000State &rhs) noexcept {
+  return lhs.gpr == rhs.gpr && lhs.gte.data == rhs.gte.data &&
+         lhs.gte.control == rhs.gte.control &&
+         lhs.gte.projected == rhs.gte.projected &&
+         lhs.gte.precise_nclip_area == rhs.gte.precise_nclip_area &&
+         lhs.gte.precise_nclip_valid == rhs.gte.precise_nclip_valid &&
+         lhs.cop0_status == rhs.cop0_status &&
+         lhs.cop0_cause == rhs.cop0_cause && lhs.cop0_epc == rhs.cop0_epc &&
+         lhs.cop0_bad_vaddr == rhs.cop0_bad_vaddr && lhs.hi == rhs.hi &&
+         lhs.lo == rhs.lo && lhs.pc == rhs.pc && lhs.next_pc == rhs.next_pc &&
+         lhs.branch_pc == rhs.branch_pc &&
+         lhs.branch_delay_slot == rhs.branch_delay_slot &&
+         sameDelayedLoad(lhs.load_delay, rhs.load_delay) &&
+         sameDelayedLoad(lhs.next_load_delay, rhs.next_load_delay);
+}
+
 } // namespace
 
 std::string_view toString(R3000StopReason reason) noexcept {
@@ -100,7 +121,9 @@ std::string_view toString(R3000StopReason reason) noexcept {
   return "unknown";
 }
 
-R3000Runtime::R3000Runtime() : ram_(ram_size) {}
+R3000Runtime::R3000Runtime()
+    : ram_(ram_size),
+      cached_blocks_(std::make_unique<CachedBlock[]>(cached_block_capacity)) {}
 
 bool R3000Runtime::setGpuProjectionCatalogTracking(bool enabled) noexcept {
   if (enabled == gpu_projection_catalog_tracking_) {
@@ -242,6 +265,168 @@ std::uint16_t R3000Runtime::publishGpuProjectionHandle(
     GteProjectedVertex projection) noexcept {
   projection.source_vertex_id = 0U;
   return ensureGpuProjectionHandle(projection);
+}
+
+bool R3000Runtime::publishExactTransform(
+    std::uint32_t address, const std::array<double, 9U> &rotation,
+    const std::array<double, 3U> &translation) noexcept {
+  if (!exactTransformCarrierTracking() || (address & 3U) != 0U ||
+      !std::ranges::all_of(rotation,
+                           [](double value) { return std::isfinite(value); }) ||
+      !std::ranges::all_of(translation,
+                           [](double value) { return std::isfinite(value); })) {
+    return false;
+  }
+
+  constexpr auto word_count = std::size_t{8U};
+  std::array<std::uint32_t, word_count> raw{};
+  std::array<GteExactWord *, word_count> slots{};
+  for (std::size_t word{}; word < word_count; ++word) {
+    const auto word_address =
+        address + static_cast<std::uint32_t>(word * sizeof(std::uint32_t));
+    if (!read32(word_address, raw[word])) {
+      return false;
+    }
+    slots[word] = exactMemoryWord(word_address, true);
+    if (slots[word] == nullptr) {
+      return false;
+    }
+  }
+
+  const auto component = [this, address](double value,
+                                         std::uint32_t domain) noexcept {
+    auto lineage =
+        pgxpLineageMix(0x4d4f485545584143ULL, exact_tracking_->gte.generation);
+    lineage = pgxpLineageMix(lineage, address + domain);
+    lineage = pgxpLineageMix(lineage, std::bit_cast<std::uint64_t>(value));
+    return GteExactComponent{value, lineage == 0U ? 1U : lineage,
+                             exact_tracking_->gte.generation, true, true};
+  };
+
+  for (std::size_t word{}; word < 5U; ++word) {
+    GteExactWord exact{};
+    exact.raw = raw[word];
+    for (std::size_t half{}; half < 2U; ++half) {
+      const auto index = word * 2U + half;
+      if (index < rotation.size()) {
+        exact.halves[half] =
+            component(rotation[index], static_cast<std::uint32_t>(index * 2U));
+      }
+    }
+    *slots[word] = exact;
+  }
+  for (std::size_t index{}; index < translation.size(); ++index) {
+    GteExactWord exact{};
+    exact.raw = raw[5U + index];
+    exact.scalar = component(translation[index],
+                             0x20U + static_cast<std::uint32_t>(index * 4U));
+    *slots[5U + index] = exact;
+  }
+  return true;
+}
+bool R3000Runtime::readExactTransformValues(std::uint32_t address,
+                                            std::array<double, 9U> &rotation,
+                                            std::array<double, 3U> &translation,
+                                            bool &enhanced) const noexcept {
+  enhanced = false;
+  if (!exactTransformCarrierTracking() || (address & 3U) != 0U) {
+    return false;
+  }
+
+  std::array<std::uint32_t, 8U> raw{};
+  for (std::size_t word{}; word < raw.size(); ++word) {
+    if (!read32(address + static_cast<std::uint32_t>(word * 4U), raw[word])) {
+      return false;
+    }
+  }
+
+  const auto current = [this](const GteExactComponent &component) noexcept {
+    return component.valid && component.lineage != 0U &&
+           component.generation == exact_tracking_->gte.generation &&
+           std::isfinite(component.value);
+  };
+  for (std::size_t index{}; index < rotation.size(); ++index) {
+    const auto word = index / 2U;
+    const auto half = index % 2U;
+    const auto raw_component = static_cast<std::int16_t>(
+        raw[word] >> static_cast<unsigned int>(half * 16U));
+    rotation[index] = static_cast<double>(raw_component);
+    const auto *exact =
+        exactWordAt(address + static_cast<std::uint32_t>(word * 4U), raw[word]);
+    if (exact != nullptr && current(exact->halves[half])) {
+      rotation[index] = exact->halves[half].value;
+      enhanced = enhanced || exact->halves[half].enhanced;
+    }
+  }
+  for (std::size_t index{}; index < translation.size(); ++index) {
+    const auto word = 5U + index;
+    translation[index] =
+        static_cast<double>(std::bit_cast<std::int32_t>(raw[word]));
+    const auto *exact =
+        exactWordAt(address + static_cast<std::uint32_t>(word * 4U), raw[word]);
+    if (exact != nullptr && current(exact->scalar)) {
+      translation[index] = exact->scalar.value;
+      enhanced = enhanced || exact->scalar.enhanced;
+    }
+  }
+  return std::ranges::all_of(
+             rotation, [](double value) { return std::isfinite(value); }) &&
+         std::ranges::all_of(translation,
+                             [](double value) { return std::isfinite(value); });
+}
+
+bool R3000Runtime::captureExactTransform(
+    std::uint32_t address, std::array<double, 9U> &rotation,
+    std::array<double, 3U> &translation) const noexcept {
+  bool enhanced{};
+  return readExactTransformValues(address, rotation, translation, enhanced) &&
+         enhanced;
+}
+
+bool R3000Runtime::captureTransformForComposition(
+    std::uint32_t address, std::array<double, 9U> &rotation,
+    std::array<double, 3U> &translation, bool &enhanced) const noexcept {
+  return readExactTransformValues(address, rotation, translation, enhanced);
+}
+
+bool R3000Runtime::publishComposedExactTransform(
+    const std::array<double, 9U> &lhs_rotation,
+    const std::array<double, 3U> &lhs_translation,
+    const std::array<double, 9U> &rhs_rotation,
+    const std::array<double, 3U> &rhs_translation, std::uint32_t output_address,
+    bool compose_translation) noexcept {
+  if (!std::ranges::all_of(lhs_rotation,
+                           [](double value) { return std::isfinite(value); }) ||
+      !std::ranges::all_of(lhs_translation,
+                           [](double value) { return std::isfinite(value); }) ||
+      !std::ranges::all_of(rhs_rotation,
+                           [](double value) { return std::isfinite(value); }) ||
+      !std::ranges::all_of(rhs_translation,
+                           [](double value) { return std::isfinite(value); })) {
+    return false;
+  }
+
+  constexpr auto q12 = 4096.0;
+  std::array<double, 9U> rotation{};
+  std::array<double, 3U> translation = rhs_translation;
+  for (std::size_t row{}; row < 3U; ++row) {
+    for (std::size_t column{}; column < 3U; ++column) {
+      double value{};
+      for (std::size_t inner{}; inner < 3U; ++inner) {
+        value +=
+            lhs_rotation[row * 3U + inner] * rhs_rotation[inner * 3U + column];
+      }
+      rotation[row * 3U + column] = value / q12;
+    }
+    if (compose_translation) {
+      double value = lhs_translation[row];
+      for (std::size_t inner{}; inner < 3U; ++inner) {
+        value += lhs_rotation[row * 3U + inner] * rhs_translation[inner] / q12;
+      }
+      translation[row] = value;
+    }
+  }
+  return publishExactTransform(output_address, rotation, translation);
 }
 
 std::uint16_t R3000Runtime::compactProjectionHandle(
@@ -429,7 +614,6 @@ void R3000Runtime::setPgxpExactTransformCaptureEnabled(bool enabled) noexcept {
   }
 }
 
-
 void R3000Runtime::setPgxpVertexIdentityTracking(bool enabled) noexcept {
   if (enabled == pgxp_vertex_identity_tracking_)
     return;
@@ -465,6 +649,7 @@ void R3000Runtime::beginPgxpTransformGeneration() noexcept {
 }
 
 void R3000Runtime::clearMemory() noexcept {
+  clearCodeCache();
   std::ranges::fill(ram_, std::byte{0});
   std::ranges::fill(scratchpad_, std::byte{0});
   std::ranges::fill(mmio_, std::byte{0});
@@ -491,6 +676,7 @@ void R3000Runtime::loadExecutable(const Executable &executable) {
 
 bool R3000Runtime::loadBytes(std::uint32_t address,
                              std::span<const std::byte> bytes) noexcept {
+  clearCodeCache();
   auto candidate = address;
   for (std::size_t index = 0; index < bytes.size(); ++index) {
     if (memoryByte(candidate) == nullptr ||
@@ -533,6 +719,7 @@ bool R3000Runtime::restoreRam(std::span<const std::byte> bytes) noexcept {
   if (bytes.size() != ram_.size()) {
     return false;
   }
+  clearCodeCache();
   std::ranges::copy(bytes, ram_.begin());
   if (pgxp_transform_tracking_) {
     beginPgxpTransformGeneration();
@@ -545,6 +732,7 @@ bool R3000Runtime::restoreScratchpad(
   if (bytes.size() != scratchpad_.size()) {
     return false;
   }
+  invalidateIdleLoopProof();
   std::ranges::copy(bytes, scratchpad_.begin());
   if (pgxp_transform_tracking_) {
     beginPgxpTransformGeneration();
@@ -556,6 +744,7 @@ bool R3000Runtime::restoreMmio(std::span<const std::byte> bytes) noexcept {
   if (bytes.size() != mmio_.size()) {
     return false;
   }
+  invalidateIdleLoopProof();
   std::ranges::copy(bytes, mmio_.begin());
   return true;
 }
@@ -589,6 +778,7 @@ R3000Runtime::capturePgxpTransformCheckpoint() const noexcept {
 }
 
 void R3000Runtime::restoreCpuState(const R3000State &state) noexcept {
+  invalidateIdleLoopProof();
   state_ = state;
   state_.gpr[0] = 0U;
   const auto restored_projected = state_.gte.projected;
@@ -738,20 +928,23 @@ R3000Runtime::memoryByte(std::uint32_t address) const noexcept {
 bool R3000Runtime::readMmio(std::uint32_t address, R3000AccessWidth width,
                             std::uint32_t &value) const noexcept {
   std::uint32_t physical{};
-  return mmio_bus_ != nullptr && physicalAddress(address, physical) &&
-         physical >= mmio_address && physical < mmio_address + mmio_size &&
-         mmio_bus_->readMmio(physical, width, value);
+  if (mmio_bus_ == nullptr || !physicalAddress(address, physical) ||
+      physical < mmio_address || physical >= mmio_address + mmio_size) {
+    return false;
+  }
+  return mmio_bus_->readMmio(physical, width, value);
 }
 
 bool R3000Runtime::writeMmio(std::uint32_t address, R3000AccessWidth width,
                              std::uint32_t value,
                              const GteProjectedVertex *projected,
-                             std::uint64_t projection_identity) noexcept {
+                             std::uint64_t projection_identity,
+                             std::uint32_t producer_pc) noexcept {
   std::uint32_t physical{};
   return mmio_bus_ != nullptr && physicalAddress(address, physical) &&
          physical >= mmio_address && physical < mmio_address + mmio_size &&
          mmio_bus_->writeMmio(physical, width, value, projected,
-                              projection_identity);
+                              projection_identity, producer_pc);
 }
 
 bool R3000Runtime::read8(std::uint32_t address,
@@ -855,6 +1048,7 @@ bool R3000Runtime::write8(std::uint32_t address, std::uint8_t value) noexcept {
     invalidateProjectedWord(address);
     ram_[physical & static_cast<std::uint32_t>(ram_size - 1U)] =
         static_cast<std::byte>(value);
+    invalidateCodePage(physical);
     return true;
   }
   if (writeMmio(address, R3000AccessWidth::byte, value)) {
@@ -877,7 +1071,8 @@ bool R3000Runtime::write16(std::uint32_t address,
 bool R3000Runtime::write16Projected(std::uint32_t address, std::uint16_t value,
                                     const ProjectedHalf *projected_half,
                                     const GteExactWord *exact_word,
-                                    const PgxpValue *pgxp) noexcept {
+                                    const PgxpValue *pgxp,
+                                    std::uint32_t producer_pc) noexcept {
   if ((address & 1U) != 0U) {
     return false;
   }
@@ -896,9 +1091,11 @@ bool R3000Runtime::write16Projected(std::uint32_t address, std::uint16_t value,
       storeExactHalf(address, value, packed, exact_word);
       storePgxpHalf(address, value, packed, pgxp);
     }
+    invalidateCodePage(physical);
     return true;
   }
-  if (writeMmio(address, R3000AccessWidth::halfword, value)) {
+  if (writeMmio(address, R3000AccessWidth::halfword, value, nullptr, 0U,
+                producer_pc)) {
     return true;
   }
   auto *byte0 = memoryByte(address);
@@ -926,9 +1123,9 @@ bool R3000Runtime::write32(std::uint32_t address,
   return write32Projected(address, value, nullptr);
 }
 
-bool R3000Runtime::write32Projected(
-    std::uint32_t address, std::uint32_t value,
-    const GteProjectedVertex *projected) noexcept {
+bool R3000Runtime::write32Projected(std::uint32_t address, std::uint32_t value,
+                                    const GteProjectedVertex *projected,
+                                    std::uint32_t producer_pc) noexcept {
   if ((address & 3U) != 0U) {
     return false;
   }
@@ -940,6 +1137,7 @@ bool R3000Runtime::write32Projected(
     ram_[offset + 1U] = static_cast<std::byte>(value >> 8U);
     ram_[offset + 2U] = static_cast<std::byte>(value >> 16U);
     ram_[offset + 3U] = static_cast<std::byte>(value >> 24U);
+    invalidateCodePage(physical);
     return true;
   }
   const auto valid_projection = projected != nullptr && projected->valid &&
@@ -948,7 +1146,8 @@ bool R3000Runtime::write32Projected(
       valid_projection ? compactProjectionHandle(projected, value)
                        : std::uint16_t{};
   if (writeMmio(address, R3000AccessWidth::word, value,
-                valid_projection ? projected : nullptr, projection_identity)) {
+                valid_projection ? projected : nullptr, projection_identity,
+                producer_pc)) {
     return true;
   }
   auto *byte0 = memoryByte(address);
@@ -1224,6 +1423,7 @@ void R3000Runtime::storeProjectedHalf(
                         combined.view_z / combined.screen_h;
       combined.exact_transform = false;
       combined.fractional_transform = true;
+      combined.enhanced_sources = 0U;
       combined.source_vertex_id = 0U;
       combined.mesh_vertex_id = 0U;
       combined.transform_lineage = 0U;
@@ -1700,13 +1900,16 @@ R3000Runtime::pgxpToProjected(const PgxpValue &value) const noexcept {
   projected.exact_transform =
       !value.derived_x && !value.derived_y && context->projection_epoch != 0U &&
       context->has(PgxpProjectionContext::exact_transform);
-  const auto retained_exact_view = projected.exact_transform &&
-                                   std::isfinite(context->view_x) &&
-                                   std::isfinite(context->view_y);
-  if (retained_exact_view) {
-    // An unmodified exact carrier already owns a coherent view tuple. Reusing
-    // it avoids two divides and is required at W/Z == 0, where screen XY is
-    // not invertible.
+  projected.enhanced_sources = context->enhanced_sources;
+  if (value.derived_x || value.derived_y) {
+    projected.enhanced_sources &=
+        static_cast<std::uint8_t>(~GteProjectedVertex::unclamped_view);
+  }
+  const auto retained_unclamped_view = projected.hasUnclampedView() &&
+                                       std::isfinite(context->view_x) &&
+                                       std::isfinite(context->view_y);
+  if (retained_unclamped_view) {
+    // Preserve pre-clamp camera tuples where screen reconstruction is singular.
     projected.view_x = context->view_x;
     projected.view_y = context->view_y;
   } else {
@@ -1718,7 +1921,6 @@ R3000Runtime::pgxpToProjected(const PgxpValue &value) const noexcept {
   projected.fractional_transform =
       value.derived_x || value.derived_y ||
       context->has(PgxpProjectionContext::fractional_transform);
-  projected.enhanced_sources = context->enhanced_sources;
   projected.source_vertex_id =
       !value.derived_x && !value.derived_y ? value.source_vertex_id : 0U;
   projected.mesh_vertex_id =
@@ -1731,8 +1933,7 @@ R3000Runtime::pgxpToProjected(const PgxpValue &value) const noexcept {
   projected.projection_epoch = context->projection_epoch;
   projected.valid = std::isfinite(projected.view_x) &&
                     std::isfinite(projected.view_y) &&
-                    (projected.exact_transform ? retained_exact_view
-                                               : projected.view_z > 0.0F);
+                    (retained_unclamped_view || projected.view_z > 0.0F);
   return projected;
 }
 
@@ -1945,7 +2146,8 @@ R3000Runtime::projectedHalfAt(std::uint32_t address, std::uint16_t value,
                               std::uint32_t register_value,
                               std::uint32_t packed) const noexcept {
   ProjectedHalf half{};
-  const auto *projected = projectedVertexProvenanceAt(address, packed).projected;
+  const auto *projected =
+      projectedVertexProvenanceAt(address, packed).projected;
   if (projected == nullptr) {
     return half;
   }
@@ -1975,6 +2177,39 @@ R3000Runtime::projectedHalfRegister(std::uint8_t reg,
   return projected_half.valid && projected_half.register_value == value
              ? &projected_half
              : nullptr;
+}
+
+R3000Runtime::ProjectedHalf
+R3000Runtime::screenProjectionHalf(std::uint8_t reg, std::uint32_t value,
+                                   std::uint8_t register_slot,
+                                   std::uint32_t source_mask) noexcept {
+  if (reg >= 32U || (source_mask & (1U << reg)) == 0U) {
+    return {};
+  }
+  if (const auto *half = projectedHalfRegister(reg, value);
+      half != nullptr && half->register_slot == register_slot) {
+    return *half;
+  }
+
+  ProjectedHalf half{};
+  const auto *projected = projectedRegister(reg, value);
+  if (projected == nullptr || register_slot > 1U) {
+    return half;
+  }
+  const auto component = static_cast<std::uint16_t>(projected->packed_sxy >>
+                                                    (register_slot * 16U));
+  if (static_cast<std::uint16_t>(value >> (register_slot * 16U)) != component) {
+    return half;
+  }
+  half.projected = *projected;
+  half.screen_position =
+      register_slot == 0U ? projected->screen_x : projected->screen_y;
+  half.register_value = value;
+  half.value = component;
+  half.slot = register_slot;
+  half.register_slot = register_slot;
+  half.valid = std::isfinite(half.screen_position);
+  return half;
 }
 
 const GteExactWord *
@@ -2153,8 +2388,7 @@ bool R3000Runtime::buildExactCarrier(
     if (!copyComponent(source, 0x4558414e443136ULL, result.halves[0]))
       return false;
     const auto result_integer = static_cast<double>(asSigned(result_raw));
-    if (source.value >= result_integer &&
-        source.value < result_integer + 1.0)
+    if (source.value >= result_integer && source.value < result_integer + 1.0)
       result.scalar = result.halves[0];
     return true;
   }
@@ -2258,9 +2492,8 @@ void R3000Runtime::writeRegister(std::uint8_t reg, std::uint32_t value,
   const auto valid_projected = projected != nullptr && projected->valid &&
                                projected->packed_sxy == value;
   const auto retain_direct_projected =
-      valid_projected &&
-      (compact_handle == 0U ||
-       (pgxp_transform_tracking_ && pgxp_cpu_tracking_));
+      valid_projected && (compact_handle == 0U ||
+                          (pgxp_transform_tracking_ && pgxp_cpu_tracking_));
   if (retain_direct_projected) {
     projected_gpr_[reg] = *projected;
     projected_gpr_valid_mask_ |= register_bit;
@@ -2401,6 +2634,8 @@ void R3000Runtime::advanceLoadDelay() noexcept {
   bool committed_compact_projection{};
   if (current_valid && state_.load_delay.reg != 0U) {
     state_.gpr[state_.load_delay.reg] = state_.load_delay.value;
+    const auto load_reg = state_.load_delay.reg;
+    const auto load_bit = 1U << load_reg;
     if (gpu_projection_catalog_tracking_) {
       const auto reg = state_.load_delay.reg;
       const auto bit = 1U << reg;
@@ -2417,8 +2652,6 @@ void R3000Runtime::advanceLoadDelay() noexcept {
       }
       committed_compact_projection = valid_handle;
     }
-    const auto load_reg = state_.load_delay.reg;
-    const auto load_bit = 1U << load_reg;
     if (committed_compact_projection) {
       if ((projected_gpr_valid_mask_ & load_bit) != 0U)
         projected_gpr_[load_reg].valid = false;
@@ -2549,6 +2782,7 @@ void R3000Runtime::clearLoadDelay() noexcept {
     exact_tracking_->next_load_delay_valid = false;
   }
 }
+
 void R3000Runtime::setExternalInterrupt(bool active) noexcept {
   constexpr std::uint32_t hardware_interrupt_bit = 1U << 10U;
   if (active) {
@@ -2590,7 +2824,296 @@ void R3000Runtime::takeInterrupt() noexcept {
   state_.branch_delay_slot = false;
 }
 
-R3000RunResult R3000Runtime::step() noexcept {
+bool R3000Runtime::idleProjectionCarriersClear() const noexcept {
+  if (projected_gpr_valid_mask_ != 0U || projected_half_gpr_valid_mask_ != 0U ||
+      gpu_projection_handle_gpr_mask_ != 0U || projected_load_delay_.valid ||
+      projected_next_load_delay_.valid || projected_half_load_delay_.valid ||
+      projected_half_next_load_delay_.valid ||
+      gpu_projection_handle_load_delay_ != 0U ||
+      gpu_projection_handle_next_load_delay_ != 0U) {
+    return false;
+  }
+  return exact_tracking_ == nullptr ||
+         (exact_tracking_->pgxp_gpr_valid_mask == 0U &&
+          exact_tracking_->gpr_valid_mask == 0U &&
+          !exact_tracking_->pgxp_load_delay_valid &&
+          !exact_tracking_->pgxp_next_load_delay_valid &&
+          !exact_tracking_->load_delay_valid &&
+          !exact_tracking_->next_load_delay_valid);
+}
+
+void R3000Runtime::invalidateIdleLoopProof() const noexcept {
+  if (++idle_loop_safety_epoch_ == 0U) {
+    idle_loop_safety_epoch_ = 1U;
+  }
+}
+
+R3000IdleLoopSnapshot R3000Runtime::captureIdleLoopSnapshot() const noexcept {
+  return {
+      .state = state_,
+      .safety_epoch = idle_loop_safety_epoch_,
+      .eligible = idleProjectionCarriersClear() && !interruptPending(),
+  };
+}
+
+bool R3000Runtime::matchesIdleLoopSnapshot(
+    const R3000IdleLoopSnapshot &snapshot) const noexcept {
+  return snapshot.eligible &&
+         snapshot.safety_epoch == idle_loop_safety_epoch_ &&
+         !interruptPending() && idleProjectionCarriersClear() &&
+         sameCpuState(snapshot.state, state_);
+}
+
+R3000RunResult R3000Runtime::step() noexcept { return stepImpl(nullptr); }
+
+void R3000Runtime::writeAddImmediate(std::uint8_t source,
+                                     std::uint8_t destination,
+                                     std::uint32_t source_value,
+                                     std::uint32_t immediate_value,
+                                     std::uint32_t result,
+                                     bool preserve_direct_projection) noexcept {
+  auto screen_source_mask = gpu_projection_handle_gpr_mask_ |
+                            projected_gpr_valid_mask_ |
+                            projected_half_gpr_valid_mask_;
+  if (pgxp_transform_tracking_ && pgxp_cpu_tracking_ &&
+      exact_tracking_ != nullptr) {
+    screen_source_mask |=
+        static_cast<std::uint32_t>(exact_tracking_->pgxp_gpr_valid_mask);
+  }
+  const auto source_bit = std::uint32_t{1U} << source;
+  const auto screen_source = (screen_source_mask & source_bit) != 0U;
+  const auto *projected =
+      preserve_direct_projection && immediate_value == 0U && screen_source
+          ? projectedRegister(source, source_value)
+          : nullptr;
+
+  PgxpValue pgxp{};
+  if (pgxp_transform_tracking_ && pgxp_cpu_tracking_ &&
+      exact_tracking_ != nullptr &&
+      (exact_tracking_->pgxp_gpr_valid_mask & (std::uint64_t{1U} << source)) !=
+          0U) {
+    if (const auto *source_pgxp = pgxpRegister(source, source_value);
+        source_pgxp != nullptr) {
+      if (immediate_value == 0U && source_pgxp->raw == result &&
+          !source_pgxp->derived_x && !source_pgxp->derived_y) {
+        pgxp = *source_pgxp;
+        pgxp.raw = result;
+      } else {
+        const auto signed_half = [](std::uint32_t value, bool high) noexcept {
+          const auto raw =
+              static_cast<std::uint16_t>(value >> (high ? 16U : 0U));
+          return static_cast<double>(static_cast<std::int16_t>(raw));
+        };
+        const auto component = [&](bool high) noexcept {
+          return source_pgxp->has(high ? PgxpValue::valid_y
+                                       : PgxpValue::valid_x)
+                     ? (high ? source_pgxp->y : source_pgxp->x)
+                     : signed_half(source_value, high);
+        };
+        const auto unsigned_low = [](double value) noexcept {
+          return value < 0.0 ? value + 65536.0 : value;
+        };
+        const auto wrap_half = [](double value) noexcept {
+          if (value < -32768.0)
+            value += 65536.0;
+          if (value < -32768.0)
+            value += 65536.0;
+          if (value >= 32768.0)
+            value -= 65536.0;
+          if (value >= 32768.0)
+            value -= 65536.0;
+          return value;
+        };
+        const auto low = unsigned_low(component(false)) +
+                         unsigned_low(signed_half(immediate_value, false));
+        const auto carry = low > 65535.0 ? 1.0 : low < 0.0 ? -1.0 : 0.0;
+        pgxp.x = wrap_half(low);
+        pgxp.y = wrap_half(component(true) +
+                           signed_half(immediate_value, true) + carry);
+        pgxp.raw = result;
+        pgxp.flags = PgxpValue::valid_x | PgxpValue::valid_y;
+        if (source_pgxp->has(PgxpValue::valid_z)) {
+          pgxp.context_handle = source_pgxp->context_handle;
+          pgxp.z = source_pgxp->z;
+          pgxp.flags |= PgxpValue::valid_z | PgxpValue::z_from_low |
+                        PgxpValue::z_from_high;
+          if (source_pgxp->has(PgxpValue::tainted_z)) {
+            pgxp.flags |= PgxpValue::tainted_z;
+          }
+        }
+        const auto source_lineage =
+            pgxpLineageMix(source_pgxp->lineage_x, source_pgxp->lineage_y);
+        const auto immediate_lineage =
+            pgxpLineageMix(0xc05a7ULL, immediate_value);
+        const auto lineage = pgxpLineageMix(
+            pgxpLineageMix(source_lineage, immediate_lineage), 0x414444ULL);
+        pgxp.lineage_x = lineage;
+        pgxp.lineage_y = lineage;
+        pgxp.derived_x = true;
+        pgxp.derived_y = true;
+        pgxp.flags |= PgxpValue::tainted_z;
+      }
+    }
+  }
+
+  auto projected_half =
+      screenProjectionHalf(source, source_value, 0U, screen_source_mask);
+  if (projected_half.valid) {
+    const auto delta =
+        static_cast<std::int64_t>(static_cast<std::int32_t>(immediate_value));
+    const auto adjusted = static_cast<std::int64_t>(
+                              static_cast<std::int16_t>(projected_half.value)) +
+                          delta;
+    if (adjusted < std::numeric_limits<std::int16_t>::min() ||
+        adjusted > std::numeric_limits<std::int16_t>::max() ||
+        static_cast<std::uint16_t>(adjusted) !=
+            static_cast<std::uint16_t>(result)) {
+      projected_half = {};
+    } else {
+      projected_half.screen_position += static_cast<float>(delta);
+      projected_half.register_value = result;
+      projected_half.value = static_cast<std::uint16_t>(adjusted);
+      projected_half.register_slot = 0U;
+      projected_half.derived = projected_half.derived || delta != 0;
+    }
+  }
+
+  const auto *pgxp_ptr = pgxp.flags != 0U ? &pgxp : nullptr;
+  const auto *half_ptr = projected_half.valid ? &projected_half : nullptr;
+  if (exact_tracking_ != nullptr &&
+      (exact_tracking_->gpr_valid_mask & source_bit) != 0U) {
+    const auto operation = immediate_value == 0U
+                               ? ExactCarrierOperation::identity
+                               : ExactCarrierOperation::add;
+    if (tryWriteExactCarrier(destination, result, operation, source,
+                             source_value, 0xffU, immediate_value, 0U,
+                             projected, pgxp_ptr, half_ptr)) {
+      return;
+    }
+  }
+  writeRegister(destination, result, projected, nullptr, pgxp_ptr, half_ptr);
+}
+
+R3000StopReason R3000Runtime::loadHalfword(std::uint32_t address,
+                                           std::uint8_t reg,
+                                           bool sign_extend) noexcept {
+  if ((address & 1U) != 0U) {
+    return R3000StopReason::alignment_fault;
+  }
+  std::uint16_t value{};
+  if (!read16(address, value)) {
+    return R3000StopReason::memory_fault;
+  }
+
+  const auto register_value =
+      sign_extend ? static_cast<std::uint32_t>(static_cast<std::int32_t>(
+                        static_cast<std::int16_t>(value)))
+                  : static_cast<std::uint32_t>(value);
+  const auto exact_half_tracking = exactTransformCarrierTracking();
+  const auto pgxp_half_tracking =
+      pgxp_transform_tracking_ && pgxp_cpu_tracking_;
+  std::uint32_t packed{};
+  const auto have_packed =
+      (pgxp_transform_tracking_ || gpu_projection_catalog_tracking_) &&
+      read32(address & ~3U, packed);
+  const auto projected_half =
+      have_packed ? projectedHalfAt(address, value, register_value, packed)
+                  : ProjectedHalf{};
+
+  GteExactWord exact_half{};
+  const GteExactWord *exact_half_ptr = nullptr;
+  if (exact_half_tracking && have_packed) {
+    if (const auto *word = exactWordAt(address & ~3U, packed);
+        word != nullptr) {
+      const auto slot = static_cast<std::uint8_t>((address >> 1U) & 1U);
+      if (word->halves[slot].valid) {
+        exact_half.raw = register_value;
+        exact_half.scalar = word->halves[slot];
+        exact_half.halves[0] = word->halves[slot];
+        exact_half_ptr = &exact_half;
+      }
+    }
+  }
+
+  PgxpValue pgxp_half{};
+  if (pgxp_half_tracking && have_packed) {
+    if (const auto *word = pgxpWordAt(address & ~3U, packed); word != nullptr) {
+      const auto high = (address & 2U) != 0U;
+      const auto component_valid =
+          word->has(high ? PgxpValue::valid_y : PgxpValue::valid_x);
+      if (component_valid) {
+        pgxp_half.context_handle = word->context_handle;
+        pgxp_half.x = high ? word->y : word->x;
+        pgxp_half.y =
+            sign_extend && static_cast<std::int16_t>(value) < 0 ? -1.0 : 0.0;
+        pgxp_half.z = word->z;
+        pgxp_half.raw = register_value;
+        const auto lineage = high ? word->lineage_y : word->lineage_x;
+        pgxp_half.lineage_x = lineage;
+        pgxp_half.lineage_y = lineage;
+        const auto component_derived = high ? word->derived_y : word->derived_x;
+        pgxp_half.derived_x = component_derived;
+        pgxp_half.derived_y = true;
+        pgxp_half.source_vertex_id =
+            !component_derived ? word->source_vertex_id : 0U;
+        pgxp_half.flags = PgxpValue::valid_x | PgxpValue::valid_y;
+        if (word->has(PgxpValue::valid_z)) {
+          pgxp_half.flags |= PgxpValue::valid_z | PgxpValue::z_from_low |
+                             PgxpValue::z_from_high;
+        }
+        if (word->has(PgxpValue::tainted_z)) {
+          pgxp_half.flags |= PgxpValue::tainted_z;
+        }
+      }
+    }
+  }
+
+  scheduleLoad(reg, register_value, nullptr,
+               projected_half.valid ? &projected_half : nullptr, exact_half_ptr,
+               pgxp_half.flags != 0U ? &pgxp_half : nullptr);
+  return R3000StopReason::running;
+}
+
+R3000StopReason
+R3000Runtime::storeHalfword(std::uint32_t address, std::uint8_t reg,
+                            std::uint32_t value,
+                            std::uint32_t producer_pc) noexcept {
+  if ((address & 1U) != 0U) {
+    return R3000StopReason::alignment_fault;
+  }
+  auto source_mask = gpu_projection_handle_gpr_mask_ |
+                     projected_gpr_valid_mask_ | projected_half_gpr_valid_mask_;
+  if (pgxp_transform_tracking_ && pgxp_cpu_tracking_ &&
+      exact_tracking_ != nullptr) {
+    source_mask |=
+        static_cast<std::uint32_t>(exact_tracking_->pgxp_gpr_valid_mask);
+  }
+  auto projected_half = screenProjectionHalf(reg, value, 0U, source_mask);
+  const auto destination_slot = static_cast<std::uint8_t>((address >> 1U) & 1U);
+  if (!projected_half.valid || projected_half.slot != destination_slot) {
+    projected_half = {};
+  }
+  if (!write16Projected(address, static_cast<std::uint16_t>(value),
+                        projected_half.valid ? &projected_half : nullptr,
+                        exactRegister(reg, value), pgxpRegister(reg, value),
+                        producer_pc)) {
+    return R3000StopReason::memory_fault;
+  }
+  return R3000StopReason::running;
+}
+
+R3000RunResult R3000Runtime::stepCachedInstruction(
+    const R3000CachedInstruction &instruction) noexcept {
+  R3000RunResult result{};
+  if (stepCachedFast(instruction, result)) {
+    return result;
+  }
+  ++cached_fast_fallbacks_;
+  return stepImpl(&instruction.raw);
+}
+
+R3000RunResult
+R3000Runtime::stepImpl(const std::uint32_t *cached_instruction) noexcept {
   const auto instruction_pc = state_.pc;
   if (interruptPending()) {
     takeInterrupt();
@@ -2600,19 +3123,24 @@ R3000RunResult R3000Runtime::step() noexcept {
   if ((instruction_pc & 3U) != 0U) {
     return {R3000StopReason::alignment_fault, 0U, instruction_pc, 0U};
   }
-  const auto fetch_physical =
-      instruction_pc >= 0x80000000U && instruction_pc < 0xc0000000U
-          ? instruction_pc & physical_address_mask
-          : instruction_pc;
-  if (fetch_physical < ram_mirror_end) {
-    const auto offset =
-        fetch_physical & static_cast<std::uint32_t>(ram_size - 1U);
-    std::memcpy(&instruction, ram_.data() + offset, sizeof(instruction));
-  } else if (!read32(instruction_pc, instruction)) {
-    return {R3000StopReason::memory_fault, 0U, instruction_pc, 0U};
+  if (cached_instruction != nullptr) {
+    instruction = *cached_instruction;
+  } else {
+    const auto fetch_physical =
+        instruction_pc >= 0x80000000U && instruction_pc < 0xc0000000U
+            ? instruction_pc & physical_address_mask
+            : instruction_pc;
+    if (fetch_physical < ram_mirror_end) {
+      const auto offset =
+          fetch_physical & static_cast<std::uint32_t>(ram_size - 1U);
+      std::memcpy(&instruction, ram_.data() + offset, sizeof(instruction));
+    } else if (!read32(instruction_pc, instruction)) {
+      return {R3000StopReason::memory_fault, 0U, instruction_pc, 0U};
+    }
   }
 
   const auto opcode = static_cast<std::uint8_t>(instruction >> 26U);
+
   const auto rs = static_cast<std::uint8_t>((instruction >> 21U) & 31U);
   const auto rt = static_cast<std::uint8_t>((instruction >> 16U) & 31U);
   auto pgxpSourceMarked = [&](std::uint8_t reg) noexcept {
@@ -2665,7 +3193,7 @@ R3000RunResult R3000Runtime::step() noexcept {
       stop = R3000StopReason::alignment_fault;
       return false;
     }
-    if (!write32Projected(address, value, projected)) {
+    if (!write32Projected(address, value, projected, instruction_pc)) {
       stop = R3000StopReason::memory_fault;
       return false;
     }
@@ -3007,55 +3535,31 @@ R3000RunResult R3000Runtime::step() noexcept {
     result.derived_y = true;
     return result;
   };
-  auto screen_source_mask =
-      gpu_projection_handle_gpr_mask_ | projected_gpr_valid_mask_ |
-      projected_half_gpr_valid_mask_;
+  auto screen_source_mask = gpu_projection_handle_gpr_mask_ |
+                            projected_gpr_valid_mask_ |
+                            projected_half_gpr_valid_mask_;
   if (pgxp_transform_tracking_ && pgxp_cpu_tracking_ &&
       exact_tracking_ != nullptr) {
-    screen_source_mask |= static_cast<std::uint32_t>(
-        exact_tracking_->pgxp_gpr_valid_mask);
+    screen_source_mask |=
+        static_cast<std::uint32_t>(exact_tracking_->pgxp_gpr_valid_mask);
   }
-  const auto screenSourceMarked = [screen_source_mask](
-                                      std::uint8_t reg) noexcept {
-    return reg < 32U && (screen_source_mask & (1U << reg)) != 0U;
-  };
+  const auto screenSourceMarked =
+      [screen_source_mask](std::uint8_t reg) noexcept {
+        return reg < 32U && (screen_source_mask & (1U << reg)) != 0U;
+      };
   const auto screenProjectedRegister =
-      [&](std::uint8_t reg, std::uint32_t raw) noexcept
-      -> const GteProjectedVertex * {
+      [&](std::uint8_t reg,
+          std::uint32_t raw) noexcept -> const GteProjectedVertex * {
     return screenSourceMarked(reg) ? projectedRegister(reg, raw) : nullptr;
   };
   const auto screenSourcesMarked =
-      [screen_source_mask](std::uint8_t first,
-                           std::uint8_t second) noexcept {
+      [screen_source_mask](std::uint8_t first, std::uint8_t second) noexcept {
         return first < 32U && second < 32U &&
                (screen_source_mask & ((1U << first) | (1U << second))) != 0U;
       };
   const auto projectionHalf = [&](std::uint8_t reg, std::uint32_t raw,
                                   std::uint8_t register_slot) noexcept {
-    if (!screenSourceMarked(reg))
-      return ProjectedHalf{};
-    if (const auto *half = projectedHalfRegister(reg, raw);
-        half != nullptr && half->register_slot == register_slot) {
-      return *half;
-    }
-    ProjectedHalf half{};
-    const auto *projected = screenProjectedRegister(reg, raw);
-    if (projected == nullptr || register_slot > 1U)
-      return half;
-    const auto component = static_cast<std::uint16_t>(projected->packed_sxy >>
-                                                      (register_slot * 16U));
-    if (static_cast<std::uint16_t>(raw >> (register_slot * 16U)) != component) {
-      return half;
-    }
-    half.projected = *projected;
-    half.screen_position =
-        register_slot == 0U ? projected->screen_x : projected->screen_y;
-    half.register_value = raw;
-    half.value = component;
-    half.slot = register_slot;
-    half.register_slot = register_slot;
-    half.valid = std::isfinite(half.screen_position);
-    return half;
+    return screenProjectionHalf(reg, raw, register_slot, screen_source_mask);
   };
   const auto shiftedProjectionHalf = [&](std::uint8_t reg, std::uint32_t raw,
                                          std::uint32_t result,
@@ -3135,21 +3639,21 @@ R3000RunResult R3000Runtime::step() noexcept {
             static_cast<std::int64_t>(static_cast<std::int32_t>(first_raw)));
       };
 
-  const auto withProjectedHalf =
-      [&](bool source_marked, auto &&project_half, auto &&consume) noexcept {
-        if (!source_marked) {
-          consume(nullptr);
-          return;
-        }
-        const auto projected_half = project_half();
-        consume(projected_half.valid ? &projected_half : nullptr);
-      };
+  const auto withProjectedHalf = [&](bool source_marked, auto &&project_half,
+                                     auto &&consume) noexcept {
+    if (!source_marked) {
+      consume(nullptr);
+      return;
+    }
+    const auto projected_half = project_half();
+    consume(projected_half.valid ? &projected_half : nullptr);
+  };
 
   const auto writeRegisterWithProjectedHalf =
       [&](std::uint8_t destination, std::uint32_t value,
-          const GteProjectedVertex *projected,
-          const GteExactWord *exact_word, const PgxpValue *pgxp,
-          bool source_marked, auto &&project_half) noexcept {
+          const GteProjectedVertex *projected, const GteExactWord *exact_word,
+          const PgxpValue *pgxp, bool source_marked,
+          auto &&project_half) noexcept {
         if (!source_marked) {
           writeRegister(destination, value, projected, exact_word, pgxp);
           return;
@@ -3174,9 +3678,8 @@ R3000RunResult R3000Runtime::step() noexcept {
           screenSourceMarked(rt),
           [&] { return shiftedProjectionHalf(rt, right, value, shift, true); },
           [&](const ProjectedHalf *projected_half) {
-            if (exact_tracking_ != nullptr &&
-                (exact_tracking_->gpr_valid_mask & (1U << rt)) != 0U)
-                [[unlikely]] {
+            if (exact_tracking_ != nullptr && (exact_tracking_->gpr_valid_mask &
+                                               (1U << rt)) != 0U) [[unlikely]] {
               if (shift == 0U &&
                   tryWriteExactCarrier(
                       rd, value, ExactCarrierOperation::identity, rt, right,
@@ -3195,11 +3698,12 @@ R3000RunResult R3000Runtime::step() noexcept {
                 return;
               }
             }
-            writeRegister(
-                rd, value,
-                shift == 0U && screenSourceMarked(rt)
-                    ? projectedRegister(rt, right) : nullptr, nullptr,
-                pgxp.flags != 0U ? &pgxp : nullptr, projected_half);
+            writeRegister(rd, value,
+                          shift == 0U && screenSourceMarked(rt)
+                              ? projectedRegister(rt, right)
+                              : nullptr,
+                          nullptr, pgxp.flags != 0U ? &pgxp : nullptr,
+                          projected_half);
           });
       break;
     }
@@ -3223,16 +3727,18 @@ R3000RunResult R3000Runtime::step() noexcept {
                   tryWriteExactCarrier(
                       rd, value, operation, rt, right, 0xffU, 0U, shift,
                       shift == 0U && screenSourceMarked(rt)
-                          ? projectedRegister(rt, right) : nullptr,
+                          ? projectedRegister(rt, right)
+                          : nullptr,
                       pgxp.flags != 0U ? &pgxp : nullptr, projected_half)) {
                 return;
               }
             }
-            writeRegister(
-                rd, value,
-                shift == 0U && screenSourceMarked(rt)
-                    ? projectedRegister(rt, right) : nullptr, nullptr,
-                pgxp.flags != 0U ? &pgxp : nullptr, projected_half);
+            writeRegister(rd, value,
+                          shift == 0U && screenSourceMarked(rt)
+                              ? projectedRegister(rt, right)
+                              : nullptr,
+                          nullptr, pgxp.flags != 0U ? &pgxp : nullptr,
+                          projected_half);
           });
       break;
     }
@@ -3250,22 +3756,25 @@ R3000RunResult R3000Runtime::step() noexcept {
                 (exact_tracking_->gpr_valid_mask & (1U << rt)) != 0U)
                 [[unlikely]] {
               const auto operation =
-                  shift == 0U ? ExactCarrierOperation::identity
-                              : ExactCarrierOperation::shift_right_arithmetic_16;
+                  shift == 0U
+                      ? ExactCarrierOperation::identity
+                      : ExactCarrierOperation::shift_right_arithmetic_16;
               if ((shift == 0U || shift == 16U) &&
                   tryWriteExactCarrier(
                       rd, value, operation, rt, right, 0xffU, 0U, shift,
                       shift == 0U && screenSourceMarked(rt)
-                          ? projectedRegister(rt, right) : nullptr,
+                          ? projectedRegister(rt, right)
+                          : nullptr,
                       pgxp.flags != 0U ? &pgxp : nullptr, projected_half)) {
                 return;
               }
             }
-            writeRegister(
-                rd, value,
-                shift == 0U && screenSourceMarked(rt)
-                    ? projectedRegister(rt, right) : nullptr, nullptr,
-                pgxp.flags != 0U ? &pgxp : nullptr, projected_half);
+            writeRegister(rd, value,
+                          shift == 0U && screenSourceMarked(rt)
+                              ? projectedRegister(rt, right)
+                              : nullptr,
+                          nullptr, pgxp.flags != 0U ? &pgxp : nullptr,
+                          projected_half);
           });
       break;
     }
@@ -3278,9 +3787,10 @@ R3000RunResult R3000Runtime::step() noexcept {
                             : PgxpValue{};
       writeRegisterWithProjectedHalf(
           rd, value,
-          amount == 0U && screenSourceMarked(rt)
-              ? projectedRegister(rt, right) : nullptr, nullptr,
-          pgxp.flags != 0U ? &pgxp : nullptr, screenSourceMarked(rt), [&] {
+          amount == 0U && screenSourceMarked(rt) ? projectedRegister(rt, right)
+                                                 : nullptr,
+          nullptr, pgxp.flags != 0U ? &pgxp : nullptr, screenSourceMarked(rt),
+          [&] {
             return shiftedProjectionHalf(rt, right, value, amount, true);
           });
       break;
@@ -3294,9 +3804,10 @@ R3000RunResult R3000Runtime::step() noexcept {
                             : PgxpValue{};
       writeRegisterWithProjectedHalf(
           rd, value,
-          amount == 0U && screenSourceMarked(rt)
-              ? projectedRegister(rt, right) : nullptr, nullptr,
-          pgxp.flags != 0U ? &pgxp : nullptr, screenSourceMarked(rt), [&] {
+          amount == 0U && screenSourceMarked(rt) ? projectedRegister(rt, right)
+                                                 : nullptr,
+          nullptr, pgxp.flags != 0U ? &pgxp : nullptr, screenSourceMarked(rt),
+          [&] {
             return shiftedProjectionHalf(rt, right, value, amount, false);
           });
       break;
@@ -3310,9 +3821,10 @@ R3000RunResult R3000Runtime::step() noexcept {
                             : PgxpValue{};
       writeRegisterWithProjectedHalf(
           rd, value,
-          amount == 0U && screenSourceMarked(rt)
-              ? projectedRegister(rt, right) : nullptr, nullptr,
-          pgxp.flags != 0U ? &pgxp : nullptr, screenSourceMarked(rt), [&] {
+          amount == 0U && screenSourceMarked(rt) ? projectedRegister(rt, right)
+                                                 : nullptr,
+          nullptr, pgxp.flags != 0U ? &pgxp : nullptr, screenSourceMarked(rt),
+          [&] {
             return shiftedProjectionHalf(rt, right, value, amount, false);
           });
       break;
@@ -3526,8 +4038,7 @@ R3000RunResult R3000Runtime::step() noexcept {
                 }
               }
               writeRegister(rd, value, nullptr, nullptr,
-                            pgxp.flags != 0U ? &pgxp : nullptr,
-                            projected_half);
+                            pgxp.flags != 0U ? &pgxp : nullptr, projected_half);
             });
       }
       break;
@@ -3548,9 +4059,9 @@ R3000RunResult R3000Runtime::step() noexcept {
             return binaryProjectionHalf(rs, left, rt, right, value, false);
           },
           [&](const ProjectedHalf *projected_half) {
-            if (exact_tracking_ != nullptr &&
-                (exact_tracking_->gpr_valid_mask &
-                 ((1U << rs) | (1U << rt))) != 0U) [[unlikely]] {
+            if (exact_tracking_ != nullptr && (exact_tracking_->gpr_valid_mask &
+                                               ((1U << rs) | (1U << rt))) != 0U)
+                [[unlikely]] {
               const auto identity_reg =
                   static_cast<std::uint8_t>(rs == 0U   ? rt
                                             : rt == 0U ? rs
@@ -3594,14 +4105,12 @@ R3000RunResult R3000Runtime::step() noexcept {
                    ((1U << rs) | (1U << rt))) != 0U &&
                   tryWriteExactCarrier(
                       rd, value, ExactCarrierOperation::subtract, rs, left, rt,
-                      right, 0U, nullptr,
-                      pgxp.flags != 0U ? &pgxp : nullptr, projected_half))
-                  [[unlikely]] {
+                      right, 0U, nullptr, pgxp.flags != 0U ? &pgxp : nullptr,
+                      projected_half)) [[unlikely]] {
                 return;
               }
               writeRegister(rd, value, nullptr, nullptr,
-                            pgxp.flags != 0U ? &pgxp : nullptr,
-                            projected_half);
+                            pgxp.flags != 0U ? &pgxp : nullptr, projected_half);
             });
       }
       break;
@@ -3619,15 +4128,14 @@ R3000RunResult R3000Runtime::step() noexcept {
             return binaryProjectionHalf(rs, left, rt, right, value, true);
           },
           [&](const ProjectedHalf *projected_half) {
-            if (exact_tracking_ != nullptr &&
-                (exact_tracking_->gpr_valid_mask &
-                 ((1U << rs) | (1U << rt))) != 0U) [[unlikely]] {
-              const auto operation =
-                  rt == 0U ? ExactCarrierOperation::identity
-                           : ExactCarrierOperation::subtract;
+            if (exact_tracking_ != nullptr && (exact_tracking_->gpr_valid_mask &
+                                               ((1U << rs) | (1U << rt))) != 0U)
+                [[unlikely]] {
+              const auto operation = rt == 0U ? ExactCarrierOperation::identity
+                                              : ExactCarrierOperation::subtract;
               if (tryWriteExactCarrier(
-                      rd, value, operation, rs, left,
-                      rt == 0U ? 0xffU : rt, rt == 0U ? 0U : right, 0U,
+                      rd, value, operation, rs, left, rt == 0U ? 0xffU : rt,
+                      rt == 0U ? 0U : right, 0U,
                       rt == 0U ? screenProjectedRegister(rs, left) : nullptr,
                       pgxp.flags != 0U ? &pgxp : nullptr, projected_half)) {
                 return;
@@ -3758,74 +4266,18 @@ R3000RunResult R3000Runtime::step() noexcept {
     break;
   case 0x08: {
     std::uint32_t value{};
-    if (addOverflows(left, signExtend16(immediate), value)) {
+    const auto immediate_value = signExtend16(immediate);
+    if (addOverflows(left, immediate_value, value)) {
       stop = R3000StopReason::arithmetic_overflow;
     } else {
-      const auto immediate_value = signExtend16(immediate);
-      const auto pgxp = pgxpSourceMarked(rs)
-                            ? arithmetic(pgxpRegister(rs, left), left, nullptr,
-                                         immediate_value, value, false)
-                            : PgxpValue{};
-      withProjectedHalf(
-          screenSourceMarked(rs),
-          [&] {
-            return offsetProjectionHalf(
-                rs, left, value, static_cast<std::int32_t>(immediate_value));
-          },
-          [&](const ProjectedHalf *projected_half) {
-            if (exact_tracking_ != nullptr &&
-                (exact_tracking_->gpr_valid_mask & (1U << rs)) != 0U)
-                [[unlikely]] {
-              const auto operation = immediate_value == 0U
-                                         ? ExactCarrierOperation::identity
-                                         : ExactCarrierOperation::add;
-              if (tryWriteExactCarrier(
-                      rt, value, operation, rs, left, 0xffU, immediate_value,
-                      0U, nullptr, pgxp.flags != 0U ? &pgxp : nullptr,
-                      projected_half)) {
-                return;
-              }
-            }
-            writeRegister(rt, value, nullptr, nullptr,
-                          pgxp.flags != 0U ? &pgxp : nullptr, projected_half);
-          });
+      writeAddImmediate(rs, rt, left, immediate_value, value, false);
     }
     break;
   }
   case 0x09: {
     const auto immediate_value = signExtend16(immediate);
     const auto value = left + immediate_value;
-    const auto pgxp = pgxpSourceMarked(rs)
-                          ? arithmetic(pgxpRegister(rs, left), left, nullptr,
-                                       immediate_value, value, false)
-                          : PgxpValue{};
-    withProjectedHalf(
-        screenSourceMarked(rs),
-        [&] {
-          return offsetProjectionHalf(
-              rs, left, value, static_cast<std::int32_t>(immediate_value));
-        },
-        [&](const ProjectedHalf *projected_half) {
-          if (exact_tracking_ != nullptr &&
-              (exact_tracking_->gpr_valid_mask & (1U << rs)) != 0U)
-              [[unlikely]] {
-            const auto operation = immediate_value == 0U
-                                       ? ExactCarrierOperation::identity
-                                       : ExactCarrierOperation::add;
-            if (tryWriteExactCarrier(
-                    rt, value, operation, rs, left, 0xffU, immediate_value, 0U,
-                    immediate == 0U ? screenProjectedRegister(rs, left)
-                                    : nullptr,
-                    pgxp.flags != 0U ? &pgxp : nullptr, projected_half)) {
-              return;
-            }
-          }
-          writeRegister(rt, value,
-                        immediate == 0U ? screenProjectedRegister(rs, left)
-                                        : nullptr,
-                        nullptr, pgxp.flags != 0U ? &pgxp : nullptr,
-                        projected_half);
-        });
+    writeAddImmediate(rs, rt, left, immediate_value, value, true);
     break;
   }
   case 0x0a:
@@ -3847,10 +4299,10 @@ R3000RunResult R3000Runtime::step() noexcept {
         [&](const ProjectedHalf *projected_half) {
           if (exact_tracking_ != nullptr && immediate == 0xffffU &&
               (exact_tracking_->gpr_valid_mask & (1U << rs)) != 0U &&
-              tryWriteExactCarrier(
-                  rt, value, ExactCarrierOperation::and_low_16, rs, left, 0xffU,
-                  immediate, 0U, nullptr, pgxp.flags != 0U ? &pgxp : nullptr,
-                  projected_half)) [[unlikely]] {
+              tryWriteExactCarrier(rt, value, ExactCarrierOperation::and_low_16,
+                                   rs, left, 0xffU, immediate, 0U, nullptr,
+                                   pgxp.flags != 0U ? &pgxp : nullptr,
+                                   projected_half)) [[unlikely]] {
             return;
           }
           writeRegister(rt, value, nullptr, nullptr,
@@ -3868,9 +4320,8 @@ R3000RunResult R3000Runtime::step() noexcept {
         screenSourceMarked(rs),
         [&] { return offsetProjectionHalf(rs, left, value, 0); },
         [&](const ProjectedHalf *projected_half) {
-          if (exact_tracking_ != nullptr &&
-              (exact_tracking_->gpr_valid_mask & (1U << rs)) != 0U)
-              [[unlikely]] {
+          if (exact_tracking_ != nullptr && (exact_tracking_->gpr_valid_mask &
+                                             (1U << rs)) != 0U) [[unlikely]] {
             const auto operation = immediate == 0U
                                        ? ExactCarrierOperation::identity
                                        : ExactCarrierOperation::or_nonoverlap;
@@ -3882,11 +4333,10 @@ R3000RunResult R3000Runtime::step() noexcept {
               return;
             }
           }
-          writeRegister(rt, value,
-                        immediate == 0U ? screenProjectedRegister(rs, left)
-                                        : nullptr,
-                        nullptr, pgxp.flags != 0U ? &pgxp : nullptr,
-                        projected_half);
+          writeRegister(
+              rt, value,
+              immediate == 0U ? screenProjectedRegister(rs, left) : nullptr,
+              nullptr, pgxp.flags != 0U ? &pgxp : nullptr, projected_half);
         });
   } break;
   case 0x0e: {
@@ -3898,9 +4348,8 @@ R3000RunResult R3000Runtime::step() noexcept {
     writeRegisterWithProjectedHalf(
         rt, value,
         immediate == 0U ? screenProjectedRegister(rs, left) : nullptr, nullptr,
-        pgxp.flags != 0U ? &pgxp : nullptr, screenSourceMarked(rs), [&] {
-          return offsetProjectionHalf(rs, left, value, 0);
-        });
+        pgxp.flags != 0U ? &pgxp : nullptr, screenSourceMarked(rs),
+        [&] { return offsetProjectionHalf(rs, left, value, 0); });
   } break;
   case 0x0f:
     writeRegister(rt, immediate << 16U);
@@ -3982,7 +4431,8 @@ R3000RunResult R3000Runtime::step() noexcept {
       GteRuntime::writeData(
           state_.gte, rd, right,
           (pgxp_transform_tracking_ || gpu_projection_catalog_tracking_)
-              ? screenProjectedRegister(rt, right) : nullptr,
+              ? screenProjectedRegister(rt, right)
+              : nullptr,
           pgxp_transform_tracking_ ? &exact_tracking_->gte : nullptr,
           pgxp_transform_tracking_ ? exactRegister(rt, right) : nullptr);
     } else if (rs == 6U) {
@@ -4037,81 +4487,7 @@ R3000RunResult R3000Runtime::step() noexcept {
   }
   case 0x21:
   case 0x25: {
-    const auto address = memoryAddress();
-    if ((address & 1U) != 0U) {
-      stop = R3000StopReason::alignment_fault;
-      break;
-    }
-    std::uint16_t value{};
-    if (!read16(address, value)) {
-      stop = R3000StopReason::memory_fault;
-    } else {
-      const auto register_value =
-          opcode == 0x21 ? static_cast<std::uint32_t>(static_cast<std::int32_t>(
-                               static_cast<std::int16_t>(value)))
-                         : static_cast<std::uint32_t>(value);
-      const auto exact_half_tracking = exactTransformCarrierTracking();
-      const auto pgxp_half_tracking =
-          pgxp_transform_tracking_ && pgxp_cpu_tracking_;
-      std::uint32_t packed{};
-      const auto have_packed =
-          (pgxp_transform_tracking_ || gpu_projection_catalog_tracking_) &&
-          read32(address & ~3U, packed);
-      const auto projected_half =
-          have_packed ? projectedHalfAt(address, value, register_value, packed)
-                      : ProjectedHalf{};
-      GteExactWord exact_half{};
-      const GteExactWord *exact_half_ptr = nullptr;
-      if (exact_half_tracking && have_packed) {
-        if (const auto *word = exactWordAt(address & ~3U, packed);
-            word != nullptr) {
-          const auto slot = static_cast<std::uint8_t>((address >> 1U) & 1U);
-          if (word->halves[slot].valid) {
-            exact_half.raw = register_value;
-            exact_half.scalar = word->halves[slot];
-            exact_half.halves[0] = word->halves[slot];
-            exact_half_ptr = &exact_half;
-          }
-        }
-      }
-      PgxpValue pgxp_half{};
-      if (pgxp_half_tracking && have_packed) {
-        if (const auto *word = pgxpWordAt(address & ~3U, packed);
-            word != nullptr) {
-          const auto high = (address & 2U) != 0U;
-          const auto component_valid =
-              word->has(high ? PgxpValue::valid_y : PgxpValue::valid_x);
-          if (component_valid) {
-            pgxp_half.context_handle = word->context_handle;
-            pgxp_half.x = high ? word->y : word->x;
-            pgxp_half.y = opcode == 0x21 && static_cast<std::int16_t>(value) < 0
-                              ? -1.0
-                              : 0.0;
-            pgxp_half.z = word->z;
-            pgxp_half.raw = register_value;
-            const auto lineage = high ? word->lineage_y : word->lineage_x;
-            pgxp_half.lineage_x = lineage;
-            pgxp_half.lineage_y = lineage;
-            const auto component_derived =
-                high ? word->derived_y : word->derived_x;
-            pgxp_half.derived_x = component_derived;
-            pgxp_half.derived_y = true;
-            pgxp_half.source_vertex_id =
-                !component_derived ? word->source_vertex_id : 0U;
-            pgxp_half.flags = PgxpValue::valid_x | PgxpValue::valid_y;
-            if (word->has(PgxpValue::valid_z))
-              pgxp_half.flags |= PgxpValue::valid_z | PgxpValue::z_from_low |
-                                 PgxpValue::z_from_high;
-            if (word->has(PgxpValue::tainted_z))
-              pgxp_half.flags |= PgxpValue::tainted_z;
-          }
-        }
-      }
-      scheduleLoad(rt, register_value, nullptr,
-                   projected_half.valid ? &projected_half : nullptr,
-                   exact_half_ptr,
-                   pgxp_half.flags != 0U ? &pgxp_half : nullptr);
-    }
+    stop = loadHalfword(memoryAddress(), rt, opcode == 0x21U);
     break;
   }
   case 0x22:
@@ -4139,8 +4515,7 @@ R3000RunResult R3000Runtime::step() noexcept {
     const GteProjectedVertex *compact_projection{};
     if (complete_word && gpu_projection_catalog_tracking_) {
       const auto *candidate =
-          projectedVertexProvenanceAt(address & ~3U, aligned_value)
-              .projected;
+          projectedVertexProvenanceAt(address & ~3U, aligned_value).projected;
       if (candidate != nullptr && candidate->packed_sxy == value &&
           compactProjectionHandle(candidate, value) != 0U) {
         compact_projection = candidate;
@@ -4237,29 +4612,11 @@ R3000RunResult R3000Runtime::step() noexcept {
     const auto address = memoryAddress();
     if (!write8(address, static_cast<std::uint8_t>(right))) {
       stop = R3000StopReason::memory_fault;
-    } else {
     }
     break;
   }
   case 0x29: {
-    const auto address = memoryAddress();
-    auto projected_half = screenSourceMarked(rt)
-                              ? projectionHalf(rt, right, 0U) : ProjectedHalf{};
-    const auto destination_slot =
-        static_cast<std::uint8_t>((address >> 1U) & 1U);
-    if (!projected_half.valid || projected_half.slot != destination_slot) {
-      projected_half = {};
-    }
-    const auto *projected_half_ptr =
-        projected_half.valid ? &projected_half : nullptr;
-    if ((address & 1U) != 0U) {
-      stop = R3000StopReason::alignment_fault;
-    } else if (!write16Projected(address, static_cast<std::uint16_t>(right),
-                                 projected_half_ptr, exactRegister(rt, right),
-                                 pgxpRegister(rt, right))) {
-      stop = R3000StopReason::memory_fault;
-    } else {
-    }
+    stop = storeHalfword(memoryAddress(), rt, right, instruction_pc);
     break;
   }
   case 0x2a:

@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -151,6 +152,7 @@ struct PauseMenuInput {
   bool confirm{};
   bool cancel{};
   bool pause{};
+  std::optional<std::size_t> pointer_selection;
 };
 
 enum class PauseSetting : std::uint32_t {
@@ -337,8 +339,7 @@ public:
   completeControllerBinding(std::uint32_t button);
   void cancelControllerBinding() noexcept { binding_pending_ = false; }
   void showControllerMissing();
-  void setControllerButtonLabels(
-      std::array<std::string, 16U> labels) noexcept;
+  void setControllerButtonLabels(std::array<std::string, 16U> labels) noexcept;
   void resolveWeaponEquip(std::uint32_t id, bool accepted);
   [[nodiscard]] bool controllerBindingPending() const noexcept {
     return binding_pending_;

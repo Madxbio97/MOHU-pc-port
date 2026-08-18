@@ -212,6 +212,14 @@ void Spu::reset() noexcept {
   std::destroy_at(state_.get());
   std::construct_at(state_.get());
   state_->noise_level = 1U;
+  diagnostic_read_position_ = 0U;
+  diagnostic_write_position_ = 0U;
+  diagnostic_count_ = 0U;
+  diagnostic_sequence_ = 0U;
+  dropped_diagnostics_ = 0U;
+  pending_key_on_pc_ = 0xffffffffU;
+  pending_key_off_pc_ = 0xffffffffU;
+  dma_diagnostic_ = {};
   clearPcm();
 }
 
@@ -239,6 +247,18 @@ bool Spu::readRegister(std::uint32_t offset, std::uint16_t &value) noexcept {
   }
 
   switch (offset) {
+  case register_key_on_low:
+    value = static_cast<std::uint16_t>(state_->pending_key_on);
+    break;
+  case register_key_on_high:
+    value = static_cast<std::uint16_t>(state_->pending_key_on >> 16U);
+    break;
+  case register_key_off_low:
+    value = static_cast<std::uint16_t>(state_->pending_key_off);
+    break;
+  case register_key_off_high:
+    value = static_cast<std::uint16_t>(state_->pending_key_off >> 16U);
+    break;
   case register_endx_low:
     value = static_cast<std::uint16_t>(state_->endx & 0xffffU);
     break;
@@ -264,7 +284,8 @@ bool Spu::readRegister(std::uint32_t offset, std::uint16_t &value) noexcept {
   return true;
 }
 
-bool Spu::writeRegister(std::uint32_t offset, std::uint16_t value) noexcept {
+bool Spu::writeRegister(std::uint32_t offset, std::uint16_t value,
+                        std::uint32_t producer_pc) noexcept {
   if (offset >= register_span || (offset & 1U) != 0U) {
     return false;
   }
@@ -275,8 +296,7 @@ bool Spu::writeRegister(std::uint32_t offset, std::uint16_t value) noexcept {
         (offset % voice_register_span) / sizeof(std::uint16_t));
     state_->registers[registerIndex(offset)] = value;
     if (voice_register == voice_current_adsr) {
-      state_->voices[voice].envelope =
-          static_cast<std::uint16_t>(value & 0x7fffU);
+      state_->voices[voice].envelope = value;
       state_->registers[registerIndex(offset)] = state_->voices[voice].envelope;
     } else if (voice_register == voice_repeat_address) {
       auto &voice_state = state_->voices[voice];
@@ -327,23 +347,35 @@ bool Spu::writeRegister(std::uint32_t offset, std::uint16_t value) noexcept {
     state_->registers[registerIndex(offset)] = value;
     state_->pending_key_on = (state_->pending_key_on & 0xffff0000U) | value;
     state_->pending_key_on &= voice_mask;
+    if (diagnostics_ && value != 0U) {
+      pending_key_on_pc_ = producer_pc;
+    }
     break;
   case register_key_on_high:
     state_->registers[registerIndex(offset)] = value;
     state_->pending_key_on =
         (state_->pending_key_on & 0x0000ffffU) |
         (static_cast<std::uint32_t>(value & 0x00ffU) << 16U);
+    if (diagnostics_ && (value & 0x00ffU) != 0U) {
+      pending_key_on_pc_ = producer_pc;
+    }
     break;
   case register_key_off_low:
     state_->registers[registerIndex(offset)] = value;
     state_->pending_key_off = (state_->pending_key_off & 0xffff0000U) | value;
     state_->pending_key_off &= voice_mask;
+    if (diagnostics_ && value != 0U) {
+      pending_key_off_pc_ = producer_pc;
+    }
     break;
   case register_key_off_high:
     state_->registers[registerIndex(offset)] = value;
     state_->pending_key_off =
         (state_->pending_key_off & 0x0000ffffU) |
         (static_cast<std::uint32_t>(value & 0x00ffU) << 16U);
+    if (diagnostics_ && (value & 0x00ffU) != 0U) {
+      pending_key_off_pc_ = producer_pc;
+    }
     break;
   case register_endx_low:
   case register_endx_high:
@@ -363,6 +395,10 @@ bool Spu::writeRegister(std::uint32_t offset, std::uint16_t value) noexcept {
     state_->reverb_current_address =
         (static_cast<std::uint32_t>(value) << 2U) & reverb_address_mask;
     break;
+  case register_irq_address:
+    state_->registers[registerIndex(offset)] = value;
+    checkLateRamIrq();
+    break;
   case register_control:
     if ((state_->registers[registerIndex(offset)] & control_spu_enable) != 0U &&
         (value & control_spu_enable) == 0U) {
@@ -381,6 +417,8 @@ bool Spu::writeRegister(std::uint32_t offset, std::uint16_t value) noexcept {
     state_->registers[registerIndex(offset)] = value;
     if ((value & control_irq_enable) == 0U) {
       state_->irq_latched = 0U;
+    } else {
+      checkLateRamIrq();
     }
     break;
   case register_transfer_control:
@@ -416,6 +454,7 @@ bool Spu::readDmaWord(std::uint32_t &value) noexcept {
   const auto high = readRamHalfword();
   value = static_cast<std::uint32_t>(low) |
           (static_cast<std::uint32_t>(high) << 16U);
+  traceDmaWord(value);
   return true;
 }
 
@@ -423,9 +462,104 @@ bool Spu::writeDmaWord(std::uint32_t value) noexcept {
   if (transferMode(control()) != 2U) {
     return false;
   }
+  traceDmaWord(value);
   writeRamHalfword(static_cast<std::uint16_t>(value & 0xffffU));
   writeRamHalfword(static_cast<std::uint16_t>(value >> 16U));
   return true;
+}
+
+void Spu::setDmaTransferBusy(bool busy, std::uint32_t ram_address,
+                             std::uint64_t expected_words) noexcept {
+  state_->transfer_busy = busy ? 1U : 0U;
+  if (!diagnostics_) {
+    dma_diagnostic_ = {};
+    return;
+  }
+  if (busy) {
+    dma_diagnostic_ = {
+        .ram_address = ram_address,
+        .start_address = state_->transfer_address,
+        .end_address = state_->transfer_address,
+        .fingerprint = 2166136261U,
+        .word_count = 0U,
+        .expected_word_count =
+            static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                expected_words, std::numeric_limits<std::uint32_t>::max())),
+        .mode = static_cast<std::uint8_t>(transferMode(control())),
+        .active = 1U,
+    };
+    return;
+  }
+  if (dma_diagnostic_.active == 0U) {
+    return;
+  }
+
+  const auto mode = dma_diagnostic_.mode;
+  pushDiagnostic(SpuDiagnosticEvent{
+      .type = mode == 3U ? SpuDiagnosticType::dma_read
+                         : SpuDiagnosticType::dma_write,
+      .mixed_frame = state_->mixed_frames,
+      .ram_address = dma_diagnostic_.ram_address,
+      .start_address = dma_diagnostic_.start_address,
+      .end_address = dma_diagnostic_.end_address,
+      .word_count = dma_diagnostic_.word_count,
+      .expected_word_count = dma_diagnostic_.expected_word_count,
+      .fingerprint = dma_diagnostic_.fingerprint,
+  });
+  dma_diagnostic_ = {};
+}
+
+void Spu::setDiagnosticsEnabled(bool enabled) {
+  if (enabled == (diagnostics_ != nullptr)) {
+    return;
+  }
+  diagnostics_.reset();
+  if (enabled) {
+    diagnostics_ = std::make_unique<
+        std::array<SpuDiagnosticEvent, diagnostic_capacity>>();
+  }
+  diagnostic_read_position_ = 0U;
+  diagnostic_write_position_ = 0U;
+  diagnostic_count_ = 0U;
+  diagnostic_sequence_ = 0U;
+  dropped_diagnostics_ = 0U;
+  dma_diagnostic_ = {};
+}
+
+std::size_t
+Spu::takeDiagnostics(std::span<SpuDiagnosticEvent> destination) noexcept {
+  if (!diagnostics_) {
+    return 0U;
+  }
+  const auto count = std::min(destination.size(), diagnostic_count_);
+  for (std::size_t index = 0U; index < count; ++index) {
+    destination[index] = (*diagnostics_)[diagnostic_read_position_];
+    diagnostic_read_position_ =
+        (diagnostic_read_position_ + 1U) % diagnostic_capacity;
+  }
+  diagnostic_count_ -= count;
+  return count;
+}
+
+std::uint64_t Spu::droppedDiagnostics() const noexcept {
+  return dropped_diagnostics_;
+}
+
+void Spu::traceDmaWord(std::uint32_t value) noexcept {
+  if (dma_diagnostic_.active == 0U) {
+    return;
+  }
+  for (std::uint32_t shift = 0U; shift < 32U; shift += 8U) {
+    dma_diagnostic_.fingerprint ^= (value >> shift) & 0xffU;
+    dma_diagnostic_.fingerprint *= 16777619U;
+  }
+  if (dma_diagnostic_.word_count != std::numeric_limits<std::uint32_t>::max()) {
+    ++dma_diagnostic_.word_count;
+    dma_diagnostic_.end_address = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(dma_diagnostic_.start_address) +
+         static_cast<std::uint64_t>(dma_diagnostic_.word_count) * 4U) &
+        ram_mask);
+  }
 }
 
 bool Spu::interruptLine() const noexcept {
@@ -513,10 +647,31 @@ void Spu::mixFrames(std::size_t frame_count) noexcept {
           (static_cast<std::uint32_t>(
                state_->registers[registerIndex(register_reverb_on_high)])
            << 16U);
+      const bool read_inactive_for_irq =
+          (spu_control & control_irq_enable) != 0U;
       for (std::size_t voice = 0U; voice < voice_count; ++voice) {
         auto &voice_state = state_->voices[voice];
         if (voice_state.active == 0U) {
           voice_state.last_volume = 0;
+          if (read_inactive_for_irq) {
+            static_cast<void>(voiceSample(voice, true));
+            auto pitch =
+                state_->registers[voiceRegisterIndex(voice, voice_pitch)];
+            pitch = std::min<std::uint16_t>(
+                pitch, static_cast<std::uint16_t>(pitch_mask));
+            advanceVoice(voice, pitch, false, true);
+            for (std::size_t channel = 0U; channel < 2U; ++channel) {
+              auto &volume = state_->voice_volume[voice][channel];
+              tickVolumeSweep(volume);
+              const auto current_offset =
+                  register_current_voice_volume_begin +
+                  static_cast<std::uint32_t>(voice) *
+                      current_voice_volume_span +
+                  static_cast<std::uint32_t>(channel * 2U);
+              state_->registers[registerIndex(current_offset)] =
+                  std::bit_cast<std::uint16_t>(volume.current_level);
+            }
+          }
           reverb_voices >>= 1U;
           continue;
         }
@@ -1003,6 +1158,39 @@ void Spu::keyOn(std::uint32_t mask) noexcept {
       continue;
     }
 
+    const auto diagnostic_start_address =
+        ramAddress(
+            state_->registers[voiceRegisterIndex(voice, voice_start_address)]) &
+        ~0x0fU;
+    const auto diagnostic_repeat_address =
+        ramAddress(
+            state_
+                ->registers[voiceRegisterIndex(voice, voice_repeat_address)]) &
+        ~0x0fU;
+    pushDiagnostic(SpuDiagnosticEvent{
+        .type = SpuDiagnosticType::key_on,
+        .voice = static_cast<std::uint8_t>(voice),
+        .adpcm_header = std::to_integer<std::uint8_t>(
+            state_->ram[diagnostic_start_address]),
+        .adpcm_flags = std::to_integer<std::uint8_t>(
+            state_->ram[(diagnostic_start_address + 1U) & ram_mask]),
+        .mixed_frame = state_->mixed_frames,
+        .producer_pc = pending_key_on_pc_,
+        .mask = mask,
+        .start_address = diagnostic_start_address,
+        .repeat_address = diagnostic_repeat_address,
+        .fingerprint = diagnostics_ ? sampleFingerprint(diagnostic_start_address)
+                                    : 0U,
+        .pitch = state_->registers[voiceRegisterIndex(voice, voice_pitch)],
+        .volume_left =
+            state_->registers[voiceRegisterIndex(voice, voice_volume_left)],
+        .volume_right =
+            state_->registers[voiceRegisterIndex(voice, voice_volume_right)],
+        .adsr_low =
+            state_->registers[voiceRegisterIndex(voice, voice_adsr_low)],
+        .adsr_high =
+            state_->registers[voiceRegisterIndex(voice, voice_adsr_high)],
+    });
     auto &voice_state = state_->voices[voice];
     voice_state = {};
     voice_state.block_address =
@@ -1041,10 +1229,20 @@ void Spu::applyPendingKeys() noexcept {
   if ((key_off | key_on) == 0U) {
     return;
   }
+  if (diagnostics_ && key_off != 0U) {
+    pushDiagnostic(SpuDiagnosticEvent{
+        .type = SpuDiagnosticType::key_off,
+        .mixed_frame = state_->mixed_frames,
+        .producer_pc = pending_key_off_pc_,
+        .mask = key_off,
+    });
+  }
   state_->pending_key_off = 0U;
   state_->pending_key_on = 0U;
   keyOff(key_off);
   keyOn(key_on);
+  pending_key_off_pc_ = 0xffffffffU;
+  pending_key_on_pc_ = 0xffffffffU;
 }
 
 void Spu::writeCaptureBuffer(std::size_t index, std::int16_t value) noexcept {
@@ -1062,9 +1260,9 @@ void Spu::advanceCaptureBuffer() noexcept {
       capture_buffer_size);
 }
 
-bool Spu::decodeBlock(std::size_t voice_index) noexcept {
+bool Spu::decodeBlock(std::size_t voice_index, bool read_for_irq) noexcept {
   auto &voice = state_->voices[voice_index];
-  if (voice.active == 0U) {
+  if (voice.active == 0U && !read_for_irq) {
     return false;
   }
 
@@ -1147,12 +1345,13 @@ void Spu::finishBlock(std::size_t voice_index, bool noise_enabled) noexcept {
   voice.block_address = (voice.block_address + adpcm_block_size) & ram_mask;
 }
 
-std::int32_t Spu::voiceSample(std::size_t voice_index) noexcept {
+std::int32_t Spu::voiceSample(std::size_t voice_index,
+                              bool read_for_irq) noexcept {
   auto &voice = state_->voices[voice_index];
-  if (voice.active == 0U) {
+  if (voice.active == 0U && !read_for_irq) {
     return 0;
   }
-  if (voice.block_valid == 0U && !decodeBlock(voice_index)) {
+  if (voice.block_valid == 0U && !decodeBlock(voice_index, read_for_irq)) {
     return 0;
   }
 
@@ -1182,14 +1381,14 @@ std::int32_t Spu::voiceSample(std::size_t voice_index) noexcept {
 }
 
 void Spu::advanceVoice(std::size_t voice_index, std::uint16_t pitch,
-                       bool noise_enabled) noexcept {
+                       bool noise_enabled, bool read_for_irq) noexcept {
   auto &voice = state_->voices[voice_index];
-  if (voice.active == 0U) {
+  if (voice.active == 0U && !read_for_irq) {
     return;
   }
 
   auto phase = static_cast<std::uint32_t>(voice.pitch_counter) + pitch;
-  while (phase >= pitch_one && voice.active != 0U) {
+  while (phase >= pitch_one && (voice.active != 0U || read_for_irq)) {
     phase -= pitch_one;
     ++voice.sample_index;
     if (voice.sample_index >= SpuVoiceState::samples_per_block) {
@@ -1636,6 +1835,56 @@ void Spu::touchRam(std::uint32_t address) noexcept {
   }
 }
 
+void Spu::checkLateRamIrq() noexcept {
+  if ((control() & control_irq_enable) == 0U || state_->irq_latched != 0U) {
+    return;
+  }
+  const auto irq_address =
+      ramAddress(state_->registers[registerIndex(register_irq_address)]);
+  if ((state_->transfer_address & ~7U) == irq_address) {
+    state_->irq_latched = 1U;
+    return;
+  }
+  for (const auto &voice : state_->voices) {
+    if (voice.block_valid == 0U) {
+      continue;
+    }
+    const auto address = voice.block_address & ram_mask;
+    if (address == irq_address || ((address + 8U) & ram_mask) == irq_address) {
+      state_->irq_latched = 1U;
+      return;
+    }
+  }
+}
+
+std::uint32_t Spu::sampleFingerprint(std::uint32_t address) const noexcept {
+  auto fingerprint = std::uint32_t{2166136261U};
+  constexpr std::uint32_t fingerprint_bytes = 224U;
+  for (std::uint32_t offset = 0U; offset < fingerprint_bytes; ++offset) {
+    fingerprint ^= std::to_integer<std::uint8_t>(
+        state_->ram[(address + offset) & ram_mask]);
+    fingerprint *= 16777619U;
+  }
+  return fingerprint;
+}
+
+void Spu::pushDiagnostic(SpuDiagnosticEvent event) noexcept {
+  if (!diagnostics_) {
+    return;
+  }
+  event.sequence = ++diagnostic_sequence_;
+  if (diagnostic_count_ == diagnostic_capacity) {
+    diagnostic_read_position_ =
+        (diagnostic_read_position_ + 1U) % diagnostic_capacity;
+    --diagnostic_count_;
+    ++dropped_diagnostics_;
+  }
+  (*diagnostics_)[diagnostic_write_position_] = event;
+  diagnostic_write_position_ =
+      (diagnostic_write_position_ + 1U) % diagnostic_capacity;
+  ++diagnostic_count_;
+}
+
 SpuPcmFrame Spu::popCdFrame() noexcept {
   if (state_->cd_frame_count == 0U) {
     return {};
@@ -1662,6 +1911,9 @@ void Spu::pushPcmFrame(SpuPcmFrame frame) noexcept {
 }
 
 bool Spu::idleForFastForward() const noexcept {
+  if ((control() & control_irq_enable) != 0U) {
+    return false;
+  }
   if (state_->pending_key_on != 0U || state_->pending_key_off != 0U ||
       state_->cd_frame_count != 0U ||
       state_->main_volume[0U].envelope_active != 0U ||

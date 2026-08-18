@@ -56,6 +56,22 @@ public:
     return committed_;
   }
 
+  [[nodiscard]] constexpr GuestDisplayGeometry
+  update(GuestDisplayGeometry observed, bool stabilize) noexcept {
+    if (!stabilize) {
+      reset();
+      return observed;
+    }
+    return update(observed);
+  }
+
+  constexpr void reset() noexcept {
+    committed_ = {};
+    candidate_ = {};
+    candidate_frames_ = 0U;
+    initialized_ = false;
+  }
+
   [[nodiscard]] constexpr bool initialized() const noexcept {
     return initialized_;
   }

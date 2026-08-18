@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -37,8 +38,7 @@ public:
   // A new CD read/seek/pause starts a new XA predictor/interpolator stream and
   // discards queued CD input, as the physical controller does.
   virtual void resetXaStream() noexcept {}
-  virtual void
-  setXaOutputMixer(std::array<std::uint8_t, 4U>) noexcept {}
+  virtual void setXaOutputMixer(std::array<std::uint8_t, 4U>) noexcept {}
 };
 
 enum class CdRomCommandPhase : std::uint8_t {
@@ -72,8 +72,7 @@ struct CdRomState {
   std::array<std::byte, raw_sector_size> data{};
   // L->L, L->R, R->L, R->R. Writes land in pending until apply bit 5.
   std::array<std::uint8_t, 4U> cd_volume_matrix{0x80U, 0U, 0U, 0x80U};
-  std::array<std::uint8_t, 4U> pending_cd_volume_matrix{0x80U, 0U, 0U,
-                                                        0x80U};
+  std::array<std::uint8_t, 4U> pending_cd_volume_matrix{0x80U, 0U, 0U, 0x80U};
   CdRomEventSchedule command_event{};
   CdRomEventSchedule sector_event{};
 
@@ -130,12 +129,20 @@ public:
   static constexpr std::uint32_t sector_single_speed_ticks = cpu_clock_hz / 75U;
   static constexpr std::uint32_t sector_double_speed_ticks =
       cpu_clock_hz / 150U;
+  static constexpr std::uint8_t maximum_data_read_speedup = 16U;
 
   explicit CdRomController(CdRomMedia *media = nullptr) noexcept;
 
   void reset() noexcept;
   void setMedia(CdRomMedia *media) noexcept;
   void setXaAudioSink(CdRomXaAudioSink *sink) noexcept;
+  void setDataReadSpeedup(std::uint8_t multiplier) noexcept {
+    data_read_speedup_ =
+        std::clamp(multiplier, std::uint8_t{1U}, maximum_data_read_speedup);
+  }
+  [[nodiscard]] std::uint8_t dataReadSpeedup() const noexcept {
+    return data_read_speedup_;
+  }
   [[nodiscard]] CdRomMedia *media() const noexcept { return media_; }
 
   // Byte accesses at offsets 0..3 relative to 0x1f801800.
@@ -147,8 +154,7 @@ public:
   [[nodiscard]] bool interruptLine() const noexcept;
   [[nodiscard]] bool dmaRequest() const noexcept;
   [[nodiscard]] bool canReadDmaWords(std::uint64_t word_count) const noexcept;
-  [[nodiscard]] bool
-  prepareDmaRead(std::uint64_t word_count) noexcept;
+  [[nodiscard]] bool prepareDmaRead(std::uint64_t word_count) noexcept;
   [[nodiscard]] bool readDmaWord(std::uint32_t &value) noexcept;
 
   // Integration contract:
@@ -181,6 +187,18 @@ public:
   }
   [[nodiscard]] bool reading() const noexcept { return state_.reading != 0U; }
   [[nodiscard]] bool muted() const noexcept { return state_.muted != 0U; }
+  [[nodiscard]] std::uint64_t sectorsRead() const noexcept {
+    return state_.sectors_read;
+  }
+  [[nodiscard]] std::span<const std::uint32_t> recentLbas() const noexcept {
+    return state_.recent_lbas;
+  }
+  [[nodiscard]] std::uint8_t recentLbaCursor() const noexcept {
+    return state_.recent_lba_cursor;
+  }
+  [[nodiscard]] std::uint8_t recentLbaCount() const noexcept {
+    return state_.recent_lba_count;
+  }
 
   [[nodiscard]] CdRomState captureState() const noexcept { return state_; }
   [[nodiscard]] bool validateState(const CdRomState &state) const noexcept;
@@ -233,6 +251,7 @@ private:
 
   CdRomMedia *media_{};
   CdRomXaAudioSink *xa_audio_sink_{};
+  std::uint8_t data_read_speedup_{1U};
   CdRomState state_{};
 };
 

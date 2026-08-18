@@ -3961,6 +3961,25 @@ void testTitleMenu() {
               sf::game::TitleCommand::exit,
           "Title cancel command mismatch");
 
+  sf::game::TitleMenu pointer_menu;
+  pointer_menu.completeSearch();
+  static_cast<void>(
+      pointer_menu.update(sf::game::TitleInput{.pointer_selection = 2U}));
+  require(pointer_menu.selection() == 2U,
+          "Title pointer hover did not select its authored menu item");
+  static_cast<void>(
+      pointer_menu.update(sf::game::TitleInput{.pointer_selection = 0U}));
+  require(pointer_menu.update(sf::game::TitleInput{.confirm = true}) ==
+                  sf::game::TitleCommand::none &&
+              pointer_menu.phase() == sf::game::TitlePhase::select_difficulty,
+          "Title pointer selection did not use the regular confirm path");
+  static_cast<void>(pointer_menu.update({}));
+  static_cast<void>(
+      pointer_menu.update(sf::game::TitleInput{.pointer_selection = 2U}));
+  require(pointer_menu.selectedDifficulty() ==
+              sf::game::CampaignDifficulty::agent,
+          "Difficulty pointer hover did not select the authored row");
+
   sf::game::TitleMenu training_return_menu;
   static_cast<void>(
       training_return_menu.update(sf::game::TitleInput{.next = true}));
@@ -4438,12 +4457,28 @@ void testWorldPresentationEnvelope() {
       std::uint16_t{13U}, std::uint16_t{15U}, std::uint16_t{17U}};
   const auto connected_distant_choice = sf::game::buildWorldTerrainEnvelope(
       connected_far_choice, distant_authored_tail, far_room_candidates);
-  require(sf::game::world_terrain_lookahead_steps == 3U &&
+  require(sf::game::world_terrain_lookahead_steps == 5U &&
               connected_distant_choice ==
                   std::vector<std::uint16_t>{
                       std::uint16_t{2U}, std::uint16_t{7U}, std::uint16_t{9U},
                       std::uint16_t{13U}, std::uint16_t{17U}},
           "A third connected terrain lookahead step was not retained");
+  constexpr std::array horizon_tail{std::uint16_t{19U}, std::uint16_t{17U}};
+  constexpr std::array horizon_candidates{std::uint16_t{17U},
+                                           std::uint16_t{19U}};
+  const auto connected_horizon_choice = sf::game::buildWorldTerrainEnvelope(
+      connected_distant_choice, horizon_tail, horizon_candidates);
+  require(connected_horizon_choice.back() == 19U,
+          "A fourth connected terrain lookahead step was not retained");
+  constexpr std::array extended_horizon_tail{std::uint16_t{23U},
+                                              std::uint16_t{19U}};
+  constexpr std::array extended_horizon_candidates{std::uint16_t{19U},
+                                                    std::uint16_t{23U}};
+  const auto extended_horizon_choice = sf::game::buildWorldTerrainEnvelope(
+      connected_horizon_choice, extended_horizon_tail,
+      extended_horizon_candidates);
+  require(extended_horizon_choice.back() == 23U,
+          "A fifth connected terrain lookahead step was not retained");
 
   constexpr std::array unmatched_tail{std::uint16_t{11U}, std::uint16_t{12U}};
   constexpr std::array fallback_candidates{std::uint16_t{7U}, std::uint16_t{8U},

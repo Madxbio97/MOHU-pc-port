@@ -31,7 +31,7 @@ if(SF_BUILD_TESTS)
     sf_add_unit_test(sf_dynamic_lighting_tests tests/dynamic_lighting_tests.cpp
         LIBRARIES sf::game)
     sf_add_unit_test(sf_player_input_tests tests/player_input_tests.cpp
-        LIBRARIES sf::platform_input)
+        LIBRARIES sf::platform_input sf::game)
     sf_add_unit_test(sf_audio_output_policy_tests
         tests/audio_output_policy_tests.cpp)
     sf_add_unit_test(sf_graphics_settings_tests
@@ -52,6 +52,12 @@ if(SF_BUILD_TESTS)
         tests/mohu_gpu_command_stream_tests.cpp LIBRARIES mohu::runtime)
     sf_add_unit_test(mohu_gpu_primitive_matcher_tests
         tests/mohu_gpu_primitive_matcher_tests.cpp LIBRARIES mohu::runtime)
+    sf_add_unit_test(mohu_level_lighting_tests
+        tests/mohu_level_lighting_tests.cpp LIBRARIES mohu::runtime)
+    sf_add_unit_test(mohu_campaign_level_tests
+        tests/mohu_campaign_level_tests.cpp LIBRARIES mohu::runtime)
+    sf_add_unit_test(mohu_frontend_menu_tests
+        tests/mohu_frontend_menu_tests.cpp LIBRARIES mohu::runtime)
     sf_add_unit_test(sf_legacy_presentation_bridge_tests
         tests/legacy_presentation_bridge_tests.cpp LIBRARIES sf::game)
     sf_add_unit_test(sf_raw_sector_source_tests
@@ -100,11 +106,18 @@ if(SF_BUILD_TESTS)
         sf_add_unit_test(sf_psycross_vram_tests
             tests/psycross_vram_tests.cpp LIBRARIES sf::psycross_backend)
         target_include_directories(sf_psycross_vram_tests
-            PRIVATE "${CMAKE_SOURCE_DIR}/src/platform")
+            PRIVATE "${CMAKE_SOURCE_DIR}/src/platform"
+                    "${SF_PSYCROSS_ROOT}/include")
         sf_add_unit_test(sf_psycross_render_tests
             tests/psycross_render_tests.cpp
             LIBRARIES sf::psycross_backend SDL2::SDL2 OpenGL::GL)
         target_include_directories(sf_psycross_render_tests
+            PRIVATE "${CMAKE_SOURCE_DIR}/src/platform"
+                    "${SF_PSYCROSS_ROOT}/include")
+        sf_add_unit_test(sf_runtime_menu_pointer_tests
+            tests/runtime_menu_pointer_tests.cpp
+            LIBRARIES sf::psycross_backend SDL2::SDL2)
+        target_include_directories(sf_runtime_menu_pointer_tests
             PRIVATE "${CMAKE_SOURCE_DIR}/src/platform"
                     "${SF_PSYCROSS_ROOT}/include")
         if(MSVC)

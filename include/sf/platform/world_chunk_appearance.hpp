@@ -11,8 +11,8 @@
 
 namespace sf::platform {
 
-inline constexpr double world_chunk_fade_seconds = 1.35;
-inline constexpr double world_chunk_prefetch_lead = 0.90;
+inline constexpr double world_chunk_fade_seconds = 1.65;
+inline constexpr double world_chunk_prefetch_lead = 0.96;
 inline constexpr std::size_t maximum_world_chunk_count = 0xfeU;
 
 [[nodiscard]] inline long worldChunkSpatialDepthCueFloorQ12(

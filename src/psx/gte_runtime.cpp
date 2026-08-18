@@ -264,6 +264,24 @@ publishTupleIdentity(std::array<GteExactComponent, Size> &destination,
   return tupleValueIdentity(destination, domain);
 }
 
+template <std::size_t Size>
+bool publishCurrentTuple(std::array<GteExactComponent, Size> &components,
+                         const GteExactState &exact, std::uint64_t domain,
+                         std::uint64_t &value_identity,
+                         bool &values_enhanced) noexcept {
+  if (!std::ranges::all_of(components, [&exact](const auto &component) {
+        return exactCurrent(component, exact);
+      })) {
+    value_identity = 0U;
+    values_enhanced = false;
+    return false;
+  }
+  value_identity =
+      publishTupleIdentity(components, components, exact.generation, domain);
+  values_enhanced = tupleEnhanced(components);
+  return true;
+}
+
 void invalidateExactResult(GteExactState *exact) noexcept {
   if (exact == nullptr) {
     return;
@@ -286,14 +304,6 @@ std::uint64_t allocateRevision(GteExactState &exact) noexcept {
       vector.fill({});
     }
     invalidateExactResult(&exact);
-    exact.pending_rotation.fill({});
-    exact.pending_translation.fill({});
-    for (auto &vector : exact.pending_vectors) {
-      vector.fill({});
-    }
-    exact.rotation_mask = 0U;
-    exact.translation_mask = 0U;
-    exact.vector_masks.fill(0U);
     exact.rotation_value_identity = 0U;
     exact.translation_value_identity = 0U;
     exact.vector_value_identities.fill(0U);
@@ -348,41 +358,20 @@ void publishProjectionState(GteExactState &exact) noexcept {
 void captureRotationWrite(GteExactState &exact, std::uint8_t index,
                           std::uint32_t raw,
                           const GteExactWord *word) noexcept {
-  if (index == 0U) {
-    exact.rotation.fill({});
-    exact.pending_rotation.fill({});
-    exact.rotation_mask = 0U;
-    exact.rotation_value_identity = 0U;
-    exact.rotation_values_enhanced = false;
-  }
-  const auto expected = static_cast<std::uint16_t>(
-      index == 0U ? 0U : (std::uint16_t{1} << (index * 2U)) - 1U);
-  if (exact.rotation_mask != expected) {
-    exact.rotation.fill({});
-    exact.pending_rotation.fill({});
-    exact.rotation_mask = 0U;
-    exact.rotation_value_identity = 0U;
-    exact.rotation_values_enhanced = false;
-    return;
-  }
+  const auto previous_identity = exact.rotation_value_identity;
   const auto first = static_cast<std::size_t>(index * 2U);
-  exact.pending_rotation[first] =
+  exact.rotation[first] =
       exactHalfOrRaw(word, raw, 0U, static_cast<double>(packedHalf(raw, false)),
                      0x100U + index * 2U, exact);
-  exact.rotation_mask |= static_cast<std::uint16_t>(1U << first);
-  if (first + 1U < exact.pending_rotation.size()) {
-    exact.pending_rotation[first + 1U] = exactHalfOrRaw(
+  if (first + 1U < exact.rotation.size()) {
+    exact.rotation[first + 1U] = exactHalfOrRaw(
         word, raw, 1U, static_cast<double>(packedHalf(raw, true)),
         0x101U + index * 2U, exact);
-    exact.rotation_mask |= static_cast<std::uint16_t>(1U << (first + 1U));
   }
-  if (exact.rotation_mask == 0x1ffU) {
-    exact.rotation_value_identity =
-        publishTupleIdentity(exact.rotation, exact.pending_rotation,
-                             exact.generation, 0x524f544154494f4eULL);
-    exact.pending_rotation.fill({});
-    exact.rotation_mask = 0U;
-    exact.rotation_values_enhanced = tupleEnhanced(exact.rotation);
+  if (publishCurrentTuple(exact.rotation, exact, 0x524f544154494f4eULL,
+                          exact.rotation_value_identity,
+                          exact.rotation_values_enhanced) &&
+      exact.rotation_value_identity != previous_identity) {
     publishCameraTuple(exact);
   }
 }
@@ -391,32 +380,13 @@ void captureTranslationWrite(GteExactState &exact, std::uint8_t index,
                              std::uint32_t raw, double fallback,
                              const GteExactWord *word) noexcept {
   const auto component = static_cast<std::uint8_t>(index - 5U);
-  if (component == 0U) {
-    exact.translation.fill({});
-    exact.pending_translation.fill({});
-    exact.translation_mask = 0U;
-    exact.translation_value_identity = 0U;
-    exact.translation_values_enhanced = false;
-  }
-  const auto expected = static_cast<std::uint8_t>((1U << component) - 1U);
-  if (exact.translation_mask != expected) {
-    exact.translation.fill({});
-    exact.pending_translation.fill({});
-    exact.translation_mask = 0U;
-    exact.translation_value_identity = 0U;
-    exact.translation_values_enhanced = false;
-    return;
-  }
-  exact.pending_translation[component] =
+  const auto previous_identity = exact.translation_value_identity;
+  exact.translation[component] =
       exactScalarOrRaw(word, raw, fallback, 0x200U + component, exact);
-  exact.translation_mask |= static_cast<std::uint8_t>(1U << component);
-  if (exact.translation_mask == 0x7U) {
-    exact.translation_value_identity =
-        publishTupleIdentity(exact.translation, exact.pending_translation,
-                             exact.generation, 0x5452414e534c4154ULL);
-    exact.pending_translation.fill({});
-    exact.translation_mask = 0U;
-    exact.translation_values_enhanced = tupleEnhanced(exact.translation);
+  if (publishCurrentTuple(exact.translation, exact, 0x5452414e534c4154ULL,
+                          exact.translation_value_identity,
+                          exact.translation_values_enhanced) &&
+      exact.translation_value_identity != previous_identity) {
     publishCameraTuple(exact);
   }
 }
@@ -425,41 +395,24 @@ void captureVectorWrite(GteExactState &exact, std::uint8_t index,
                         std::uint32_t raw, const GteState &state,
                         const GteExactWord *word) noexcept {
   const auto vector = static_cast<std::uint8_t>(index / 2U);
-  auto &mask = exact.vector_masks[vector];
+  auto &components = exact.vectors[vector];
   if ((index & 1U) == 0U) {
-    exact.vectors[vector].fill({});
-    exact.pending_vectors[vector].fill({});
-    mask = 0U;
-    exact.vector_value_identities[vector] = 0U;
-    exact.vector_values_enhanced[vector] = false;
-    exact.pending_vectors[vector][0] = exactHalfOrRaw(
+    components[0] = exactHalfOrRaw(
         word, raw, 0U,
         static_cast<double>(packedHalf(state.data[index], false)),
         0x300U + vector * 3U, exact);
-    exact.pending_vectors[vector][1] = exactHalfOrRaw(
+    components[1] = exactHalfOrRaw(
         word, raw, 1U, static_cast<double>(packedHalf(state.data[index], true)),
         0x301U + vector * 3U, exact);
-    mask = 0x3U;
-    return;
+  } else {
+    components[2] = exactScalarOrRaw(
+        word, raw, static_cast<double>(signedHalf(state.data[index])),
+        0x302U + vector * 3U, exact);
   }
-  if (mask != 0x3U) {
-    exact.vectors[vector].fill({});
-    exact.pending_vectors[vector].fill({});
-    mask = 0U;
-    exact.vector_value_identities[vector] = 0U;
-    exact.vector_values_enhanced[vector] = false;
-    return;
-  }
-  exact.pending_vectors[vector][2] = exactScalarOrRaw(
-      word, raw, static_cast<double>(signedHalf(state.data[index])),
-      0x302U + vector * 3U, exact);
-  mask = 0x7U;
-  exact.vector_value_identities[vector] =
-      publishTupleIdentity(exact.vectors[vector], exact.pending_vectors[vector],
-                           exact.generation, 0x564543544f520000ULL + vector);
-  exact.pending_vectors[vector].fill({});
-  mask = 0U;
-  exact.vector_values_enhanced[vector] = tupleEnhanced(exact.vectors[vector]);
+  static_cast<void>(publishCurrentTuple(components, exact,
+                                        0x564543544f520000ULL + vector,
+                                        exact.vector_value_identities[vector],
+                                        exact.vector_values_enhanced[vector]));
 }
 
 void captureResultWrite(GteExactState &exact, std::uint8_t index,
@@ -503,6 +456,34 @@ std::uint64_t combineTransformLineage(const GteExactState &exact,
   }
   lineage = mixLineage(lineage, input[0].lineage);
   lineage = mixLineage(lineage, instruction);
+  return lineage == 0U ? 1U : lineage;
+}
+
+std::uint64_t rawTransformLineage(const GteState &state,
+                                  const GteExactState &exact,
+                                  std::uint8_t matrix, std::uint8_t vector,
+                                  std::uint8_t translation,
+                                  std::uint32_t instruction) noexcept {
+  auto lineage = mixLineage(lineage_offset, 0x4d414334344d4143ULL);
+  lineage = mixLineage(lineage, exact.generation);
+  lineage = mixLineage(lineage, instruction & 0x000ff3ffU);
+  for (std::uint8_t row{}; row < 3U; ++row) {
+    for (std::uint8_t column{}; column < 3U; ++column) {
+      lineage = mixLineage(
+          lineage,
+          static_cast<std::uint16_t>(
+              matrixElement(state, matrix, row, column)));
+    }
+    lineage = mixLineage(
+        lineage, static_cast<std::uint32_t>(
+                     translationElement(state, translation, row)));
+  }
+  for (std::uint8_t component{}; component < 3U; ++component) {
+    lineage = mixLineage(
+        lineage,
+        static_cast<std::uint16_t>(
+            vectorElement(state, vector, component)));
+  }
   return lineage == 0U ? 1U : lineage;
 }
 
@@ -1060,7 +1041,10 @@ void pushProjectedVertex(
   projected.valid = true;
   projected.exact_transform = exact_transform;
   projected.fractional_transform = fractional_transform;
-  projected.enhanced_sources = enhanced_sources;
+  // Mark direct pre-clamp camera tuples without widening the sidecar.
+  projected.enhanced_sources =
+      enhanced_sources |
+      (exact_view != nullptr ? GteProjectedVertex::unclamped_view : 0U);
   projected.source_vertex_id = source_vertex_id;
   projected.mesh_vertex_id = mesh_vertex_id;
   projected.transform_lineage = transform_lineage;
@@ -1218,6 +1202,7 @@ void executeMatrixVectorMultiply(GteState &state, std::uint32_t instruction,
       exactMatrixVector(*exact, matrix, vector, translation, shift, instruction,
                         exact_result, exact_enhanced, exact_lineage);
 
+  std::array<std::int64_t, 3U> macro_result{};
   for (std::uint8_t row = 0U; row < 3U; ++row) {
     const auto component = static_cast<std::uint8_t>(row + 1U);
     const auto x_product =
@@ -1240,6 +1225,7 @@ void executeMatrixVectorMultiply(GteState &state, std::uint32_t instruction,
       static_cast<void>(
           clampIr(state, component, lowSignedWord(first >> shift), false));
       const auto value = signExtendMac(state, component, y_product) + z_product;
+      macro_result[row] = signExtendMac(state, component, value);
       setMacAndIr(state, component, signExtendMac(state, component, value),
                   shift, limit_mode);
       continue;
@@ -1252,10 +1238,28 @@ void executeMatrixVectorMultiply(GteState &state, std::uint32_t instruction,
                                    x_product);
     value = signExtendMac(state, component, value + y_product);
     value = signExtendMac(state, component, value + z_product);
+    macro_result[row] = value;
     setMacAndIr(state, component, value, shift, limit_mode);
   }
   constexpr std::uint32_t mac123_overflow_mask = 0x7e000000U;
-  if (has_exact_result && (state.control[31] & mac123_overflow_mask) == 0U) {
+  const auto macro_result_valid =
+      exact != nullptr && exact->transform_twin_enabled &&
+      (state.control[31] & mac123_overflow_mask) == 0U;
+  if (!has_exact_result && macro_result_valid) {
+    const auto divisor =
+        static_cast<double>(std::uint64_t{1} << shift);
+    for (std::size_t row{}; row < exact_result.size(); ++row) {
+      exact_result[row] = static_cast<double>(macro_result[row]) / divisor;
+      exact_enhanced[row] =
+          std::abs(exact_result[row] -
+                   static_cast<double>(signedWord(state.data[25U + row]))) >
+          1.0e-9;
+    }
+    exact_lineage = rawTransformLineage(state, *exact, matrix, vector,
+                                        translation, instruction);
+  }
+  if ((has_exact_result || macro_result_valid) &&
+      (state.control[31] & mac123_overflow_mask) == 0U) {
     for (std::size_t row{}; row < exact_result.size(); ++row) {
       exact_enhanced[row] =
           exact_enhanced[row] ||
@@ -1360,9 +1364,10 @@ void perspectiveTransformVector(GteState &state, std::uint8_t vector_index,
   checkMac0Overflow(state, screen_y);
   const auto screen_saturated = pushScreenPosition(
       state, lowSignedWord(screen_x >> 16U), lowSignedWord(screen_y >> 16U));
-  // If an enhanced publication is incomplete, MAC44 still contains the
-  // coherent current transform before IR/SZ truncation and saturation.
-  // Publish that unclamped tuple instead of falling back to Q8 registers.
+  // RTPS/RTPT owns a coherent MAC44 tuple before IR/SZ truncation. Preserve it
+  // for every GTE-projected vertex; enhanced camera/model/vector publications
+  // replace the integer inputs when available, but are not required merely to
+  // retain the current macro's fractional result.
   if (exact_twin_enabled && (!has_exact_view || !exact_view_computed)) {
     for (std::size_t row{}; row < exact_view.size(); ++row) {
       exact_view[row] = static_cast<double>(coordinate[row]) / 4096.0;
@@ -1374,19 +1379,39 @@ void perspectiveTransformVector(GteState &state, std::uint8_t vector_index,
         exact != nullptr
             ? sourceVertexIdentity(state, vector_index, instruction, exact)
             : 0U;
+    if (exact_twin_enabled) {
+      fractional_transform =
+          fractional_transform ||
+          std::ranges::any_of(coordinate, [](std::int64_t value) {
+            return value % 4096 != 0;
+          });
+      if (!has_exact_view) {
+        exact_lineage = rawTransformLineage(state, *exact, 0U, vector_index,
+                                            0U, instruction);
+      }
+    }
     const auto source_vertex_id =
         exact != nullptr && exact->source_identity_enabled ? mesh_vertex_id
                                                            : 0U;
+    const auto macro_projection_safe =
+        exact_twin_enabled && !ir_saturated && !depth_saturated &&
+        !divide_overflow && !screen_saturated;
+    const auto exact_projection = has_exact_view || macro_projection_safe;
+    const auto transform_lineage =
+        has_exact_view ? exact->camera_revision
+        : macro_projection_safe ? exact_lineage
+                                : 0U;
+    const auto projection_epoch =
+        exact_projection ? exact->projection_revision : 0U;
     pushProjectedVertex(state, coordinate, ir_saturated, depth_saturated,
                         divide_overflow, screen_saturated,
                         has_unclamped_view ? &exact_view : nullptr,
                         preserve_projection_precision, fractional_transform,
                         enhanced_sources, source_vertex_id, mesh_vertex_id,
-                        has_exact_view ? exact->camera_revision : 0U,
-                        has_exact_view ? exact->projection_revision : 0U);
+                        transform_lineage, projection_epoch);
   }
 
-  if (has_exact_view) {
+  if (has_unclamped_view) {
     std::array<double, 3U> exact_result{};
     std::array<bool, 3U> enhanced{};
     const auto result_scale =
@@ -1479,13 +1504,13 @@ void executeNormalClip(GteState &state, const GteExactState *) noexcept {
                 static_cast<double>(v0.screen_x) * v2.screen_y -
                 static_cast<double>(v1.screen_x) * v0.screen_y -
                 static_cast<double>(v2.screen_x) * v1.screen_y;
-    // A non-positive signed W is only published by the exact-transform path.
-    // Legacy fractional PGXP vertices can carry a zero-initialized view tuple,
-    // which must continue to use their precise post-divide screen area.
-    const auto has_exact_transform =
-        v0.exact_transform || v1.exact_transform || v2.exact_transform;
+    // Direct camera tuples may cross the eye plane; derived values use their
+    // post-divide screen area.
+    const auto has_camera_view = v0.exact_transform || v1.exact_transform ||
+                                 v2.exact_transform || v0.hasUnclampedView() ||
+                                 v1.hasUnclampedView() || v2.hasUnclampedView();
     const auto eye_crossing =
-        has_exact_transform &&
+        has_camera_view &&
         (v0.view_z <= 0.0F || v1.view_z <= 0.0F || v2.view_z <= 0.0F);
     const auto homogeneous_context = [&] {
       if (!eye_crossing) {
@@ -1501,7 +1526,8 @@ void executeNormalClip(GteState &state, const GteExactState *) noexcept {
             !std::isfinite(vertex->screen_offset_x) ||
             !std::isfinite(vertex->screen_offset_y) ||
             vertex->screen_h <= 0.0F ||
-            (vertex->view_z <= 0.0F && !vertex->exact_transform)) {
+            (vertex->view_z <= 0.0F && !vertex->exact_transform &&
+             !vertex->hasUnclampedView())) {
           return false;
         }
         if (std::abs(vertex->screen_h - v0.screen_h) > camera_tolerance ||

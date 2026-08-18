@@ -119,6 +119,217 @@ void testBranchDelay() {
   require(runtime.state().gpr[3] == 5U, "JR did not execute its delay slot");
 }
 
+void testIdleLoopFastForwardProof() {
+  sf::psx::R3000Runtime runtime;
+  sf::psx::PsxMachine machine{runtime, sf::psx::CpuClockScale{2U, 1U}};
+  constexpr std::array words{
+      encodeI(0x04U, 0U, 0U, static_cast<std::uint16_t>(-1)),
+      0U,
+  };
+  loadCode(runtime, words);
+  runtime.reset(code_address);
+
+  const auto run_loop = [&] {
+    const auto branch = machine.step();
+    const auto delay = machine.step();
+    require(branch.reason == sf::psx::R3000StopReason::running &&
+                delay.reason == sf::psx::R3000StopReason::running &&
+                runtime.state().pc == code_address,
+            "Synthetic idle loop did not return to its exact boundary");
+  };
+  run_loop();
+  const auto snapshot = runtime.captureIdleLoopSnapshot();
+  run_loop();
+  require(runtime.matchesIdleLoopSnapshot(snapshot),
+          "Pure idle loop did not reproduce its architectural state");
+
+  const auto tick_before = machine.currentTick();
+  constexpr std::uint64_t requested_skip = 1'000U;
+  require(machine.fastForwardIdleTicks(requested_skip) == requested_skip &&
+              machine.currentTick() == tick_before + requested_skip &&
+              runtime.state().pc == code_address,
+          "Idle fast-forward changed CPU state or lost machine time");
+
+  const auto invalidated = runtime.captureIdleLoopSnapshot();
+  require(runtime.write32(0x80020000U, 7U) &&
+              !runtime.matchesIdleLoopSnapshot(invalidated),
+          "A guest memory write did not invalidate the idle-loop proof");
+
+  runtime.reset(code_address);
+  const auto status_poll = runtime.captureIdleLoopSnapshot();
+  std::uint32_t gpu_status{};
+  require(runtime.read32(0x1f801814U, gpu_status) &&
+              runtime.matchesIdleLoopSnapshot(status_poll),
+          "A scheduler-bounded GPU status read invalidated idle-loop proof");
+
+  const auto fifo_read = runtime.captureIdleLoopSnapshot();
+  std::uint8_t controller_data{};
+  require(runtime.read8(0x1f801040U, controller_data) &&
+              !runtime.matchesIdleLoopSnapshot(fifo_read),
+          "A destructive MMIO FIFO read retained idle-loop proof");
+}
+
+void testCachedInterpreterBlocks() {
+  sf::psx::R3000Runtime runtime;
+  sf::psx::PsxMachine machine{runtime, sf::psx::CpuClockScale{3U, 2U}};
+  constexpr std::uint32_t data_address = 0x80020000U;
+  constexpr std::array words{
+      encodeI(0x09U, 0U, 8U, 5U),
+      encodeI(0x09U, 0U, 9U, 0U),
+      encodeI(0x09U, 9U, 9U, 1U),
+      encodeI(0x05U, 9U, 8U, static_cast<std::uint16_t>(-2)),
+      0U,
+      encodeI(0x2bU, 10U, 9U, 0U),
+      encodeR(31U, 0U, 0U, 0U, 0x08U),
+      0U,
+  };
+  loadCode(runtime, words);
+  runtime.setExecutionBreakpoint(sf::psx::R3000Runtime::return_sentinel, true);
+  runtime.reset(code_address);
+  runtime.setRegister(10U, data_address);
+  runtime.setRegister(31U, sf::psx::R3000Runtime::return_sentinel);
+
+  const auto tick_before = machine.currentTick();
+  const auto first = machine.runCached(100U);
+  std::uint32_t stored{};
+  require(first.reason == sf::psx::R3000StopReason::running &&
+              first.instructions == 20U &&
+              runtime.state().pc == sf::psx::R3000Runtime::return_sentinel &&
+              runtime.read32(data_address, stored) && stored == 5U &&
+              machine.currentTick() == tick_before + first.instructions,
+          "Cached block execution diverged from scalar R3000 semantics");
+
+  require(runtime.write32(code_address, encodeI(0x09U, 0U, 8U, 3U)),
+          "Could not patch cached guest code");
+  runtime.reset(code_address);
+  runtime.setRegister(10U, data_address);
+  runtime.setRegister(31U, sf::psx::R3000Runtime::return_sentinel);
+  const auto patched = machine.runCached(100U);
+  require(patched.reason == sf::psx::R3000StopReason::running &&
+              runtime.state().pc == sf::psx::R3000Runtime::return_sentinel &&
+              runtime.read32(data_address, stored) && stored == 3U,
+          "A RAM code write did not invalidate the cached block");
+
+  runtime.setExecutionBreakpoint(code_address + 4U, true);
+  runtime.reset(code_address);
+  runtime.setRegister(31U, sf::psx::R3000Runtime::return_sentinel);
+  const auto boundary = machine.runCached(100U);
+  require(boundary.reason == sf::psx::R3000StopReason::running &&
+              boundary.instructions == 1U &&
+              runtime.state().pc == code_address + 4U &&
+              runtime.state().gpr[8U] == 3U,
+          "Cached execution crossed an exact host breakpoint");
+}
+
+void testCachedInterpreterLoadDelay() {
+  sf::psx::R3000Runtime runtime;
+  sf::psx::PsxMachine machine{runtime};
+  constexpr std::uint32_t data_address = 0x80020000U;
+  constexpr std::array words{
+      encodeI(0x0fU, 0U, 8U, 0x8002U), encodeI(0x23U, 8U, 2U, 0U),
+      encodeI(0x09U, 2U, 3U, 1U),      encodeR(2U, 0U, 4U, 0U, 0x21U),
+      encodeI(0x23U, 8U, 5U, 0U),      encodeI(0x09U, 0U, 5U, 9U),
+      encodeR(31U, 0U, 0U, 0U, 0x08U), 0U,
+  };
+  loadCode(runtime, words);
+  require(runtime.write32(data_address, 0x12345678U),
+          "Could not seed cached load-delay data");
+  runtime.setExecutionBreakpoint(sf::psx::R3000Runtime::return_sentinel, true);
+  runtime.reset(code_address);
+  runtime.setRegister(31U, sf::psx::R3000Runtime::return_sentinel);
+
+  const auto result = machine.runCached(100U);
+  require(result.reason == sf::psx::R3000StopReason::running &&
+              runtime.state().pc == sf::psx::R3000Runtime::return_sentinel &&
+              runtime.state().gpr[3U] == 1U &&
+              runtime.state().gpr[4U] == 0x12345678U &&
+              runtime.state().gpr[5U] == 9U,
+          "Cached load-delay execution diverged from scalar semantics");
+}
+
+void testCachedInterpreterHalfwords() {
+  sf::psx::R3000Runtime runtime;
+  sf::psx::PsxMachine machine{runtime};
+  constexpr std::uint32_t data_address = 0x80020000U;
+  constexpr std::array words{
+      encodeI(0x0fU, 0U, 8U, 0x8002U),
+      encodeI(0x21U, 8U, 2U, 0U),
+      0U,
+      encodeR(2U, 0U, 3U, 0U, 0x21U),
+      encodeI(0x25U, 8U, 4U, 2U),
+      0U,
+      encodeR(4U, 0U, 5U, 0U, 0x21U),
+      encodeI(0x29U, 8U, 3U, 4U),
+      encodeR(31U, 0U, 0U, 0U, 0x08U),
+      0U,
+  };
+  loadCode(runtime, words);
+  require(runtime.write32(data_address, 0x7fff8001U),
+          "Could not seed cached halfword data");
+  runtime.setExecutionBreakpoint(sf::psx::R3000Runtime::return_sentinel, true);
+  runtime.reset(code_address);
+  runtime.setRegister(31U, sf::psx::R3000Runtime::return_sentinel);
+
+  const auto result = machine.runCached(100U);
+  std::uint16_t stored{};
+  require(result.reason == sf::psx::R3000StopReason::running &&
+              runtime.state().pc == sf::psx::R3000Runtime::return_sentinel &&
+              runtime.state().gpr[3U] == 0xffff8001U &&
+              runtime.state().gpr[5U] == 0x00007fffU &&
+              runtime.read16(data_address + 4U, stored) && stored == 0x8001U,
+          "Cached LH/LHU/SH execution diverged from scalar semantics");
+}
+
+void testCachedInterpreterTrackedAddImmediate() {
+  sf::psx::R3000Runtime runtime;
+  runtime.setPgxpCpuTracking(true);
+  runtime.setPgxpPreserveProjectionPrecision(true);
+  require(runtime.setPgxpTransformTracking(true),
+          "Could not enable cached PGXP tracking");
+  sf::psx::PsxMachine machine{runtime};
+  constexpr std::uint32_t data_address = 0x80024000U;
+  constexpr std::array words{
+      0x4a180001U,
+      encodeCop2Transfer(0U, 8U, 14U),
+      0U,
+      encodeI(0x09U, 8U, 8U, 1U),
+      encodeI(0x09U, 8U, 8U, static_cast<std::uint16_t>(-1)),
+      encodeI(0x2bU, 10U, 8U, 0U),
+      encodeR(31U, 0U, 0U, 0U, 0x08U),
+      0U,
+  };
+  loadCode(runtime, words);
+  auto state = runtime.state();
+  sf::psx::GteRuntime::writeControl(state.gte, 0U, 0x00001001U);
+  sf::psx::GteRuntime::writeControl(state.gte, 2U, 0x00001000U);
+  sf::psx::GteRuntime::writeControl(state.gte, 4U, 0x00001000U);
+  sf::psx::GteRuntime::writeControl(state.gte, 26U, 320U);
+  sf::psx::GteRuntime::writeData(state.gte, 0U, 101U | (53U << 16U));
+  sf::psx::GteRuntime::writeData(state.gte, 1U, 1000U);
+  state.pc = code_address;
+  state.next_pc = code_address + 4U;
+  runtime.restoreCpuState(state);
+  runtime.setRegister(10U, data_address);
+  runtime.setRegister(31U, sf::psx::R3000Runtime::return_sentinel);
+  runtime.setExecutionBreakpoint(sf::psx::R3000Runtime::return_sentinel, true);
+
+  const auto fallback_before = runtime.cachedFastFallbacks();
+  const auto result = machine.runCached(64U);
+  const auto fallback_count = runtime.cachedFastFallbacks() - fallback_before;
+  const auto *projection = runtime.projectedVertexAt(data_address);
+  std::uint32_t stored{};
+  require(result.reason == sf::psx::R3000StopReason::running &&
+              runtime.state().pc == sf::psx::R3000Runtime::return_sentinel,
+          "Cached ADDIU carrier program did not return");
+  require(runtime.read32(data_address, stored),
+          "Cached ADDIU carrier result was not stored");
+  require(projection != nullptr && projection->valid &&
+              projection->packed_sxy == stored,
+          "Cached ADDIU fast path lost PGXP provenance");
+  require(fallback_count == 2U,
+          "Cached ADDIU carrier unexpectedly fell back to scalar");
+}
+
 void testLoadDelay() {
   sf::psx::R3000Runtime runtime;
   constexpr std::array words{
@@ -693,12 +904,11 @@ void testMachineLinkedListDma() {
               std::vector<std::uint32_t>(payloads.begin(), payloads.end()) &&
           gpu.dma_sources ==
               std::vector<sf::psx::GpuDmaWordSource>{
-                  {0x1004U, 0x1000U,
-                   sf::psx::GpuDmaSourceKind::linked_list},
-                  {0x1008U, 0x1000U,
-                   sf::psx::GpuDmaSourceKind::linked_list},
+                  {0x1004U, 0x1000U, sf::psx::GpuDmaSourceKind::linked_list},
+                  {0x1008U, 0x1000U, sf::psx::GpuDmaSourceKind::linked_list},
                   {0x2004U, 0x1000U,
-                   sf::psx::GpuDmaSourceKind::linked_list}} &&
+                   sf::psx::GpuDmaSourceKind::linked_list,
+                   sf::psx::GpuDmaWordSource::invalid_ordering_depth}} &&
           (machine.dma().chcr(sf::psx::DmaChannel::gpu) & 0x01000000U) == 0U,
       "Linked-list GPU DMA provenance or completion mismatch");
 }
@@ -1189,6 +1399,36 @@ void testGteGameplayMath() {
               std::abs(preserved_projection->view_x - 101.02466F) < 0.0001F,
           "GTE catalog did not preserve fractional MAC projection precision");
 
+  auto macro_projection_state = precise_state;
+  sf::psx::GteExactState macro_projection_tracking{};
+  sf::psx::GteRuntime::writeControl(macro_projection_state, 0U, 0x1001U);
+  require(sf::psx::GteRuntime::executeCommand(
+              macro_projection_state, 0x4a180001U,
+              &macro_projection_tracking, true, true),
+          "Macro-precision RTPS command was rejected");
+  const auto *macro_projection =
+      sf::psx::GteRuntime::projectedVertex(macro_projection_state, 14U);
+  require(macro_projection != nullptr && macro_projection->valid &&
+              macro_projection->exact_transform &&
+              macro_projection->fractional_transform &&
+              macro_projection->hasExactTransformProvenance() &&
+              std::abs(macro_projection->view_x - 101.02466F) < 0.0001F,
+          "RTPS lost the current MAC44 tuple before Q12-to-Q8 truncation");
+
+  sf::psx::GteState macro_mvmva_state{};
+  sf::psx::GteExactState macro_mvmva_tracking{};
+  sf::psx::GteRuntime::writeControl(macro_mvmva_state, 0U, 0x1001U);
+  sf::psx::GteRuntime::writeControl(macro_mvmva_state, 2U, 0x1000U);
+  sf::psx::GteRuntime::writeControl(macro_mvmva_state, 4U, 0x1000U);
+  sf::psx::GteRuntime::writeData(macro_mvmva_state, 0U, 101U);
+  require(sf::psx::GteRuntime::executeCommand(
+              macro_mvmva_state, 0x4a080012U, &macro_mvmva_tracking) &&
+              macro_mvmva_tracking.result[0U].valid &&
+              macro_mvmva_tracking.result[0U].enhanced &&
+              std::abs(macro_mvmva_tracking.result[0U].value - 101.02466) <
+                  0.0001,
+          "MVMVA lost its MAC44 result before IR truncation");
+
   const auto precise_identity = precise->source_vertex_id;
   auto repeated_identity_state = precise_state;
   require(sf::psx::GteRuntime::executeCommand(
@@ -1220,16 +1460,21 @@ void testGteGameplayMath() {
                       ->source_vertex_id != precise_identity,
           "Different transform reused a source vertex identity");
 
+  auto unclamped_projection_tracking = raw_projection_tracking;
+  unclamped_projection_tracking.transform_twin_enabled = true;
+
   auto divide_overflow_state = precise_state;
   sf::psx::GteRuntime::writeData(divide_overflow_state, 0U, 32U);
   sf::psx::GteRuntime::writeData(divide_overflow_state, 1U, 64U);
-  require(sf::psx::GteRuntime::executeCommand(
-              divide_overflow_state, 0x4a180001U, &raw_projection_tracking),
+  require(sf::psx::GteRuntime::executeCommand(divide_overflow_state,
+                                              0x4a180001U,
+                                              &unclamped_projection_tracking),
           "Divide-overflow RTPS command was rejected");
   const auto *divide_overflow =
       sf::psx::GteRuntime::projectedVertex(divide_overflow_state, 14U);
   require(divide_overflow != nullptr && divide_overflow->valid &&
               divide_overflow->divide_overflow &&
+              divide_overflow->hasUnclampedView() &&
               !divide_overflow->exact_transform &&
               !divide_overflow->pgxpEligible(),
           "Legacy projection survived GTE divide overflow");
@@ -1237,13 +1482,15 @@ void testGteGameplayMath() {
   auto screen_saturated_state = precise_state;
   sf::psx::GteRuntime::writeData(screen_saturated_state, 0U, 10'000U);
   sf::psx::GteRuntime::writeData(screen_saturated_state, 1U, 1'000U);
-  require(sf::psx::GteRuntime::executeCommand(
-              screen_saturated_state, 0x4a180001U, &raw_projection_tracking),
+  require(sf::psx::GteRuntime::executeCommand(screen_saturated_state,
+                                              0x4a180001U,
+                                              &unclamped_projection_tracking),
           "Screen-saturated RTPS command was rejected");
   const auto *screen_saturated =
       sf::psx::GteRuntime::projectedVertex(screen_saturated_state, 14U);
   require(screen_saturated != nullptr && screen_saturated->valid &&
               screen_saturated->screen_saturated &&
+              screen_saturated->hasUnclampedView() &&
               !screen_saturated->exact_transform &&
               !screen_saturated->pgxpEligible(),
           "Legacy projection survived GTE screen saturation");
@@ -1252,13 +1499,15 @@ void testGteGameplayMath() {
   sf::psx::GteRuntime::writeControl(depth_saturated_state, 7U, 70'000U);
   sf::psx::GteRuntime::writeData(depth_saturated_state, 0U, 0U);
   sf::psx::GteRuntime::writeData(depth_saturated_state, 1U, 0U);
-  require(sf::psx::GteRuntime::executeCommand(
-              depth_saturated_state, 0x4a180001U, &raw_projection_tracking),
+  require(sf::psx::GteRuntime::executeCommand(depth_saturated_state,
+                                              0x4a180001U,
+                                              &unclamped_projection_tracking),
           "Depth-saturated RTPS command was rejected");
   const auto *depth_saturated =
       sf::psx::GteRuntime::projectedVertex(depth_saturated_state, 14U);
   require(depth_saturated != nullptr && depth_saturated->valid &&
               depth_saturated->depth_saturated &&
+              depth_saturated->hasUnclampedView() &&
               !depth_saturated->exact_transform &&
               !depth_saturated->pgxpEligible(),
           "Legacy projection survived GTE depth saturation");
@@ -1785,9 +2034,13 @@ void testGteGameplayMath() {
             exact.data == integer.data && exact.control == integer.control &&
             exact.projected == integer.projected &&
             std::bit_cast<std::int32_t>(
-                sf::psx::GteRuntime::readData(integer, 24U)) * precise_y > 0.0F &&
+                sf::psx::GteRuntime::readData(integer, 24U)) *
+                    precise_y >
+                0.0F &&
             std::bit_cast<std::int32_t>(
-                sf::psx::GteRuntime::readData(exact, 24U)) * precise_y > 0.0F &&
+                sf::psx::GteRuntime::readData(exact, 24U)) *
+                    precise_y >
+                0.0F &&
             integer.precise_nclip_valid && exact.precise_nclip_valid &&
             integer.precise_nclip_area == exact.precise_nclip_area &&
             (integer.precise_nclip_area > 0.0) == (precise_y > 0.0F),
@@ -1893,13 +2146,12 @@ void testGteExactTransformTwin() {
   const auto *raw_fallback =
       sf::psx::GteRuntime::projectedVertex(raw_fallback_state, 14U);
   require(raw_fallback != nullptr && raw_fallback->valid &&
-              !raw_fallback->exact_transform &&
+              raw_fallback->exact_transform &&
               !raw_fallback->fractional_transform &&
-              raw_fallback->transform_lineage == 0U &&
-              raw_fallback->projection_epoch == 0U &&
+              raw_fallback->hasExactTransformProvenance() &&
               raw_fallback->view_x == 100.0F &&
               raw_fallback->view_y == -50.0F && raw_fallback->view_z == 1000.0F,
-          "Incomplete enhanced tuple escaped conservative MAC44 fallback");
+          "Raw RTPS macro did not publish its coherent current MAC44 tuple");
 
   sf::psx::GteState atomic_state{};
   sf::psx::GteExactState atomic_exact{};
@@ -1920,11 +2172,10 @@ void testGteExactTransformTwin() {
       sf::psx::GteRuntime::executeCommand(atomic_state, rtps, &atomic_exact),
       "Partial exact rotation rejected RTPS");
   auto projected = *sf::psx::GteRuntime::projectedVertex(atomic_state, 14U);
-  require(projected.valid && !projected.exact_transform &&
+  require(projected.valid && projected.exact_transform &&
               !projected.fractional_transform &&
-              projected.transform_lineage == 0U &&
-              projected.projection_epoch == 0U,
-          "Partial CR0-CR3 rotation escaped conservative MAC44 fallback");
+              projected.hasExactTransformProvenance(),
+          "Partial enhanced state lost the coherent integer MAC44 tuple");
   sf::psx::GteRuntime::writeControl(atomic_state, 4U, identity_r4,
                                     &atomic_exact);
   require(
@@ -1938,15 +2189,16 @@ void testGteExactTransformTwin() {
           "Integer exact tuple did not publish its coherent view without "
           "fractional transformation");
 
+  const auto complete_epoch = projected.projection_epoch;
   sf::psx::GteRuntime::writeControl(atomic_state, 0U, identity_r0,
                                     &atomic_exact);
   require(
       sf::psx::GteRuntime::executeCommand(atomic_state, rtps, &atomic_exact) &&
-          !sf::psx::GteRuntime::projectedVertex(atomic_state, 14U)
-               ->exact_transform &&
           sf::psx::GteRuntime::projectedVertex(atomic_state, 14U)
-                  ->transform_lineage == 0U,
-      "A lone CR0 write reused the old enhanced rotation publication");
+              ->exact_transform &&
+          sf::psx::GteRuntime::projectedVertex(atomic_state, 14U)
+                  ->projection_epoch == complete_epoch,
+      "A no-op CR0 write invalidated the current exact rotation");
   for (std::uint8_t index = 1U; index <= 4U; ++index) {
     constexpr std::array values{identity_r0, identity_r1, identity_r2,
                                 identity_r3, identity_r4};
@@ -1956,22 +2208,22 @@ void testGteExactTransformTwin() {
   sf::psx::GteRuntime::writeControl(atomic_state, 5U, 0U, &atomic_exact);
   require(
       sf::psx::GteRuntime::executeCommand(atomic_state, rtps, &atomic_exact) &&
-          !sf::psx::GteRuntime::projectedVertex(atomic_state, 14U)
-               ->exact_transform &&
           sf::psx::GteRuntime::projectedVertex(atomic_state, 14U)
-                  ->transform_lineage == 0U,
-      "A partial CR5 translation reused stale enhanced state");
+              ->exact_transform &&
+          sf::psx::GteRuntime::projectedVertex(atomic_state, 14U)
+                  ->projection_epoch == complete_epoch,
+      "A no-op CR5 write invalidated the current exact translation");
   sf::psx::GteRuntime::writeControl(atomic_state, 6U, 0U, &atomic_exact);
   sf::psx::GteRuntime::writeControl(atomic_state, 7U, 0U, &atomic_exact);
   sf::psx::GteRuntime::writeData(atomic_state, 0U, 100U, nullptr,
                                  &atomic_exact);
   require(
       sf::psx::GteRuntime::executeCommand(atomic_state, rtps, &atomic_exact) &&
-          !sf::psx::GteRuntime::projectedVertex(atomic_state, 14U)
-               ->exact_transform &&
           sf::psx::GteRuntime::projectedVertex(atomic_state, 14U)
-                  ->transform_lineage == 0U,
-      "A partial VXY write reused stale enhanced VZ state");
+              ->exact_transform &&
+          sf::psx::GteRuntime::projectedVertex(atomic_state, 14U)->view_z ==
+              1000.0F,
+      "A VXY write discarded the unchanged exact VZ component");
   sf::psx::GteRuntime::writeData(atomic_state, 1U, 1000U, nullptr,
                                  &atomic_exact);
   require(
@@ -2022,8 +2274,8 @@ void testGteExactTransformTwin() {
   const auto republished =
       *sf::psx::GteRuntime::projectedVertex(atomic_state, 14U);
   require(republished.source_vertex_id == stable.source_vertex_id &&
-              republished.transform_lineage != stable.transform_lineage,
-          "Same exact values acquired a publication-dependent identity");
+              republished.transform_lineage == stable.transform_lineage,
+          "Same exact values changed stable transform identity");
 
   const auto unchanged_epoch = republished.projection_epoch;
   sf::psx::GteRuntime::writeControl(atomic_state, 26U, 320U, &atomic_exact);
@@ -2177,10 +2429,9 @@ void testGteExactTransformTwin() {
   const auto saturated_xy_raw =
       10'000U |
       (static_cast<std::uint32_t>(static_cast<std::uint16_t>(-50)) << 16U);
-  auto saturated_xy = packed_word(projection_exact, saturated_xy_raw,
-                                  10'000.25, -50.5, 0x304U);
-  auto saturated_z =
-      scalar_word(projection_exact, 1000U, 1000.125, 0x306U);
+  auto saturated_xy =
+      packed_word(projection_exact, saturated_xy_raw, 10'000.25, -50.5, 0x304U);
+  auto saturated_z = scalar_word(projection_exact, 1000U, 1000.125, 0x306U);
   sf::psx::GteRuntime::writeData(exact_projection, 0U, saturated_xy_raw,
                                  nullptr, &projection_exact, &saturated_xy);
   sf::psx::GteRuntime::writeData(exact_projection, 1U, 1000U, nullptr,
@@ -2191,16 +2442,15 @@ void testGteExactTransformTwin() {
   const auto saturated_vertex =
       *sf::psx::GteRuntime::projectedVertex(exact_projection, 14U);
   const auto saturated_reprojection =
-      saturated_vertex.screen_offset_x +
-      saturated_vertex.view_x * saturated_vertex.screen_h /
-          saturated_vertex.view_z;
-  require(saturated_vertex.exact_transform &&
-              saturated_vertex.screen_saturated &&
-              saturated_vertex.pgxpEligible() &&
-              saturated_vertex.screen_x > 1023.0F &&
-              std::abs(saturated_vertex.screen_x - saturated_reprojection) <
-                  0.001F,
-          "Exact RTPS re-applied the hardware screen clamp");
+      saturated_vertex.screen_offset_x + saturated_vertex.view_x *
+                                             saturated_vertex.screen_h /
+                                             saturated_vertex.view_z;
+  require(
+      saturated_vertex.exact_transform && saturated_vertex.screen_saturated &&
+          saturated_vertex.pgxpEligible() &&
+          saturated_vertex.screen_x > 1023.0F &&
+          std::abs(saturated_vertex.screen_x - saturated_reprojection) < 0.001F,
+      "Exact RTPS re-applied the hardware screen clamp");
 
   auto near_zero = scalar_word(projection_exact, 0U, 0.0, 0x301U);
   sf::psx::GteRuntime::writeData(exact_projection, 0U, xy_raw, nullptr,
@@ -2592,8 +2842,9 @@ void testR3000ExactTransformTwinEndToEnd() {
               multiplied_matrix_exact_sxy == multiplied_matrix_legacy_sxy &&
               multiplied_matrix_projection != nullptr &&
               multiplied_matrix_projection->valid &&
-              !multiplied_matrix_projection->fractional_transform,
-          "MULT/MFLO/SRA retained stale fractional exact state");
+              multiplied_matrix_projection->exact_transform &&
+              multiplied_matrix_projection->fractional_transform,
+          "RTPS did not preserve the current multiplied MAC44 matrix result");
 
   constexpr std::uint16_t packed_alias_a_offset = 0x0540U;
   constexpr std::uint16_t packed_alias_b_offset = 0x0544U;
@@ -2783,6 +3034,73 @@ void testR3000ExactTransformTwinEndToEnd() {
   require(rejected_projection == nullptr ||
               !rejected_projection->exact_transform,
           "Exact GTE checkpoint ignored its architectural witness");
+}
+void testPublishedExactMatrixComposition() {
+  constexpr std::uint32_t lhs_address = 0x80010600U;
+  constexpr std::uint32_t output_address = 0x80010640U;
+  constexpr std::array lhs_rotation{4'095.5, -16.25, 0.5,   16.5,    4'095.75,
+                                    -8.0,    -0.25,  8.125, 4'095.25};
+  constexpr std::array lhs_translation{100.25, -50.5, 25.125};
+  constexpr std::array rhs_rotation{4'094.75, 32.5,  -4.0,   -32.25,   4'095.5,
+                                    12.0,     4.125, -11.75, 4'095.875};
+  constexpr std::array rhs_translation{10.5, 20.25, -5.75};
+
+  sf::psx::R3000Runtime runtime;
+  runtime.setPgxpExactTransformTracking(true);
+  require(runtime.setPgxpTransformTracking(true),
+          "Exact matrix composition storage allocation failed");
+  for (std::size_t word{}; word < 8U; ++word) {
+    require(runtime.write32(lhs_address + static_cast<std::uint32_t>(word * 4U),
+                            0U) &&
+                runtime.write32(
+                    output_address + static_cast<std::uint32_t>(word * 4U), 0U),
+            "Exact matrix composition fixture initialization failed");
+  }
+  require(runtime.publishExactTransform(lhs_address, lhs_rotation,
+                                        lhs_translation) &&
+              runtime.publishExactTransform(output_address, rhs_rotation,
+                                            rhs_translation),
+          "Exact matrix composition inputs were not published");
+
+  std::array<double, 9U> captured_rotation{};
+  std::array<double, 3U> captured_translation{};
+  require(runtime.captureExactTransform(output_address, captured_rotation,
+                                        captured_translation),
+          "Exact matrix composition RHS was not captured");
+  for (std::size_t word{}; word < 8U; ++word) {
+    require(runtime.write32(
+                output_address + static_cast<std::uint32_t>(word * 4U), 0U),
+            "MulMatrix output witness simulation failed");
+  }
+  require(runtime.publishComposedExactTransform(
+              lhs_rotation, lhs_translation, captured_rotation,
+              captured_translation, output_address),
+          "Exact matrix composition result was not published");
+
+  std::array<double, 9U> actual_rotation{};
+  std::array<double, 3U> actual_translation{};
+  require(runtime.captureExactTransform(output_address, actual_rotation,
+                                        actual_translation),
+          "Exact matrix composition result was not recoverable");
+  constexpr auto q12 = 4096.0;
+  for (std::size_t row{}; row < 3U; ++row) {
+    for (std::size_t column{}; column < 3U; ++column) {
+      double expected{};
+      for (std::size_t inner{}; inner < 3U; ++inner) {
+        expected +=
+            lhs_rotation[row * 3U + inner] * rhs_rotation[inner * 3U + column];
+      }
+      require(std::abs(actual_rotation[row * 3U + column] - expected / q12) <
+                  1.0e-9,
+              "Exact matrix rotation composition was requantized");
+    }
+    double expected = lhs_translation[row];
+    for (std::size_t inner{}; inner < 3U; ++inner) {
+      expected += lhs_rotation[row * 3U + inner] * rhs_translation[inner] / q12;
+    }
+    require(std::abs(actual_translation[row] - expected) < 1.0e-9,
+            "Exact matrix translation composition was requantized");
+  }
 }
 
 void testR3000ExactCarrierDomainSafety() {
@@ -10743,16 +11061,13 @@ void testLightweightGteProjectionCatalog() {
   sf::psx::GteRuntime::writeControl(toggle_state.gte, 24U, 0U);
   sf::psx::GteRuntime::writeControl(toggle_state.gte, 25U, 0U);
   sf::psx::GteRuntime::writeControl(toggle_state.gte, 26U, 320U);
-  sf::psx::GteRuntime::writeData(toggle_state.gte, 0U,
-                                 100U | (50U << 16U));
+  sf::psx::GteRuntime::writeData(toggle_state.gte, 0U, 100U | (50U << 16U));
   sf::psx::GteRuntime::writeData(toggle_state.gte, 1U, 1000U);
   toggle_runtime.restoreCpuState(toggle_state);
 
   constexpr std::array toggle_producer{
-      0x4a180001U,
-      encodeCop2Transfer(0U, 8U, 14U),
-      0U,
-      encodeR(31U, 0U, 0U, 0U, 0x08U),
+      0x4a180001U, encodeCop2Transfer(0U, 8U, 14U),
+      0U,          encodeR(31U, 0U, 0U, 0U, 0x08U),
       0U,
   };
   loadCode(toggle_runtime, toggle_producer);
@@ -10773,12 +11088,13 @@ void testLightweightGteProjectionCatalog() {
   };
   loadCode(toggle_runtime, toggle_consumer);
   toggle_runtime.setRegister(9U, toggle_destination);
-  require(toggle_runtime.call(code_address).reason ==
-                  sf::psx::R3000StopReason::returned &&
-              toggle_runtime.projectedVertexAt(toggle_destination) != nullptr &&
-              toggle_runtime.projectedVertexAt(toggle_destination)->packed_sxy ==
-                  toggle_sxy,
-          "Disabling heavy PGXP discarded a materialized catalog carrier");
+  require(
+      toggle_runtime.call(code_address).reason ==
+              sf::psx::R3000StopReason::returned &&
+          toggle_runtime.projectedVertexAt(toggle_destination) != nullptr &&
+          toggle_runtime.projectedVertexAt(toggle_destination)->packed_sxy ==
+              toggle_sxy,
+      "Disabling heavy PGXP discarded a materialized catalog carrier");
   require(runtime.setGpuProjectionCatalogTracking(false) &&
               runtime.gpuProjectionCatalog().empty(),
           "Lightweight projection catalog did not disable cleanly");
@@ -11573,6 +11889,10 @@ void testLevelGt3ScratchProjectionCarrier() {
 int main(int argc, char **argv) {
   try {
     testBranchDelay();
+    testCachedInterpreterBlocks();
+    testCachedInterpreterLoadDelay();
+    testCachedInterpreterHalfwords();
+    testCachedInterpreterTrackedAddImmediate();
     testLoadDelay();
     testMultiplyAndDivide();
     testCop0Status();
@@ -11591,6 +11911,7 @@ int main(int argc, char **argv) {
     testExactProjectionCpuCarrierProvenance();
     testLevelGt3ScratchProjectionCarrier();
     testCompactProjectionHandleFrameAliasing();
+    testPublishedExactMatrixComposition();
     testHostCallArgumentsInvalidateProjectionCarriers();
     testHalfwordProjectionContextMismatchCannotRepublish();
     testPgxpAddressShadowAndUnalignedTransport();

@@ -10,6 +10,7 @@ struct PsyXSceneFogParameters {
   float terrainThreshold = 0.0F;
   float terrainScale = 0.0F;
   float useGte = 0.0F;
+  float density = 1.0F;
   unsigned int revision = 1U;
 };
 
@@ -30,21 +31,22 @@ void PsyX_DestroyAtmosphere() {}
 
 #if USE_OPENGL
 void PsyX_ApplySceneFogUniforms(PSXGPU_Shader *shader) {
-  if (shader == NULL ||
-      shader->appliedSceneFogRevision == g_sceneFog.revision)
+  if (shader == NULL)
     return;
 
-  const float enabled = g_cfg_volumetricFog && g_sceneFog.enabled &&
-                                g_sceneFog.drawEnabled
-                            ? 1.0F
-                            : 0.0F;
-  glUniform4f(shader->sceneFogColorEnabledLoc, g_sceneFog.color[0],
-              g_sceneFog.color[1], g_sceneFog.color[2], enabled);
-  glUniform4f(shader->sceneFogGteLoc, g_sceneFog.dqa, g_sceneFog.dqb,
-              g_sceneFog.projection, g_sceneFog.useGte);
-  glUniform2f(shader->sceneFogTerrainLoc, g_sceneFog.terrainThreshold,
-              g_sceneFog.terrainScale);
-  shader->appliedSceneFogRevision = g_sceneFog.revision;
+  if (shader->appliedSceneFogRevision != g_sceneFog.revision) {
+    const float enabled = g_cfg_volumetricFog && g_sceneFog.enabled &&
+                                  g_sceneFog.drawEnabled
+                              ? 1.0F
+                              : 0.0F;
+    glUniform4f(shader->sceneFogColorEnabledLoc, g_sceneFog.color[0],
+                g_sceneFog.color[1], g_sceneFog.color[2], enabled);
+    glUniform4f(shader->sceneFogGteLoc, g_sceneFog.dqa, g_sceneFog.dqb,
+                g_sceneFog.projection, g_sceneFog.useGte);
+    glUniform3f(shader->sceneFogTerrainLoc, g_sceneFog.terrainThreshold,
+                g_sceneFog.terrainScale, g_sceneFog.density);
+    shader->appliedSceneFogRevision = g_sceneFog.revision;
+  }
 }
 #endif
 
@@ -78,5 +80,13 @@ void GR_EnableSceneFog(int enable) {
   if (g_sceneFog.drawEnabled == drawEnabled)
     return;
   g_sceneFog.drawEnabled = drawEnabled;
+  PsyX_AdvanceSceneFogRevision();
+}
+
+void GR_SetSceneFogDensity(float density) {
+  const float clamped = std::max(0.25F, std::min(density, 4.0F));
+  if (g_sceneFog.density == clamped)
+    return;
+  g_sceneFog.density = clamped;
   PsyX_AdvanceSceneFogRevision();
 }

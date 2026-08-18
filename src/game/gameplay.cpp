@@ -2227,9 +2227,9 @@ void GameplaySession::rebuildPresentationModels(bool reset_for_new_room) {
       portal_candidates);
   // Extend only along the first selected route. Choosing another entry from
   // portal_candidates would add a sibling at the same depth instead of moving
-  // the horizon farther from Gabe. A third connected step gives the streamer
-  // a modest extra lead; its cumulative VRAM admission can still stop safely
-  // after either nearer room.
+  // the horizon farther from Gabe. Five connected steps give the streamer a
+  // longer PC draw envelope; cumulative VRAM admission still stops safely at
+  // the last complete nearer room.
   auto lookahead_steps = terrain_models_.size() > presentation_models_.size()
                              ? std::size_t{1U}
                              : std::size_t{};

@@ -1,6 +1,6 @@
 #include "launcher.hpp"
 
-#include "mohu/display_presentation.hpp"
+#include "mohu/frontend_menu.hpp"
 #include "mohu/runtime.hpp"
 
 #include "sf/core/error.hpp"
@@ -10,8 +10,13 @@
 #include "sf/game/title.hpp"
 #include "sf/platform/host.hpp"
 
+#include <SDL.h>
+
+#include <array>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -24,6 +29,22 @@
 #include <vector>
 
 namespace {
+
+bool environmentFlagEnabled(const char *name,
+                            bool enabled_by_default = false) noexcept {
+  const auto *value = SDL_getenv(name);
+  return value == nullptr || value[0] == '\0' ? enabled_by_default
+                                              : std::strcmp(value, "0") != 0;
+}
+
+void logSpuDiagnostics(mohu::Runtime &runtime) noexcept {
+  std::array<sf::psx::SpuDiagnosticEvent, 128U> events{};
+  while (const auto count = runtime.takeSpuDiagnostics(events)) {
+    sf::platform::logRuntimeSpuDiagnostics(
+        std::span<const sf::psx::SpuDiagnosticEvent>{events}.first(count),
+        runtime.droppedSpuDiagnostics());
+  }
+}
 
 std::optional<int> parseInteger(std::string_view text) {
   int value{};
@@ -402,57 +423,235 @@ int main(int argc, char **argv) {
       return 0;
     }
 
-    const auto memory_card_path = sf::platform::defaultMemoryCardImagePath();
-    if (memory_card_path.empty()) {
+    const auto memory_card_slot_1_path =
+        sf::platform::defaultMemoryCardImagePath(0U);
+    const auto memory_card_slot_2_path =
+        sf::platform::defaultMemoryCardImagePath(1U);
+    if (memory_card_slot_1_path.empty() || memory_card_slot_2_path.empty()) {
       throw sf::core::Error{sf::core::ErrorCode::io,
-                            "Cannot resolve the Memory Card save path"};
+                            "Cannot resolve the Memory Card save paths"};
     }
-    mohu::StableGuestDisplayGeometry stable_display_geometry;
-    auto runtime =
-        std::make_unique<mohu::Runtime>(std::move(disc), memory_card_path);
+    auto runtime = std::make_unique<mohu::Runtime>(
+        std::move(disc), memory_card_slot_1_path, memory_card_slot_2_path);
     const auto gameplay_aspect = sf::platform::presentationAspectRatio(
         graphics.aspect_ratio, sf::platform::PresentationContent::gameplay);
+    const auto spu_diagnostics_enabled =
+        environmentFlagEnabled("SF_SPU_DIAGNOSTICS");
+    const auto exact_transform_diagnostics_enabled =
+        environmentFlagEnabled("SF_EXACT_TRANSFORM_DIAGNOSTICS");
+    runtime->setSpuDiagnosticsEnabled(spu_diagnostics_enabled);
     runtime->configureAdaptiveWorldFrustum(
         static_cast<std::uint32_t>(std::max(graphics.width, 1)),
         static_cast<std::uint32_t>(std::max(graphics.height, 1)),
         gameplay_aspect == sf::platform::AspectRatioMode::adaptive);
+    using RuntimeClock = std::chrono::steady_clock;
+    std::uint64_t next_cpu_perf_log_frame{1U};
+    std::uint64_t cpu_perf_samples{};
+    std::uint64_t cpu_perf_instruction_base{};
+    std::uint64_t cpu_perf_fallback_base{};
+    std::chrono::microseconds cpu_perf_total{};
+    std::chrono::microseconds cpu_perf_max{};
+    bool cpu_perf_started{};
     std::optional<mohu::RuntimeFrameResult> runtime_failure;
+    std::uint64_t next_exact_transform_log_frame{120U};
+    const auto copy_span = []<typename T>(std::span<const T> values) {
+      return std::vector<T>{values.begin(), values.end()};
+    };
     auto host = sf::platform::createPsyCrossRuntimeHost(
         "Medal of Honor: Underground PC",
-        [&](const sf::platform::RuntimePadInput &pad) {
-          auto frame = runtime->runFrame(pad.active_low_buttons, pad.analog);
-          if (frame.running()) {
-            return true;
+        [&](const sf::platform::RuntimePadInputs &pads,
+            const sf::platform::RuntimeMenuInteraction &menu_interaction) {
+          if (menu_interaction.selection_valid) {
+            static_cast<void>(runtime->selectFrontendMenuTarget(
+                menu_interaction.screen_id, menu_interaction.selection));
           }
-          runtime_failure = std::move(frame);
-          return false;
-        },
-        [&runtime, &stable_display_geometry] {
+          if (!cpu_perf_started) {
+            cpu_perf_instruction_base = runtime->stats().instructions;
+            cpu_perf_fallback_base = runtime->stats().cached_fast_fallbacks;
+            cpu_perf_started = true;
+          }
+          const auto frame_started = RuntimeClock::now();
+          mohu::RuntimeControllerInputs controllers{};
+          for (std::size_t port{}; port < controllers.size(); ++port) {
+            controllers[port].active_low_buttons =
+                pads[port].active_low_buttons;
+            controllers[port].analog = pads[port].analog;
+            controllers[port].connected = pads[port].connected;
+          }
+          auto frame = runtime->runFrame(controllers);
+          const auto frame_elapsed =
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  RuntimeClock::now() - frame_started);
+          const auto &stats = runtime->stats();
+          cpu_perf_total += frame_elapsed;
+          cpu_perf_max = std::max(cpu_perf_max, frame_elapsed);
+          ++cpu_perf_samples;
+          if (stats.frames >= next_cpu_perf_log_frame &&
+              cpu_perf_samples != 0U) {
+            const auto instructions =
+                stats.instructions - cpu_perf_instruction_base;
+            const auto fast_fallbacks =
+                stats.cached_fast_fallbacks - cpu_perf_fallback_base;
+            const auto read_guest_word = [&](std::uint32_t address) {
+              std::uint32_t value{};
+              static_cast<void>(runtime->cpu().read32(address, value));
+              return value;
+            };
+            constexpr std::uint32_t card_state = 0x800985c0U;
+            sf::platform::RuntimeGuestCardDiagnostics card{
+                .task = read_guest_word(card_state),
+                .result = read_guest_word(card_state + 0x04U),
+                .done = read_guest_word(card_state + 0x08U),
+                .ports = read_guest_word(card_state + 0x0cU),
+                .channel = read_guest_word(card_state + 0x10U),
+                .completion_callback = read_guest_word(card_state + 0x44U),
+                .task_stack_depth = read_guest_word(0x80087890U),
+                .vblank_callback = read_guest_word(0x80031a68U),
+                .update_ticks = read_guest_word(card_state + 0x50U),
+            };
+            for (std::size_t index{}; index < card.software_events.size();
+                 ++index) {
+              card.software_events[index] = read_guest_word(
+                  0x80098690U + static_cast<std::uint32_t>(index) * 4U);
+              card.hardware_events[index] = read_guest_word(
+                  0x800986a0U + static_cast<std::uint32_t>(index) * 4U);
+              card.software_handles[index] = read_guest_word(
+                  0x80098670U + static_cast<std::uint32_t>(index) * 4U);
+              card.hardware_handles[index] = read_guest_word(
+                  0x80098680U + static_cast<std::uint32_t>(index) * 4U);
+              card.stack_callbacks[index] = read_guest_word(
+                  0x80098660U + static_cast<std::uint32_t>(index) * 4U);
+              for (std::size_t word{}; word < card.stack_frames[index].size();
+                   ++word) {
+                card.stack_frames[index][word] =
+                    read_guest_word(0x80098620U + static_cast<std::uint32_t>(
+                                                      index * 16U + word * 4U));
+              }
+            }
+            sf::platform::logRuntimeGuestCpuDiagnostics(
+                cpu_perf_samples, cpu_perf_total.count() / cpu_perf_samples,
+                static_cast<std::uint64_t>(cpu_perf_max.count()),
+                instructions / cpu_perf_samples, fast_fallbacks,
+                runtime->cpu().state().pc, runtime->cpu().state().gpr[31U],
+                runtime->biosState(), card, runtime->machine().currentTick());
+            cpu_perf_samples = 0U;
+            cpu_perf_total = {};
+            cpu_perf_max = {};
+            cpu_perf_instruction_base = stats.instructions;
+            cpu_perf_fallback_base = stats.cached_fast_fallbacks;
+            next_cpu_perf_log_frame = stats.frames + 30U;
+          }
+          if (exact_transform_diagnostics_enabled &&
+              stats.frames >= next_exact_transform_log_frame) {
+            sf::platform::logRuntimeExactTransformDiagnostics(
+                stats.exact_transform_captures,
+                stats.exact_transform_publications,
+                stats.exact_transform_rejections,
+                stats.exact_composition_entries,
+                stats.exact_composition_captures, stats.exact_composition_sites,
+                stats.exact_composition_publications,
+                runtime->gpuProjectionCatalog());
+            next_exact_transform_log_frame = stats.frames + 120U;
+          }
+
+          if (!frame.running()) {
+            runtime_failure = std::move(frame);
+            return sf::platform::RuntimeFrameStep{.running = false};
+          }
           const auto &display = runtime->gpuDisplayState();
-          const auto geometry = stable_display_geometry.update(
-              mohu::GuestDisplayGeometry{display.width, display.height,
-                                         display.rgb24, display.interlaced});
-          // X/Y continue to select the exact guest backbuffer. Only the
-          // scanout geometry is debounced, so a transient GP1 reset cannot
-          // reshape the entire host frame for one presentation.
-          return sf::platform::RuntimeGpuFrame{
-              runtime->gpuCommands(),
-              runtime->gpuProjections(),
-              runtime->gpuProjectionIdentities(),
-              runtime->gpuProjectionCatalog(),
-              display.x,
-              display.y,
-              geometry.width,
-              geometry.height,
-              display.enabled,
-              geometry.rgb24,
-              geometry.interlaced,
-              runtime->gpuCommandBufferEpoch(),
-              runtime->gpuDmaSources()};
+          const auto gameplay_ready = runtime->gameplayPresentationReady();
+          std::vector<sf::platform::RuntimeGpuDisplayPublication>
+              display_publications;
+          display_publications.reserve(
+              runtime->gpuDisplayPublications().size());
+          for (const auto &publication : runtime->gpuDisplayPublications()) {
+            display_publications.push_back({
+                .word_offset = publication.word_offset,
+                .sequence = publication.sequence,
+                .display_x = publication.display.x,
+                .display_y = publication.display.y,
+                .display_width = publication.display.width,
+                .display_height = publication.display.height,
+                .display_enabled = publication.display.enabled,
+                .display_rgb24 = publication.display.rgb24,
+                .display_interlaced = publication.display.interlaced,
+            });
+          }
+          const auto campaign_level = runtime->activeCampaignLevel();
+          const auto atmosphere = runtime->activeAtmosphere();
+          const auto frontend_menu = mohu::inspectFrontendMenu(runtime->cpu());
+          sf::platform::RuntimeMenuState menu{
+              .active = frontend_menu.active,
+              .screen_id = frontend_menu.screen_id,
+              .selected = frontend_menu.selected,
+          };
+          menu.targets.reserve(frontend_menu.target_count);
+          for (std::size_t index{}; index < frontend_menu.target_count;
+               ++index) {
+            const auto &target = frontend_menu.targets[index];
+            menu.targets.push_back({
+                .selection = target.selection,
+                .x = target.x,
+                .y = target.y,
+                .width = target.width,
+                .height = target.height,
+            });
+          }
+          std::shared_ptr<const sf::platform::RuntimeGpuFrame> snapshot =
+              std::make_shared<sf::platform::RuntimeGpuFrame>(
+                  sf::platform::RuntimeGpuFrame{
+                      .sequence = stats.frames,
+                      .display_publication_sequence =
+                          runtime->gpuDisplayPublicationSequence(),
+                      .display_publications = std::move(display_publications),
+                      .words = copy_span(runtime->gpuCommands()),
+                      .projections = copy_span(runtime->gpuProjections()),
+                      .projection_identities =
+                          copy_span(runtime->gpuProjectionIdentities()),
+                      .projection_catalog =
+                          copy_span(runtime->gpuProjectionCatalog()),
+                      .display_x = display.x,
+                      .display_y = display.y,
+                      .display_width = display.width,
+                      .display_height = display.height,
+                      .display_enabled = display.enabled,
+                      .display_rgb24 = display.rgb24,
+                      .display_interlaced = display.interlaced,
+                      .content =
+                          gameplay_ready && !display.rgb24 &&
+                                  !display.interlaced
+                              ? sf::platform::PresentationContent::gameplay
+                              : sf::platform::PresentationContent::authored_4_3,
+                      .campaign_level = campaign_level,
+                      .atmosphere =
+                          {
+                              .red = atmosphere.red,
+                              .green = atmosphere.green,
+                              .blue = atmosphere.blue,
+                              .dqa = atmosphere.dqa,
+                              .dqb = atmosphere.dqb,
+                              .projection = atmosphere.projection,
+                              .terrain_depth_cue = atmosphere.terrain_depth_cue,
+                              .skybox_yaw = atmosphere.skybox_yaw,
+                              .skybox_pitch = atmosphere.skybox_pitch,
+                              .skybox_vertical_fov =
+                                  atmosphere.skybox_vertical_fov,
+                              .valid = atmosphere.valid,
+                              .skybox_view_valid = atmosphere.skybox_view_valid,
+                          },
+                      .menu = std::move(menu),
+                      .command_buffer_epoch = runtime->gpuCommandBufferEpoch(),
+                      .dma_sources = copy_span(runtime->gpuDmaSources()),
+                  });
+          return sf::platform::RuntimeFrameStep{.frame = std::move(snapshot)};
         },
         graphics, input, runtime_actions,
-        [&runtime](std::span<sf::psx::SpuPcmFrame> destination) noexcept {
-          return runtime->takePcm(destination);
+        [&runtime, spu_diagnostics_enabled](
+            std::span<sf::psx::SpuPcmFrame> destination) noexcept {
+          const auto count = runtime->takePcm(destination);
+          if (spu_diagnostics_enabled)
+            logSpuDiagnostics(*runtime);
+          return count;
         });
     host->run();
 

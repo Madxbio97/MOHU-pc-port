@@ -48,10 +48,17 @@ public:
   [[nodiscard]] virtual bool readMmio(std::uint32_t physical_address,
                                       R3000AccessWidth width,
                                       std::uint32_t &value) noexcept = 0;
+  // True only for read-only status registers whose observable state changes
+  // exclusively at machine scheduler boundaries.
+  [[nodiscard]] virtual bool idleSafeReadMmio(std::uint32_t,
+                                              R3000AccessWidth) const noexcept {
+    return false;
+  }
   [[nodiscard]] virtual bool
   writeMmio(std::uint32_t physical_address, R3000AccessWidth width,
             std::uint32_t value, const GteProjectedVertex *projected = nullptr,
-            std::uint64_t projection_identity = 0U) noexcept = 0;
+            std::uint64_t projection_identity = 0U,
+            std::uint32_t producer_pc = 0xffffffffU) noexcept = 0;
 };
 
 struct R3000DelayedLoadState {
@@ -75,6 +82,26 @@ struct R3000State {
   bool branch_delay_slot{};
   R3000DelayedLoadState load_delay{};
   R3000DelayedLoadState next_load_delay{};
+};
+
+struct R3000IdleLoopSnapshot {
+  R3000State state{};
+  std::uint64_t safety_epoch{};
+  bool eligible{};
+};
+
+struct R3000CachedInstruction {
+  std::uint32_t raw{};
+  std::uint32_t source_mask{};
+  std::uint8_t operation{};
+  bool synchronization_boundary{};
+  bool carrier_mask_required{};
+};
+
+struct R3000CachedBlockView {
+  std::span<const R3000CachedInstruction> instructions{};
+  std::uint32_t start_pc{};
+  std::uint64_t cache_epoch{};
 };
 
 struct R3000PgxpTransformCheckpoint {
@@ -155,6 +182,23 @@ public:
   }
   [[nodiscard]] std::uint16_t
   publishGpuProjectionHandle(GteProjectedVertex projection) noexcept;
+  [[nodiscard]] bool
+  publishExactTransform(std::uint32_t address,
+                        const std::array<double, 9U> &rotation,
+                        const std::array<double, 3U> &translation) noexcept;
+  [[nodiscard]] bool
+  captureExactTransform(std::uint32_t address, std::array<double, 9U> &rotation,
+                        std::array<double, 3U> &translation) const noexcept;
+  [[nodiscard]] bool captureTransformForComposition(
+      std::uint32_t address, std::array<double, 9U> &rotation,
+      std::array<double, 3U> &translation, bool &enhanced) const noexcept;
+  [[nodiscard]] bool
+  publishComposedExactTransform(const std::array<double, 9U> &lhs_rotation,
+                                const std::array<double, 3U> &lhs_translation,
+                                const std::array<double, 9U> &rhs_rotation,
+                                const std::array<double, 3U> &rhs_translation,
+                                std::uint32_t output_address,
+                                bool compose_translation = true) noexcept;
 
   [[nodiscard]] bool pgxpTransformTracking() const noexcept {
     return pgxp_transform_tracking_;
@@ -179,11 +223,27 @@ public:
 
   [[nodiscard]] bool interruptPending() const noexcept;
 
+  [[nodiscard]] R3000IdleLoopSnapshot captureIdleLoopSnapshot() const noexcept;
+  [[nodiscard]] bool
+  matchesIdleLoopSnapshot(const R3000IdleLoopSnapshot &snapshot) const noexcept;
+
   [[nodiscard]] bool atReturnSentinel() const noexcept {
     return state_.pc == return_sentinel;
   }
 
   [[nodiscard]] R3000RunResult step() noexcept;
+  [[nodiscard]] R3000RunResult
+  stepCachedInstruction(const R3000CachedInstruction &instruction) noexcept;
+  [[nodiscard]] R3000CachedBlockView cachedBlock() noexcept;
+  void setExecutionBreakpoint(std::uint32_t pc, bool enabled) noexcept;
+  [[nodiscard]] bool executionBreakpoint(std::uint32_t pc) const noexcept;
+  [[nodiscard]] std::uint64_t codeCacheEpoch() const noexcept {
+    return code_cache_epoch_;
+  }
+  [[nodiscard]] std::uint64_t cachedFastFallbacks() const noexcept {
+    return cached_fast_fallbacks_;
+  }
+  void clearCodeCache() noexcept;
   [[nodiscard]] R3000RunResult
   call(std::uint32_t address, std::span<const std::uint32_t> arguments = {},
        std::uint64_t instruction_budget = 1'000'000U) noexcept;
@@ -352,6 +412,45 @@ private:
   static constexpr std::size_t pgxp_context_capacity = 32768U;
   static_assert((pgxp_context_capacity & (pgxp_context_capacity - 1U)) == 0U);
 
+  static constexpr std::size_t code_page_size = 4096U;
+  static constexpr std::size_t code_page_count = ram_size / code_page_size;
+  static constexpr std::size_t cached_block_capacity = 8192U;
+  static constexpr std::size_t cached_block_max_instructions = 32U;
+  static constexpr std::size_t execution_breakpoint_capacity = 32U;
+  static_assert((cached_block_capacity & (cached_block_capacity - 1U)) == 0U);
+
+  struct CachedBlock {
+    std::array<R3000CachedInstruction, cached_block_max_instructions>
+        instructions{};
+    std::array<std::uint32_t, 2U> page_generations{};
+    std::array<std::uint16_t, 2U> pages{};
+    std::uint32_t start_pc{0xffffffffU};
+    std::uint32_t reset_generation{};
+    std::uint8_t instruction_count{};
+    std::uint8_t page_count{};
+  };
+
+  [[nodiscard]] R3000RunResult
+  stepImpl(const std::uint32_t *cached_instruction) noexcept;
+  [[nodiscard]] static R3000CachedInstruction
+  decodeCachedInstruction(std::uint32_t instruction) noexcept;
+  [[nodiscard]] bool stepCachedFast(const R3000CachedInstruction &instruction,
+                                    R3000RunResult &result) noexcept;
+  [[nodiscard]] R3000StopReason loadHalfword(std::uint32_t address,
+                                             std::uint8_t reg,
+                                             bool sign_extend) noexcept;
+  [[nodiscard]] R3000StopReason
+  storeHalfword(std::uint32_t address, std::uint8_t reg, std::uint32_t value,
+                std::uint32_t producer_pc) noexcept;
+  void writeAddImmediate(std::uint8_t source, std::uint8_t destination,
+                         std::uint32_t source_value,
+                         std::uint32_t immediate_value, std::uint32_t result,
+                         bool preserve_direct_projection) noexcept;
+  [[nodiscard]] CachedBlock &buildCachedBlock(CachedBlock &block,
+                                              std::uint32_t start_pc) noexcept;
+  void invalidateCodePage(std::uint32_t physical_address) noexcept;
+  void rebuildBreakpointPages() noexcept;
+
   [[nodiscard]] std::byte *memoryByte(std::uint32_t address) noexcept;
   [[nodiscard]] const std::byte *
   memoryByte(std::uint32_t address) const noexcept;
@@ -359,18 +458,21 @@ private:
                                             std::uint32_t &physical) noexcept;
   [[nodiscard]] bool readMmio(std::uint32_t address, R3000AccessWidth width,
                               std::uint32_t &value) const noexcept;
-  [[nodiscard]] bool writeMmio(std::uint32_t address, R3000AccessWidth width,
-                               std::uint32_t value,
-                               const GteProjectedVertex *projected = nullptr,
-                               std::uint64_t projection_identity = 0U) noexcept;
+  [[nodiscard]] bool
+  writeMmio(std::uint32_t address, R3000AccessWidth width, std::uint32_t value,
+            const GteProjectedVertex *projected = nullptr,
+            std::uint64_t projection_identity = 0U,
+            std::uint32_t producer_pc = 0xffffffffU) noexcept;
   [[nodiscard]] bool
   write32Projected(std::uint32_t address, std::uint32_t value,
-                   const GteProjectedVertex *projected) noexcept;
-  [[nodiscard]] bool write16Projected(std::uint32_t address,
-                                      std::uint16_t value,
-                                      const ProjectedHalf *projected_half,
-                                      const GteExactWord *exact_word = nullptr,
-                                      const PgxpValue *pgxp = nullptr) noexcept;
+                   const GteProjectedVertex *projected,
+                   std::uint32_t producer_pc = 0xffffffffU) noexcept;
+  [[nodiscard]] bool
+  write16Projected(std::uint32_t address, std::uint16_t value,
+                   const ProjectedHalf *projected_half,
+                   const GteExactWord *exact_word = nullptr,
+                   const PgxpValue *pgxp = nullptr,
+                   std::uint32_t producer_pc = 0xffffffffU) noexcept;
   void writeRegister(std::uint8_t reg, std::uint32_t value,
                      const GteProjectedVertex *projected = nullptr,
                      const GteExactWord *exact_word = nullptr,
@@ -395,6 +497,10 @@ private:
                   std::uint32_t packed) const noexcept;
   [[nodiscard]] const ProjectedHalf *
   projectedHalfRegister(std::uint8_t reg, std::uint32_t value) const noexcept;
+  [[nodiscard]] ProjectedHalf
+  screenProjectionHalf(std::uint8_t reg, std::uint32_t value,
+                       std::uint8_t register_slot,
+                       std::uint32_t source_mask) noexcept;
   [[nodiscard]] const GteExactWord *
   exactRegister(std::uint8_t reg, std::uint32_t value) const noexcept;
   enum class ExactCarrierOperation : std::uint8_t {
@@ -482,12 +588,27 @@ private:
   void storeCompactProjectionHandle(std::uint32_t address,
                                     std::uint16_t handle) noexcept;
   void invalidateCompactProjectionHandle(std::uint32_t address) noexcept;
+  [[nodiscard]] bool idleProjectionCarriersClear() const noexcept;
+  void invalidateIdleLoopProof() const noexcept;
+  [[nodiscard]] bool readExactTransformValues(
+      std::uint32_t address, std::array<double, 9U> &rotation,
+      std::array<double, 3U> &translation, bool &enhanced) const noexcept;
 
   std::vector<std::byte> ram_;
   std::array<std::byte, scratchpad_size> scratchpad_{};
   std::array<std::byte, mmio_size> mmio_{};
   R3000State state_{};
   R3000MmioBus *mmio_bus_{};
+  std::unique_ptr<CachedBlock[]> cached_blocks_;
+  std::array<std::uint32_t, code_page_count> code_page_generations_{};
+  std::array<std::uint8_t, code_page_count> code_page_cached_{};
+  std::array<std::uint8_t, code_page_count> breakpoint_pages_{};
+  std::array<std::uint32_t, execution_breakpoint_capacity>
+      execution_breakpoints_{};
+  std::size_t execution_breakpoint_count_{};
+  std::uint32_t code_cache_reset_generation_{1U};
+  std::uint64_t code_cache_epoch_{1U};
+  std::uint64_t cached_fast_fallbacks_{};
   std::array<GteProjectedVertex, 32> projected_gpr_{};
   std::uint32_t projected_gpr_valid_mask_{};
   GteProjectedVertex projected_load_delay_{};
@@ -514,6 +635,7 @@ private:
   std::size_t gpu_projection_catalog_size_{};
   std::uint32_t gpu_projection_handle_gpr_mask_{};
   std::uint32_t tracked_generation_{1U};
+  mutable std::uint64_t idle_loop_safety_epoch_{1U};
   std::uint32_t tracked_age_{1U};
   std::uint32_t next_pgxp_context_handle_{1U};
   bool tracked_words_present_{};

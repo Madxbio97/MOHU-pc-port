@@ -14,7 +14,8 @@ void loadLauncherSettings(GraphicsSettings &graphics,
                           MohUndergroundRuntimeActionBindings &runtime_actions,
                           game::GameLanguage &language) noexcept;
 
-[[nodiscard]] std::filesystem::path defaultMemoryCardImagePath() noexcept;
+[[nodiscard]] std::filesystem::path
+defaultMemoryCardImagePath(std::uint8_t slot = 0U) noexcept;
 
 [[nodiscard]] bool
 saveLauncherControllerSettings(const ControllerButtonBindings &bindings,

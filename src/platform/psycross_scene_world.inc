@@ -865,20 +865,43 @@ void renderObjects(const game::GameplaySession &gameplay,
         // Only an active, bound retail NPC may bridge a camera-culled pose.
         continue;
       }
+      const auto animation_phase = npcAnimationPhase(object, object_index);
+      const auto interpolate_native_pose =
+          !exact_guest_pose && !dedicated_presentation;
+      if (interpolate_native_pose) {
+        const auto previous_pose =
+            state == nullptr
+                ? actor_animations.enemyPose(actor_tick, animation_phase)
+                : actor_animations.npcPose(
+                      gameplay.npcAnimation(object_index),
+                      state->locomotion_animation_tick == 0U
+                          ? 0U
+                          : state->locomotion_animation_tick - 1U,
+                      state->animation_tick == 0U
+                          ? 0U
+                          : state->animation_tick - 1U,
+                      animation_phase);
+        pose_scratch.interpolation_from.capture(previous_pose,
+                                                hmd_model->parts().size());
+      }
       const auto pose =
           state == nullptr
               ? actor_animations.enemyPose(
-                    actor_tick, static_cast<std::uint64_t>(object_index) * 7U)
+                    actor_tick + (interpolate_native_pose ? 1U : 0U),
+                    animation_phase)
               : actor_animations.npcPose(
                     gameplay.npcAnimation(object_index),
                     state->locomotion_animation_tick, state->animation_tick,
-                    npcAnimationPhase(object, object_index));
+                    animation_phase);
       const auto *render_pose =
           dedicated_presentation && !exact_guest_pose ? nullptr : &pose;
+      const auto *interpolation_from =
+          interpolate_native_pose ? &pose_scratch.interpolation_from : nullptr;
       const auto *resolved_pose =
           prepareHmdWorldVertices(*hmd_model, object, render_pose, pose_scratch,
                                   primitives.actor_scratch.hmd_world_vertices,
-                                  &primitives.actor_scratch.hmd_world_normals);
+                                  &primitives.actor_scratch.hmd_world_normals,
+                                  interpolation_from, interpolation_amount);
       const auto world_vertices =
           std::span<const Vector3>{primitives.actor_scratch.hmd_world_vertices};
       const auto world_normals =
@@ -1568,10 +1591,12 @@ void renderPresentedPlayer(
     const game::GameplaySession &gameplay,
     const game::ActorAnimationBank &actor_animations,
     std::uint64_t player_animation_tick, game::WeaponId presented_weapon,
+    std::uint64_t player_presentation_animation_tick,
     double interpolation_amount,
     const RenderPresentationSnapshot &previous_presentation,
     const RenderPresentationSnapshot &presentation, const MATRIX &view,
     std::vector<OT_TAG> &ordering_table,
+    std::vector<OT_TAG> &viewmodel_ordering_table,
     std::vector<OT_TAG> &shadow_ordering_table,
     ActorShadowPresentationCache &shadow_cache, HmdPoseScratch &pose_scratch,
     PrimitiveBuffer &primitives, RenderStats &stats) {
@@ -1590,6 +1615,27 @@ void renderPresentedPlayer(
     if (guest_player != nullptr) {
       player_object = *guest_player;
     }
+    const auto interpolate_native_pose =
+        !hasLegacyHmdBones(*player_model, player_object);
+    if (interpolate_native_pose) {
+      const auto previous_pose = [&] {
+        if (!gameplay.playerAlive()) {
+          const auto tick = gameplay.playerDeathAnimationTick();
+          return actor_animations.npcPose(
+              game::NpcAnimationRequest{
+                  game::NpcAnimationAction::death,
+                  game::weaponStance(gameplay.hud().inventory().current()),
+                  0U,
+              },
+              tick == 0U ? 0U : tick - 1U);
+        }
+        return actor_animations.playerPose(
+            gameplay.playerAnimation(), player_animation_tick,
+            player_presentation_animation_tick);
+      }();
+      pose_scratch.interpolation_from.capture(previous_pose,
+                                              player_model->parts().size());
+    }
     const auto pose = [&] {
       if (!gameplay.playerAlive()) {
         return actor_animations.npcPose(
@@ -1601,13 +1647,18 @@ void renderPresentedPlayer(
             gameplay.playerDeathAnimationTick());
       }
       return actor_animations.playerPose(
-          gameplay.playerAnimation(), player_animation_tick,
-          gameplay.playerPresentationAnimationTick());
+          gameplay.playerAnimation(),
+          player_animation_tick + (interpolate_native_pose ? 1U : 0U),
+          player_presentation_animation_tick +
+              (interpolate_native_pose ? 1U : 0U));
     }();
+    const auto *interpolation_from =
+        interpolate_native_pose ? &pose_scratch.interpolation_from : nullptr;
     const auto *resolved_pose = prepareHmdWorldVertices(
         *player_model, player_object, &pose, pose_scratch,
         primitives.actor_scratch.hmd_world_vertices,
-        &primitives.actor_scratch.hmd_world_normals);
+        &primitives.actor_scratch.hmd_world_normals, interpolation_from,
+        interpolation_amount);
     const auto world_vertices =
         std::span<const Vector3>{primitives.actor_scratch.hmd_world_vertices};
     const auto world_normals =
@@ -1646,12 +1697,14 @@ void renderPresentedPlayer(
                                      presentation.player.z)
             : PlayerCameraVisibility::opaque;
     const auto translucent = visibility == PlayerCameraVisibility::translucent;
+    auto &player_ordering_table =
+        translucent ? viewmodel_ordering_table : ordering_table;
     if (visibility != PlayerCameraVisibility::hidden) {
       const auto wound_vertices = legacyHmdWoundVertices(
           gameplay, presentation.player_guest_slot, *player_model);
       renderHmdObject(*player_model, player_object, &pose,
                       game::resident_hmd_texture_bank, pose_scratch, view,
-                      ordering_table, primitives, stats, std::nullopt,
+                      player_ordering_table, primitives, stats, std::nullopt,
                       world_vertices, world_normals, translucent, true,
                       &wound_vertices);
     }
@@ -1659,7 +1712,8 @@ void renderPresentedPlayer(
         visibility != PlayerCameraVisibility::hidden && weapon_presentation) {
       renderActorWeapon(*weapon_presentation, player_object,
                         game::resident_weapon_texture_bank, presentation.camera,
-                        view, ordering_table, primitives, stats, translucent);
+                        view, player_ordering_table, primitives, stats,
+                        translucent);
     }
   } else if (!gameplay.legacyRenderCommandsAuthoritative()) {
     renderPlayer(presentation.player, view, ordering_table, primitives, stats);
@@ -3167,7 +3221,9 @@ RenderStats renderWorld(
     const FireTexturePlacement &fire_texture_placement,
     const CombatEffectTextureAtlas &effect_textures,
     const game::ActorAnimationBank &actor_animations, std::uint64_t actor_tick,
+    std::uint64_t model_animation_tick,
     std::uint64_t player_animation_tick,
+    std::uint64_t player_presentation_animation_tick,
     std::span<const game::LegacyWeaponEventBridgeState> weapon_edges,
     std::span<const game::LegacyMuzzleFlashPresentationState>
         retail_muzzle_flashes,
@@ -3183,6 +3239,7 @@ RenderStats renderWorld(
     const RenderPresentationSnapshot &guest_presentation,
     const RenderPresentationSnapshot &presentation, const MATRIX &view,
     std::vector<OT_TAG> &ordering_table,
+    std::vector<OT_TAG> &viewmodel_ordering_table,
     std::vector<OT_TAG> &prefetch_ordering_table,
     std::vector<OT_TAG> &optic_trail_ordering_table,
     std::vector<OT_TAG> &optic_subject_ordering_table,
@@ -3204,6 +3261,8 @@ RenderStats renderWorld(
       presentation.first_person_aim && presentation.optic_mode == 3U;
 
   ClearOTagR(reinterpret_cast<u_long *>(ordering_table.data()),
+             ordering_table_size);
+  ClearOTagR(reinterpret_cast<u_long *>(viewmodel_ordering_table.data()),
              ordering_table_size);
   ClearOTagR(reinterpret_cast<u_long *>(prefetch_ordering_table.data()),
              ordering_table_size);
@@ -4038,7 +4097,7 @@ RenderStats renderWorld(
                             dynamic_light_scratch.persistent, view,
                             world_chunk_appearance, primitives);
   renderObjects(gameplay, fire_animation, fire_texture_placement,
-                actor_animations, actor_tick, interpolation_amount,
+                actor_animations, model_animation_tick, interpolation_amount,
                 presentation, view, ordering_table,
                 optic_subject_ordering_table, shadow_ordering_table,
                 prefetch_fire_ordering_table, fire_ordering_table, shadow_cache,
@@ -4079,9 +4138,11 @@ RenderStats renderWorld(
                                     scanner_xray_ordering_table, primitives,
                                     stats);
   renderPresentedPlayer(gameplay, actor_animations, player_animation_tick,
-                        presented_player_weapon, interpolation_amount,
+                        presented_player_weapon,
+                        player_presentation_animation_tick, interpolation_amount,
                         previous_presentation, presentation, view,
-                        ordering_table, shadow_ordering_table, shadow_cache,
+                        ordering_table, viewmodel_ordering_table,
+                        shadow_ordering_table, shadow_cache,
                         pose_scratch, primitives, stats);
   if (!primitives.storageStable()) {
     throw core::Error{core::ErrorCode::invalid_format,

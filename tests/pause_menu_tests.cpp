@@ -1207,15 +1207,18 @@ void testCompoundRussianMenuLocalization() {
     return sf::game::encodeVitText(source);
   };
   require(sf::game::localizeTextCopy("Select Difficulty") ==
-          vit(u8"\u0412\u042b\u0411\u0415\u0420\u0418\u0422\u0415 \u0421\u041b\u041e\u0416\u041d\u041e\u0421\u0422\u042c"));
+          vit(u8"\u0412\u042b\u0411\u0415\u0420\u0418\u0422\u0415 "
+              u8"\u0421\u041b\u041e\u0416\u041d\u041e\u0421\u0422\u042c"));
   require(sf::game::localizeTextCopy("Normal") ==
           vit(u8"\u041e\u0420\u0418\u0413\u0418\u041d\u0410\u041b"));
   require(sf::game::localizeTextCopy("Hard Mode") ==
-          vit(u8"\u0412\u042b\u0421\u041e\u041a\u0410\u042f \u0421\u041b\u041e\u0416\u041d\u041e\u0421\u0422\u042c"));
+          vit(u8"\u0412\u042b\u0421\u041e\u041a\u0410\u042f "
+              u8"\u0421\u041b\u041e\u0416\u041d\u041e\u0421\u0422\u042c"));
   require(sf::game::localizeTextCopy("Agent") ==
           vit(u8"\u0410\u0413\u0415\u041d\u0422"));
-  require(sf::game::localizeTextCopy("AGENT MODE") ==
-          vit(u8"\u0420\u0415\u0416\u0418\u041c \u0410\u0413\u0415\u041d\u0422"));
+  require(
+      sf::game::localizeTextCopy("AGENT MODE") ==
+      vit(u8"\u0420\u0415\u0416\u0418\u041c \u0410\u0413\u0415\u041d\u0422"));
   require(sf::game::localizeTextCopy("DIFFICULTY") ==
           vit(u8"\u0421\u041b\u041e\u0416\u041d\u041e\u0421\u0422\u042c"));
   require(
@@ -1223,26 +1226,49 @@ void testCompoundRussianMenuLocalization() {
           "A special PC-version mode not present in the original game. "
           "Enemies are more accurate and aggressive, and some missions have "
           "stricter conditions.") ==
-      vit(u8"\u0421\u041f\u0415\u0426\u0418\u0410\u041b\u042c\u041d\u042b\u0419 \u0420\u0415\u0416\u0418\u041c "
-          u8"\u041f\u041a-\u0412\u0415\u0420\u0421\u0418\u0418, \u041a\u041e\u0422\u041e\u0420\u041e\u0413\u041e \u041d\u0415 \u0411\u042b\u041b\u041e \u0412 "
-          u8"\u041e\u0420\u0418\u0413\u0418\u041d\u0410\u041b\u042c\u041d\u041e\u0419 \u0418\u0413\u0420\u0415. \u0412\u0420\u0410\u0413\u0418 "
-          u8"\u0422\u041e\u0427\u041d\u0415\u0415 \u0418 \u0410\u0413\u0420\u0415\u0421\u0421\u0418\u0412\u041d\u0415\u0415, \u0410 \u0412 \u041d\u0415\u041a\u041e\u0422\u041e\u0420\u042b\u0425 "
-          u8"\u041c\u0418\u0421\u0421\u0418\u042f\u0425 \u0414\u0415\u0419\u0421\u0422\u0412\u0423\u042e\u0422 \u0411\u041e\u041b\u0415\u0415 \u0421\u0422\u0420\u041e\u0413\u0418\u0415 "
+      vit(u8"\u0421\u041f\u0415\u0426\u0418\u0410\u041b\u042c\u041d\u042b\u0419"
+          u8" \u0420\u0415\u0416\u0418\u041c "
+          u8"\u041f\u041a-\u0412\u0415\u0420\u0421\u0418\u0418, "
+          u8"\u041a\u041e\u0422\u041e\u0420\u041e\u0413\u041e \u041d\u0415 "
+          u8"\u0411\u042b\u041b\u041e \u0412 "
+          u8"\u041e\u0420\u0418\u0413\u0418\u041d\u0410\u041b\u042c\u041d\u041e"
+          u8"\u0419 \u0418\u0413\u0420\u0415. \u0412\u0420\u0410\u0413\u0418 "
+          u8"\u0422\u041e\u0427\u041d\u0415\u0415 \u0418 "
+          u8"\u0410\u0413\u0420\u0415\u0421\u0421\u0418\u0412\u041d\u0415\u0415"
+          u8", \u0410 \u0412 "
+          u8"\u041d\u0415\u041a\u041e\u0422\u041e\u0420\u042b\u0425 "
+          u8"\u041c\u0418\u0421\u0421\u0418\u042f\u0425 "
+          u8"\u0414\u0415\u0419\u0421\u0422\u0412\u0423\u042e\u0422 "
+          u8"\u0411\u041e\u041b\u0415\u0415 "
+          u8"\u0421\u0422\u0420\u041e\u0413\u0418\u0415 "
           u8"\u0423\u0421\u041b\u041e\u0412\u0418\u042f."));
-  require(sf::game::localizeTextCopy("%x continue   %t back") ==
-          vit(u8"%x \u041f\u0420\u041e\u0414\u041e\u041b\u0416\u0418\u0422\u042c   %t \u041d\u0410\u0417\u0410\u0414"));
+  require(
+      sf::game::localizeTextCopy("%x continue   %t back") ==
+      vit(u8"%x \u041f\u0420\u041e\u0414\u041e\u041b\u0416\u0418\u0422\u042c   "
+          u8"%t \u041d\u0410\u0417\u0410\u0414"));
   require(sf::game::localizeTextCopy("%x - continue; %t - back") ==
-          vit(u8"%x - \u041f\u0420\u041e\u0414\u041e\u041b\u0416\u0418\u0422\u042c; %t - \u041d\u0410\u0417\u0410\u0414"));
+          vit(u8"%x - "
+              u8"\u041f\u0420\u041e\u0414\u041e\u041b\u0416\u0418\u0422\u042c; "
+              u8"%t - \u041d\u0410\u0417\u0410\u0414"));
   require(sf::game::localizeTextCopy("Playing on HARD difficulty") ==
-          vit(u8"\u0421\u041b\u041e\u0416\u041d\u041e\u0421\u0422\u042c: \u0412\u042b\u0421\u041e\u041a\u0410\u042f"));
+          vit(u8"\u0421\u041b\u041e\u0416\u041d\u041e\u0421\u0422\u042c: "
+              u8"\u0412\u042b\u0421\u041e\u041a\u0410\u042f"));
   require(sf::game::localizeTextCopy("Playing Agent mode") ==
-          vit(u8"\u0412\u042b\u0411\u0420\u0410\u041d\u041d\u0410\u042f \u0421\u041b\u041e\u0416\u041d\u041e\u0421\u0422\u042c: \u0410\u0413\u0415\u041d\u0422"));
+          vit(u8"\u0412\u042b\u0411\u0420\u0410\u041d\u041d\u0410\u042f "
+              u8"\u0421\u041b\u041e\u0416\u041d\u041e\u0421\u0422\u042c: "
+              u8"\u0410\u0413\u0415\u041d\u0422"));
   require(sf::game::localizeTextCopy("Stick Layout") ==
-          vit(u8"\u0420\u0410\u0421\u041a\u041b\u0410\u0414\u041a\u0410 \u0421\u0422\u0418\u041a\u041e\u0412"));
+          vit(u8"\u0420\u0410\u0421\u041a\u041b\u0410\u0414\u041a\u0410 "
+              u8"\u0421\u0422\u0418\u041a\u041e\u0412"));
   require(sf::game::localizeTextCopy(
               "Stick Layout: Character Left / Camera Right") ==
-          vit(u8"\u0420\u0410\u0421\u041a\u041b\u0410\u0414\u041a\u0410 \u0421\u0422\u0418\u041a\u041e\u0412") + ": " +
-              vit(u8"\u041f\u0415\u0420\u0421\u041e\u041d\u0410\u0416: \u041b\u0415\u0412\u042b\u0419 / \u041a\u0410\u041c\u0415\u0420\u0410: \u041f\u0420\u0410\u0412\u042b\u0419"));
+          vit(u8"\u0420\u0410\u0421\u041a\u041b\u0410\u0414\u041a\u0410 "
+              u8"\u0421\u0422\u0418\u041a\u041e\u0412") +
+              ": " +
+              vit(u8"\u041f\u0415\u0420\u0421\u041e\u041d\u0410\u0416: "
+                  u8"\u041b\u0415\u0412\u042b\u0419 / "
+                  u8"\u041a\u0410\u041c\u0415\u0420\u0410: "
+                  u8"\u041f\u0420\u0410\u0412\u042b\u0419"));
   require(sf::game::localizeTextCopy(
               "Stick Layout: Character Right / Camera Left") ==
           vit(u8"\u0420\u0410\u0421\u041a\u041b\u0410\u0414\u041a\u0410 "
@@ -1262,15 +1288,18 @@ void testCompoundRussianMenuLocalization() {
   const auto slots = sf::game::localizeTextCopy("Slot 2  Empty");
   require(slots.find("Slot") == std::string::npos &&
           slots.find("Empty") == std::string::npos);
-  const auto slot_prefix =
-      vit(u8"\u042f\u0427\u0415\u0419\u041a\u0410") + " 2  " +
-      vit(u8"\u0412\u0410\u0428\u0418\u041d\u0413\u0422\u041e\u041d-\u041f\u0410\u0420\u041a") + "  ";
+  const auto slot_prefix = vit(u8"\u042f\u0427\u0415\u0419\u041a\u0410") +
+                           " 2  " +
+                           vit(u8"\u0412\u0410\u0428\u0418\u041d\u0413\u0422"
+                               u8"\u041e\u041d-\u041f\u0410\u0420\u041a") +
+                           "  ";
   require(sf::game::localizeTextCopy("Slot 2  Washington Park  Normal") ==
           slot_prefix +
               vit(u8"\u041e\u0420\u0418\u0413\u0418\u041d\u0410\u041b"));
   require(sf::game::localizeTextCopy("Slot 2  Washington Park  Hard Mode") ==
           slot_prefix +
-              vit(u8"\u0412\u042b\u0421\u041e\u041a\u0410\u042f \u0421\u041b\u041e\u0416\u041d\u041e\u0421\u0422\u042c"));
+              vit(u8"\u0412\u042b\u0421\u041e\u041a\u0410\u042f "
+                  u8"\u0421\u041b\u041e\u0416\u041d\u041e\u0421\u0422\u042c"));
   require(sf::game::localizeTextCopy("Slot 2  Washington Park  Agent") ==
           slot_prefix + vit(u8"\u0410\u0413\u0415\u041d\u0422"));
   const auto status =
@@ -1290,11 +1319,18 @@ void testCompoundRussianMenuLocalization() {
   const auto agent_park_timer = sf::game::localizeTextCopy(
       "All bombs must be defused in under 15 minutes");
   require(agent_park_timer ==
-          vit(u8"\u041e\u0411\u0415\u0417\u0412\u0420\u0415\u0414\u0418\u0422\u042c \u0412\u0421\u0415 \u0411\u041e\u041c\u0411\u042b \u041c\u0415\u041d\u0415\u0415 \u0427\u0415\u041c \u0417\u0410 15 \u041c\u0418\u041d\u0423\u0422"));
+          vit(u8"\u041e\u0411\u0415\u0417\u0412\u0420\u0415\u0414\u0418\u0422"
+              u8"\u042c \u0412\u0421\u0415 \u0411\u041e\u041c\u0411\u042b "
+              u8"\u041c\u0415\u041d\u0415\u0415 \u0427\u0415\u041c "
+              u8"\u0417\u0410 15 \u041c\u0418\u041d\u0423\u0422"));
   const auto agent_warehouse_timer = sf::game::localizeTextCopy(
       "Get out before the building collapses in 12 minutes");
-  require(agent_warehouse_timer ==
-          vit(u8"\u041f\u041e\u041a\u0418\u041d\u0423\u0422\u042c \u0417\u0414\u0410\u041d\u0418\u0415 \u0417\u0410 12 \u041c\u0418\u041d\u0423\u0422, \u0414\u041e \u0415\u0413\u041e \u041e\u0411\u0420\u0423\u0428\u0415\u041d\u0418\u042f"));
+  require(
+      agent_warehouse_timer ==
+      vit(u8"\u041f\u041e\u041a\u0418\u041d\u0423\u0422\u042c "
+          u8"\u0417\u0414\u0410\u041d\u0418\u0415 \u0417\u0410 12 "
+          u8"\u041c\u0418\u041d\u0423\u0422, \u0414\u041e \u0415\u0413\u041e "
+          u8"\u041e\u0411\u0420\u0423\u0428\u0415\u041d\u0418\u042f"));
   const auto action = sf::game::localizeTextCopy("Change Weapon: R1");
   require(action.find("Change Weapon") == std::string::npos &&
           action.find('?') == std::string::npos && action.ends_with("R1"));
@@ -1333,7 +1369,8 @@ void testCompoundRussianMenuLocalization() {
           objective_failed);
   const auto mission_failed = sf::game::localizeTextCopy("Mission Failed");
   require(mission_failed ==
-          vit(u8"\u041c\u0418\u0421\u0421\u0418\u042f \u041f\u0420\u041e\u0412\u0410\u041b\u0415\u041d\u0410"));
+          vit(u8"\u041c\u0418\u0421\u0421\u0418\u042f "
+              u8"\u041f\u0420\u041e\u0412\u0410\u041b\u0415\u041d\u0410"));
   require(sf::game::localizeTextCopy("MISSION FAILED") == mission_failed);
   require(sf::game::completeGameplayTextSource("Scope Pwr O") ==
           std::optional<std::string_view>{"Scope Pwr On"});
@@ -1709,6 +1746,15 @@ void testRetailCheatChordsAndContexts() {
   require(theater && *theater == RetailCheat::movie_theater);
 }
 
+void testPointerHoverUsesMenuSelection() {
+  auto menu = makeMenu();
+  require(menu.selection() == 0U);
+  static_cast<void>(menu.update({.pointer_selection = 4U}));
+  require(menu.selection() == 4U &&
+          menu.transition().kind ==
+              sf::game::PauseTransitionKind::section_selection);
+}
+
 } // namespace
 
 int main() {
@@ -1744,6 +1790,7 @@ int main() {
     testFormattedMissionLocalization();
     testMissionMenuLocalizationDoesNotLeakAcrossLanguages();
     testRetailWeaponArtAssets();
+    testPointerHoverUsesMenuSelection();
     testRetailCheatChordsAndContexts();
   } catch (const std::exception &error) {
     std::fprintf(stderr, "%s\n", error.what());

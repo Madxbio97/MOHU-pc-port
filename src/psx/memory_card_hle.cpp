@@ -25,9 +25,27 @@ constexpr std::uint32_t async_mode = 0x8000U;
 constexpr std::uint32_t error_result = 0xffffffffU;
 constexpr std::uint32_t directory_entry_size = 0x28U;
 constexpr std::uint32_t directory_attribute_active = 0x50U;
+constexpr std::uint32_t device_table_anchor = 0x00000150U;
+constexpr std::uint32_t device_table_size_anchor = 0x00000154U;
+constexpr std::uint32_t device_descriptor_stride = 0x50U;
+constexpr std::uint32_t device_descriptor_words =
+    device_descriptor_stride / sizeof(std::uint32_t);
+constexpr std::uint32_t maximum_device_count = 32U;
+constexpr std::uint32_t backup_unit_device_table = 0x0000b000U;
+constexpr std::uint32_t backup_unit_device_name = 0x0000ba00U;
+constexpr std::uint32_t backup_unit_firstfile_stub = 0x0000ba08U;
+constexpr std::uint32_t backup_unit_nextfile_stub = 0x0000ba14U;
+constexpr std::uint32_t device_firstfile_offset = 0x30U;
+constexpr std::uint32_t device_nextfile_offset = 0x34U;
+constexpr std::array<std::uint8_t, 3U> backup_unit_name{'b', 'u', 0U};
+constexpr std::uint32_t mips_load_b0_vector = 0x240a00b0U;
+constexpr std::uint32_t mips_jump_t2 = 0x01400008U;
+constexpr std::uint32_t mips_load_call = 0x24090000U;
+static_assert(backup_unit_nextfile_stub + 12U < 0x0000c000U);
 
 struct ParsedPath {
   std::array<char, 21U> name{};
+  std::uint8_t slot{memory_card_invalid_slot};
 };
 
 [[nodiscard]] bool isFileCall(std::uint32_t vector, std::uint32_t call,
@@ -84,12 +102,13 @@ struct ParsedPath {
   std::array<char, 27U> text{};
   std::size_t length{};
   if (!readGuestString(runtime, address, text, length) || length <= 5U ||
-      length > 25U || text[0] != 'b' || text[1] != 'u' || text[2] != '0' ||
-      text[3] != '0' || text[4] != ':') {
+      length > 25U || text[0] != 'b' || text[1] != 'u' ||
+      (text[2] != '0' && text[2] != '1') || text[3] != '0' || text[4] != ':') {
     return false;
   }
 
   path = {};
+  path.slot = static_cast<std::uint8_t>(text[2] - '0');
   const auto name_length = length - 5U;
   for (std::size_t index{}; index < name_length; ++index) {
     const auto value = text[5U + index];
@@ -101,6 +120,39 @@ struct ParsedPath {
   }
   path.name[name_length] = '\0';
   return true;
+}
+
+[[nodiscard]] std::uint8_t pathSlot(const R3000Runtime &runtime,
+                                    std::uint32_t address) noexcept {
+  std::array<std::uint8_t, 5U> prefix{};
+  for (std::uint32_t index{}; index < prefix.size(); ++index) {
+    if (!runtime.read8(address + index, prefix[index])) {
+      return memory_card_invalid_slot;
+    }
+  }
+  if (prefix[0U] != 'b' || prefix[1U] != 'u' || prefix[3U] != '0' ||
+      prefix[4U] != ':' || (prefix[2U] != '0' && prefix[2U] != '1')) {
+    return memory_card_invalid_slot;
+  }
+  return static_cast<std::uint8_t>(prefix[2U] - '0');
+}
+
+[[nodiscard]] constexpr std::uint8_t
+descriptorSlot(std::uint32_t descriptor) noexcept {
+  constexpr auto first = 2U;
+  constexpr auto per_slot =
+      (memory_card_descriptor_count - first) / memory_card_slot_count;
+  if (descriptor < first || descriptor >= memory_card_descriptor_count) {
+    return memory_card_invalid_slot;
+  }
+  return static_cast<std::uint8_t>((descriptor - first) / per_slot);
+}
+
+[[nodiscard]] constexpr std::uint8_t
+firstDescriptor(std::uint8_t slot) noexcept {
+  constexpr auto per_slot =
+      (memory_card_descriptor_count - 2U) / memory_card_slot_count;
+  return static_cast<std::uint8_t>(2U + slot * per_slot);
 }
 
 [[nodiscard]] bool sameName(const std::array<char, 21U> &left,
@@ -155,9 +207,13 @@ findFile(const MemoryCardHleState &state,
   return memory_card_invalid_index;
 }
 
-[[nodiscard]] std::uint8_t
-findFreeDescriptor(const MemoryCardHleState &state) noexcept {
-  for (std::uint8_t index = 2U; index < state.descriptors.size(); ++index) {
+[[nodiscard]] std::uint8_t findFreeDescriptor(const MemoryCardHleState &state,
+                                              std::uint8_t slot) noexcept {
+  const auto begin = firstDescriptor(slot);
+  const auto end = slot + 1U < memory_card_slot_count
+                       ? firstDescriptor(static_cast<std::uint8_t>(slot + 1U))
+                       : static_cast<std::uint8_t>(state.descriptors.size());
+  for (auto index = begin; index < end; ++index) {
     if (state.descriptors[index].file_index == memory_card_invalid_index) {
       return index;
     }
@@ -315,15 +371,16 @@ findFreeDescriptor(const MemoryCardHleState &state) noexcept {
 [[nodiscard]] std::uint32_t openFile(R3000Runtime &runtime,
                                      MemoryCardHleState &state,
                                      std::uint32_t path_address,
-                                     std::uint32_t mode) noexcept {
+                                     std::uint32_t mode,
+                                     std::uint8_t slot) noexcept {
   if (!state.present || !state.formatted) {
     return error_result;
   }
   ParsedPath path{};
-  if (!parsePath(runtime, path_address, false, path)) {
+  if (!parsePath(runtime, path_address, false, path) || path.slot != slot) {
     return error_result;
   }
-  const auto descriptor = findFreeDescriptor(state);
+  const auto descriptor = findFreeDescriptor(state, slot);
   if (descriptor == memory_card_invalid_index) {
     return error_result;
   }
@@ -442,12 +499,12 @@ submitTransfer(R3000Runtime &runtime, MemoryCardHleState &state,
 
 [[nodiscard]] std::uint32_t formatCard(R3000Runtime &runtime,
                                        MemoryCardHleState &state,
-                                       std::uint32_t path_address) noexcept {
+                                       std::uint32_t path_address,
+                                       std::uint8_t slot) noexcept {
   std::array<char, 27U> text{};
   std::size_t length{};
   if (!state.present || !readGuestString(runtime, path_address, text, length) ||
-      length != 5U || text[0] != 'b' || text[1] != 'u' || text[2] != '0' ||
-      text[3] != '0' || text[4] != ':') {
+      length != 5U || pathSlot(runtime, path_address) != slot) {
     return 0U;
   }
 
@@ -466,10 +523,11 @@ submitTransfer(R3000Runtime &runtime, MemoryCardHleState &state,
 [[nodiscard]] std::uint32_t firstFile(R3000Runtime &runtime,
                                       MemoryCardHleState &state,
                                       std::uint32_t pattern_address,
-                                      std::uint32_t entry_address) noexcept {
+                                      std::uint32_t entry_address,
+                                      std::uint8_t slot) noexcept {
   ParsedPath path{};
   if (!state.present || !state.formatted ||
-      !parsePath(runtime, pattern_address, true, path)) {
+      !parsePath(runtime, pattern_address, true, path) || path.slot != slot) {
     state.find = {};
     return 0U;
   }
@@ -481,10 +539,11 @@ submitTransfer(R3000Runtime &runtime, MemoryCardHleState &state,
 
 [[nodiscard]] std::uint32_t eraseFile(R3000Runtime &runtime,
                                       MemoryCardHleState &state,
-                                      std::uint32_t path_address) noexcept {
+                                      std::uint32_t path_address,
+                                      std::uint8_t slot) noexcept {
   ParsedPath path{};
   if (!state.present || !state.formatted ||
-      !parsePath(runtime, path_address, true, path)) {
+      !parsePath(runtime, path_address, true, path) || path.slot != slot) {
     return 0U;
   }
   for (std::uint8_t index{}; index < state.files.size(); ++index) {
@@ -500,18 +559,140 @@ submitTransfer(R3000Runtime &runtime, MemoryCardHleState &state,
   return 0U;
 }
 } // namespace
+
+bool MemoryCardHle::installBackupUnitDevice(R3000Runtime &runtime) noexcept {
+  std::uint32_t source_table{};
+  std::uint32_t source_bytes{};
+  if (!runtime.read32(device_table_anchor, source_table) ||
+      !runtime.read32(device_table_size_anchor, source_bytes)) {
+    return false;
+  }
+
+  std::uint32_t source_count{};
+  if (source_table != 0U && source_bytes % device_descriptor_stride == 0U &&
+      source_bytes / device_descriptor_stride < maximum_device_count) {
+    source_count = source_bytes / device_descriptor_stride;
+  }
+
+  for (std::uint32_t index{}; index < source_count; ++index) {
+    std::uint32_t name_address{};
+    if (!runtime.read32(source_table + index * device_descriptor_stride,
+                        name_address)) {
+      return false;
+    }
+    auto matches = name_address != 0U;
+    for (std::size_t character{};
+         matches && character < backup_unit_name.size(); ++character) {
+      std::uint8_t value{};
+      matches =
+          runtime.read8(name_address + static_cast<std::uint32_t>(character),
+                        value) &&
+          value == backup_unit_name[character];
+    }
+    if (matches) {
+      return true;
+    }
+  }
+
+  std::array<std::uint32_t, maximum_device_count * device_descriptor_words>
+      descriptors{};
+  for (std::uint32_t index{}; index < source_count; ++index) {
+    for (std::uint32_t word{}; word < device_descriptor_words; ++word) {
+      if (!runtime.read32(
+              source_table + index * device_descriptor_stride +
+                  word * sizeof(std::uint32_t),
+              descriptors[index * device_descriptor_words + word])) {
+        return false;
+      }
+    }
+  }
+
+  for (std::size_t character{}; character < backup_unit_name.size();
+       ++character) {
+    if (!runtime.write8(backup_unit_device_name +
+                            static_cast<std::uint32_t>(character),
+                        backup_unit_name[character])) {
+      return false;
+    }
+  }
+  const auto write_stub = [&runtime](std::uint32_t address,
+                                     std::uint32_t call) noexcept {
+    return runtime.write32(address, mips_load_b0_vector) &&
+           runtime.write32(address + 4U, mips_jump_t2) &&
+           runtime.write32(address + 8U, mips_load_call | call);
+  };
+  if (!write_stub(backup_unit_firstfile_stub, first_file_call) ||
+      !write_stub(backup_unit_nextfile_stub, next_file_call)) {
+    return false;
+  }
+
+  const auto backup_unit_index = source_count;
+  const auto backup_unit_word = backup_unit_index * device_descriptor_words;
+  descriptors[backup_unit_word] = backup_unit_device_name;
+  descriptors[backup_unit_word +
+              device_firstfile_offset / sizeof(std::uint32_t)] =
+      backup_unit_firstfile_stub;
+  descriptors[backup_unit_word +
+              device_nextfile_offset / sizeof(std::uint32_t)] =
+      backup_unit_nextfile_stub;
+  const auto installed_count = source_count + 1U;
+
+  for (std::uint32_t index{}; index < installed_count; ++index) {
+    for (std::uint32_t word{}; word < device_descriptor_words; ++word) {
+      if (!runtime.write32(
+              backup_unit_device_table + index * device_descriptor_stride +
+                  word * sizeof(std::uint32_t),
+              descriptors[index * device_descriptor_words + word])) {
+        return false;
+      }
+    }
+  }
+  return runtime.write32(device_table_anchor, backup_unit_device_table) &&
+         runtime.write32(device_table_size_anchor,
+                         installed_count * device_descriptor_stride);
+}
+
 bool MemoryCardHle::handlesCall(std::uint32_t vector,
                                 std::uint32_t call) noexcept {
   std::uint32_t normalized{};
   return isFileCall(vector, call, normalized);
 }
 
+std::uint8_t MemoryCardHle::resolveCallSlot(const R3000Runtime &runtime,
+                                            std::uint32_t vector,
+                                            std::uint32_t call,
+                                            std::uint8_t find_slot) noexcept {
+  std::uint32_t normalized{};
+  if (!isFileCall(vector, call, normalized)) {
+    return memory_card_invalid_slot;
+  }
+  const auto &cpu = runtime.state();
+  switch (normalized) {
+  case open_call:
+  case format_call:
+  case first_file_call:
+  case erase_call:
+    return pathSlot(runtime, cpu.gpr[4U]);
+  case seek_call:
+  case read_call:
+  case write_call:
+  case close_call:
+    return descriptorSlot(cpu.gpr[4U]);
+  case next_file_call:
+    return find_slot < memory_card_slot_count ? find_slot
+                                              : memory_card_invalid_slot;
+  default:
+    return memory_card_invalid_slot;
+  }
+}
+
 MemoryCardCallResult MemoryCardHle::handleCall(R3000Runtime &runtime,
                                                MemoryCardHleState &state,
                                                std::uint32_t vector,
-                                               std::uint32_t call) noexcept {
+                                               std::uint32_t call,
+                                               std::uint8_t slot) noexcept {
   std::uint32_t normalized{};
-  if (!isFileCall(vector, call, normalized)) {
+  if (!isFileCall(vector, call, normalized) || slot >= memory_card_slot_count) {
     return {};
   }
 
@@ -519,7 +700,7 @@ MemoryCardCallResult MemoryCardHle::handleCall(R3000Runtime &runtime,
   std::uint32_t result = error_result;
   switch (normalized) {
   case open_call:
-    result = openFile(runtime, state, cpu.gpr[4U], cpu.gpr[5U]);
+    result = openFile(runtime, state, cpu.gpr[4U], cpu.gpr[5U], slot);
     break;
   case seek_call:
     result = seekFile(state, cpu.gpr[4U],
@@ -537,16 +718,16 @@ MemoryCardCallResult MemoryCardHle::handleCall(R3000Runtime &runtime,
     result = closeFile(state, cpu.gpr[4U]);
     break;
   case format_call:
-    result = formatCard(runtime, state, cpu.gpr[4U]);
+    result = formatCard(runtime, state, cpu.gpr[4U], slot);
     break;
   case first_file_call:
-    result = firstFile(runtime, state, cpu.gpr[4U], cpu.gpr[5U]);
+    result = firstFile(runtime, state, cpu.gpr[4U], cpu.gpr[5U], slot);
     break;
   case next_file_call:
     result = nextFile(runtime, state, cpu.gpr[4U]);
     break;
   case erase_call:
-    result = eraseFile(runtime, state, cpu.gpr[4U]);
+    result = eraseFile(runtime, state, cpu.gpr[4U], slot);
     break;
   default:
     return {};
@@ -648,6 +829,26 @@ bool MemoryCardHle::validateState(const MemoryCardHleState &state) noexcept {
          (state.pending.length % 0x80U) == 0U &&
          state.pending.offset < file_size &&
          state.pending.length <= file_size - state.pending.offset;
+}
+
+bool MemoryCardHle::validateState(const MemoryCardHleState &state,
+                                  std::uint8_t slot) noexcept {
+  if (slot >= memory_card_slot_count || !validateState(state)) {
+    return false;
+  }
+  const auto begin = firstDescriptor(slot);
+  const auto end = slot + 1U < memory_card_slot_count
+                       ? firstDescriptor(static_cast<std::uint8_t>(slot + 1U))
+                       : static_cast<std::uint8_t>(state.descriptors.size());
+  for (std::uint8_t descriptor = 2U; descriptor < state.descriptors.size();
+       ++descriptor) {
+    if (state.descriptors[descriptor].file_index != memory_card_invalid_index &&
+        (descriptor < begin || descriptor >= end)) {
+      return false;
+    }
+  }
+  return state.pending.kind == MemoryCardPendingKind::none ||
+         (state.pending.descriptor >= begin && state.pending.descriptor < end);
 }
 
 } // namespace sf::psx

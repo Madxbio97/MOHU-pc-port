@@ -831,6 +831,31 @@ RuntimePadInput mergeMohUndergroundRuntimeInput(
   return physical;
 }
 
+RuntimePadInput applyMohUndergroundControllerBindings(
+    RuntimePadInput physical,
+    const ControllerButtonBindings &bindings) noexcept {
+  if (!physical.connected || !game::areControllerBindingsValid(bindings)) {
+    return physical;
+  }
+
+  const auto source_buttons = physical.active_low_buttons;
+  physical.active_low_buttons = static_cast<std::uint16_t>(
+      source_buttons | game::bindable_controller_button_mask);
+  for (const auto &metadata : game::controllerActionCatalog()) {
+    if ((source_buttons & bindings[metadata.action]) == 0U) {
+      physical.active_low_buttons = static_cast<std::uint16_t>(
+          physical.active_low_buttons & ~metadata.standard_button);
+    }
+  }
+
+  const auto axes = game::controllerStickAxes(
+      bindings.stick_layout, physical.analog[2U], physical.analog[3U],
+      physical.analog[0U], physical.analog[1U]);
+  physical.analog = {axes.camera_horizontal, axes.camera_vertical,
+                     axes.character_horizontal, axes.character_vertical};
+  return physical;
+}
+
 std::int32_t runtimeMouseDeltaForGuestStep(std::int32_t total_delta,
                                            std::size_t step_index,
                                            std::size_t step_count) noexcept {
@@ -857,8 +882,7 @@ std::int32_t runtimeMouseDeltaForGuestStep(std::int32_t total_delta,
 RuntimePadInput applyMohUndergroundRuntimeMouseLook(
     RuntimePadInput pad, std::int32_t mouse_delta_x, std::int32_t mouse_delta_y,
     bool mouse_look_active, std::uint32_t sensitivity_percent,
-    const MohUndergroundRuntimeActionBindings &runtime_actions,
-    double movement_camera_yaw) noexcept {
+    const MohUndergroundRuntimeActionBindings &runtime_actions) noexcept {
   if (!mouse_look_active) {
     return pad;
   }
@@ -896,19 +920,15 @@ RuntimePadInput applyMohUndergroundRuntimeMouseLook(
     pad.analog[0U] = 128U;
     pad.analog[1U] = 128U;
     pad.analog[2U] =
-        applyAnalogAxis(pad.analog[2U], roundedScale(mouse_delta_x, 3, 100));
+        applyAnalogAxis(pad.analog[2U], roundedScale(mouse_delta_x, 4, 100));
     pad.analog[3U] =
-        applyAnalogAxis(pad.analog[3U], roundedScale(mouse_delta_y, 11, 400));
+        applyAnalogAxis(pad.analog[3U], roundedScale(mouse_delta_y, 16, 400));
     return pad;
   }
 
-  const auto horizontal = roundedScale(mouse_delta_x, 4, 100);
-  const auto vertical = roundedScale(mouse_delta_y, 15, 400);
-  const auto steering = static_cast<std::int64_t>(std::lround(
-      std::clamp(std::isfinite(movement_camera_yaw) ? movement_camera_yaw : 0.0,
-                 -1.0, 1.0) *
-      10.0));
-  pad.analog[0U] = applyAnalogAxis(pad.analog[0U], horizontal + steering);
+  const auto horizontal = roundedScale(mouse_delta_x, 5, 100);
+  const auto vertical = roundedScale(mouse_delta_y, 20, 400);
+  pad.analog[0U] = applyAnalogAxis(pad.analog[0U], horizontal);
   pad.analog[1U] = applyAnalogAxis(pad.analog[1U], vertical);
 
   if (runtime_actions.mouse_look_mode ==

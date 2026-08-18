@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace mohu {
 
@@ -31,34 +32,40 @@ enum class RuntimePcAction : std::uint8_t {
   frustum_slus_triangle_outcode,
 };
 
+namespace detail {
+
+struct RuntimePcActionEntry {
+  std::uint32_t pc{};
+  RuntimePcAction action{};
+};
+
+inline constexpr auto runtime_pc_actions = [] {
+  std::array<RuntimePcActionEntry, 32U> result{};
+  result[1U] = {0x80000080U, RuntimePcAction::exception_vector};
+  result[3U] = {sf::psx::R3000Runtime::return_sentinel,
+                RuntimePcAction::return_sentinel};
+  result[5U] = {0x8009cd7cU, RuntimePcAction::frustum_bsp_lower_x};
+  result[9U] = {0x000000a0U, RuntimePcAction::bios_call_vector};
+  result[13U] = {0x000000b0U, RuntimePcAction::bios_call_vector};
+  result[16U] = {0x80099dacU, RuntimePcAction::frustum_bsp_lower_x};
+  result[17U] = {0x000000c0U, RuntimePcAction::bios_call_vector};
+  result[22U] = {0x80037b00U, RuntimePcAction::disc_search_return};
+  result[23U] = {0x8009a2c8U, RuntimePcAction::frustum_bsp_lower_x};
+  result[24U] = {0x80010c00U, RuntimePcAction::frustum_slus_triangle_outcode};
+  result[25U] = {0x80039064U, RuntimePcAction::directory_scan_entry};
+  result[26U] = {0x800115c4U, RuntimePcAction::frustum_slus_triangle_outcode};
+  result[27U] = {0x8009ce1cU, RuntimePcAction::frustum_object_upper_x};
+  result[29U] = {0x8009a8b0U, RuntimePcAction::frustum_level_triangle_outcode};
+  result[30U] = {0x80099a28U, RuntimePcAction::frustum_bsp_upper_x};
+  return result;
+}();
+
+} // namespace detail
+
 [[nodiscard]] constexpr RuntimePcAction
 runtimePcAction(std::uint32_t pc) noexcept {
-  struct Entry {
-    std::uint32_t pc{};
-    RuntimePcAction action{};
-  };
-  constexpr auto entries = [] {
-    std::array<Entry, 32U> result{};
-    result[1U] = {0x80000080U, RuntimePcAction::exception_vector};
-    result[3U] = {sf::psx::R3000Runtime::return_sentinel,
-                  RuntimePcAction::return_sentinel};
-    result[5U] = {0x8009cd7cU, RuntimePcAction::frustum_bsp_lower_x};
-    result[9U] = {0x000000a0U, RuntimePcAction::bios_call_vector};
-    result[13U] = {0x000000b0U, RuntimePcAction::bios_call_vector};
-    result[16U] = {0x80099dacU, RuntimePcAction::frustum_bsp_lower_x};
-    result[17U] = {0x000000c0U, RuntimePcAction::bios_call_vector};
-    result[22U] = {0x80037b00U, RuntimePcAction::disc_search_return};
-    result[23U] = {0x8009a2c8U, RuntimePcAction::frustum_bsp_lower_x};
-    result[24U] = {0x80010c00U, RuntimePcAction::frustum_slus_triangle_outcode};
-    result[25U] = {0x80039064U, RuntimePcAction::directory_scan_entry};
-    result[26U] = {0x800115c4U, RuntimePcAction::frustum_slus_triangle_outcode};
-    result[27U] = {0x8009ce1cU, RuntimePcAction::frustum_object_upper_x};
-    result[29U] = {0x8009a8b0U,
-                   RuntimePcAction::frustum_level_triangle_outcode};
-    result[30U] = {0x80099a28U, RuntimePcAction::frustum_bsp_upper_x};
-    return result;
-  }();
-  const auto &entry = entries[((pc >> 2U) ^ (pc >> 7U)) & 31U];
+  const auto &entry =
+      detail::runtime_pc_actions[((pc >> 2U) ^ (pc >> 7U)) & 31U];
   return entry.pc == pc ? entry.action : RuntimePcAction::none;
 }
 
@@ -78,9 +85,21 @@ struct RuntimeFrameResult {
   }
 };
 
+struct RuntimeControllerInput {
+  std::uint16_t active_low_buttons{0xffffU};
+  std::array<std::uint8_t, 4U> analog{128U, 128U, 128U, 128U};
+  bool connected{true};
+
+  friend bool operator==(const RuntimeControllerInput &,
+                         const RuntimeControllerInput &) = default;
+};
+
+using RuntimeControllerInputs = std::array<RuntimeControllerInput, 2U>;
+
 struct RuntimeStats {
   std::uint64_t frames{};
   std::uint64_t instructions{};
+  std::uint64_t cached_fast_fallbacks{};
   std::uint64_t bios_calls{};
   std::uint64_t interrupts{};
   std::uint64_t gpu_words{};
@@ -95,23 +114,74 @@ struct RuntimeStats {
   std::uint32_t last_directory_extent{};
   std::uint32_t last_directory_sectors{};
   std::uint32_t max_directory_sectors{};
+  std::uint64_t exact_transform_captures{};
+  std::uint64_t exact_transform_publications{};
+  std::uint64_t exact_transform_rejections{};
+  std::uint64_t exact_composition_entries{};
+  std::uint64_t exact_composition_captures{};
+  std::uint64_t exact_composition_sites{};
+  std::uint64_t exact_composition_publications{};
+  std::uint64_t idle_loop_fast_forwards{};
+  std::uint64_t idle_ticks_fast_forwarded{};
+};
+
+struct RuntimeAtmosphereState {
+  std::uint8_t red{};
+  std::uint8_t green{};
+  std::uint8_t blue{};
+  std::int32_t dqa{};
+  std::int32_t dqb{};
+  std::uint16_t projection{};
+  std::uint32_t terrain_depth_cue{};
+  float skybox_yaw{};
+  float skybox_pitch{};
+  float skybox_vertical_fov{};
+  bool valid{};
+  bool skybox_view_valid{};
 };
 
 class Runtime final {
 public:
   explicit Runtime(sf::game::GameDisc disc);
   Runtime(sf::game::GameDisc disc, std::filesystem::path memory_card_path);
+  Runtime(sf::game::GameDisc disc,
+          std::filesystem::path memory_card_slot_1_path,
+          std::filesystem::path memory_card_slot_2_path);
+
+  [[nodiscard]] RuntimeFrameResult
+  runFrame(const RuntimeControllerInputs &controllers);
 
   [[nodiscard]] RuntimeFrameResult
   runFrame(std::uint16_t active_low_buttons,
            std::array<std::uint8_t, 4U> analog = {128U, 128U, 128U, 128U});
 
+  [[nodiscard]] bool selectFrontendMenuTarget(std::uint32_t screen_id,
+                                              std::uint32_t selection) noexcept;
+
   [[nodiscard]] std::size_t
   takePcm(std::span<sf::psx::SpuPcmFrame> destination) noexcept;
+  void setSpuDiagnosticsEnabled(bool enabled) {
+    machine_.spu().setDiagnosticsEnabled(enabled);
+  }
+  [[nodiscard]] std::size_t takeSpuDiagnostics(
+      std::span<sf::psx::SpuDiagnosticEvent> destination) noexcept;
+  [[nodiscard]] std::uint64_t droppedSpuDiagnostics() const noexcept {
+    return machine_.spu().droppedDiagnostics();
+  }
 
   void configureAdaptiveWorldFrustum(std::uint32_t output_width,
                                      std::uint32_t output_height,
                                      bool adaptive) noexcept;
+
+  [[nodiscard]] bool gameplayPresentationReady() const noexcept;
+  [[nodiscard]] std::uint8_t activeCampaignLevel() const noexcept {
+    if (!gameplayPresentationReady())
+      return 0U;
+    return active_campaign_level_ >= 1U && active_campaign_level_ <= 24U
+               ? active_campaign_level_
+               : 1U;
+  }
+  [[nodiscard]] RuntimeAtmosphereState activeAtmosphere() const noexcept;
 
   [[nodiscard]] const RuntimeStats &stats() const noexcept { return stats_; }
   [[nodiscard]] const sf::psx::R3000Runtime &cpu() const noexcept {
@@ -139,6 +209,10 @@ public:
   gpuProjectionCatalog() const noexcept {
     return cpu_.gpuProjectionCatalog();
   }
+  [[nodiscard]] std::span<const GpuDisplayPublication>
+  gpuDisplayPublications() const noexcept {
+    return gpu_.frameDisplayPublications();
+  }
   void setGteProjectionCommandBackend(
       sf::psx::GteProjectionCommandBackend backend) noexcept {
     cpu_.setGteProjectionCommandBackend(backend);
@@ -151,6 +225,9 @@ public:
   }
   [[nodiscard]] std::uint64_t gpuCommandBufferEpoch() const noexcept {
     return gpu_.commandBufferEpoch();
+  }
+  [[nodiscard]] std::uint64_t gpuDisplayPublicationSequence() const noexcept {
+    return gpu_.displayPublicationSequence();
   }
   [[nodiscard]] std::span<const std::uint32_t> firstGpuWords() const noexcept {
     return gpu_.firstWords();
@@ -171,8 +248,34 @@ private:
   };
 
   void applyAdaptiveWorldFrustumHook(AdaptiveWorldFrustumHook hook) noexcept;
+  [[nodiscard]] bool gameplayOverlayLoaded() const noexcept;
   [[nodiscard]] AdaptiveWorldFrustumState
   validateAdaptiveWorldFrustum() const noexcept;
+
+  struct ExactTransformCapture {
+    std::uint32_t caller_stack{};
+    std::uint32_t destination{};
+    std::array<double, 9U> rotation{};
+    std::array<double, 3U> translation{};
+    bool valid{};
+  };
+  struct ExactMatrixCompositionCapture {
+    std::uint32_t caller_stack{};
+    std::uint32_t output{};
+    std::array<double, 9U> lhs_rotation{};
+    std::array<double, 3U> lhs_translation{};
+    std::array<double, 9U> rhs_rotation{};
+    std::array<double, 3U> rhs_translation{};
+    bool valid{};
+  };
+
+  void captureExactMatrixComposition() noexcept;
+  void publishExactMatrixComposition() noexcept;
+
+  void updateActiveLevel() noexcept;
+  void updateGameplayPresentation() noexcept;
+  void captureExactTransformInput() noexcept;
+  void publishExactTransformOutput() noexcept;
 
   sf::game::GameDisc disc_;
   sf::psx::R3000Runtime cpu_;
@@ -184,6 +287,16 @@ private:
   RuntimeStats stats_{};
   std::int32_t adaptive_world_x_margin_{};
   AdaptiveWorldFrustumState adaptive_world_frustum_state_{};
+  bool gameplay_presentation_ready_{};
+  struct LevelExtent {
+    std::uint32_t first_lba{};
+    std::uint32_t last_lba{};
+    std::uint8_t campaign_level{};
+  };
+  std::vector<LevelExtent> level_extents_;
+  std::uint8_t active_campaign_level_{};
+  std::array<ExactTransformCapture, 4U> exact_transform_captures_{};
+  ExactMatrixCompositionCapture exact_matrix_composition_{};
 };
 
 } // namespace mohu

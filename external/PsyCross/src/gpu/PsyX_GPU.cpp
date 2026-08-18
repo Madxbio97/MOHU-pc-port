@@ -102,6 +102,19 @@ GPUDrawSplit g_splits[MAX_DRAW_SPLITS];
 int g_vertexIndex = 0;
 int g_splitIndex = 0;
 
+struct PrimitiveLightingState {
+  unsigned char red{128};
+  unsigned char green{128};
+  unsigned char blue{128};
+  bool enabled{};
+} g_primitiveLighting;
+
+struct PrimitiveOrderingDepthState {
+  unsigned int depth{};
+  unsigned int span{};
+  bool enabled{};
+} g_primitiveOrderingDepth;
+
 void ClearSplits() {
   currentSplitDebugText = nullptr;
   g_vertexIndex = 0;
@@ -1100,12 +1113,39 @@ void DrawSplit(const GPUDrawSplit &split, WorldDepthEpoch &depthEpoch) {
   int runStart = split.startVertex;
   int runVertices = 0;
   bool runUsesDepth = false;
+  bool runIsWorld = false;
+  bool runHasOrderingDepth = false;
+  unsigned int runOrderingDepth = 0U;
+  unsigned int runOrderingSpan = 0U;
 
   const auto flushRun = [&]() {
     if (runVertices == 0)
       return;
+    if (!drawOnScreen && runIsWorld &&
+        GR_CompositeGuestSkyboxBeforeWorld() != 0) {
+      GR_RebindVertexBuffer(1U);
+      GR_ApplyProjectionEpoch(&split.dispenv, split.projectionEpoch);
+      GR_SetupClipMode(&split.drawenv.clip, drawOnScreen);
+      GR_SetTexture(split.textureId, split.texFormat, split.textureFilterMode);
+      GR_SetTextureBlendMode(split.blendMode);
+      if (split.texFormat == TF_32_BIT_RGBA)
+        GR_SetOverrideTextureSize(
+            split.textureId == g_whiteTexture ? 1 : split.drawenv.tw.w,
+            split.textureId == g_whiteTexture ? 1 : split.drawenv.tw.h);
+      GR_SetBlendModeForPrimitive(split.blendMode,
+                                  split.textureId == g_whiteTexture);
+      GR_SetStencilMode(split.drawPrimMode);
+    }
     if (runUsesDepth) {
-      if (depthRequested && g_cfg_pgxpZBuffer && rawSinceDepth &&
+      if (runHasOrderingDepth) {
+        const auto denominator = static_cast<float>(runOrderingSpan);
+        const auto lower = static_cast<float>(runOrderingDepth) / denominator;
+        const auto upper =
+            static_cast<float>(runOrderingDepth + 1U) / denominator;
+        GR_SetDepthRange(lower, upper);
+        GR_SetDepthState(1, depthWrite ? 1 : 0);
+        rawSinceDepth = false;
+      } else if (depthRequested && g_cfg_pgxpZBuffer && rawSinceDepth &&
           !target.painterOnly) {
         if (target.band + 1U < WORLD_DEPTH_BAND_COUNT) {
           ++target.band;
@@ -1116,14 +1156,14 @@ void DrawSplit(const GPUDrawSplit &split, WorldDepthEpoch &depthEpoch) {
         }
         rawSinceDepth = false;
       }
-      if (!target.painterOnly) {
+      if (!runHasOrderingDepth && !target.painterOnly) {
         const auto lower = static_cast<float>(target.band) /
                            static_cast<float>(WORLD_DEPTH_BAND_COUNT);
         const auto upper = static_cast<float>(target.band + 1U) /
                            static_cast<float>(WORLD_DEPTH_BAND_COUNT);
         GR_SetDepthRange(lower, upper);
         GR_SetDepthState(1, depthWrite ? 1 : 0);
-      } else {
+      } else if (!runHasOrderingDepth) {
         GR_SetDepthState(0, 0);
       }
     } else {
@@ -1138,12 +1178,29 @@ void DrawSplit(const GPUDrawSplit &split, WorldDepthEpoch &depthEpoch) {
   for (int vertexIndex = split.startVertex;
        vertexIndex < split.startVertex + split.numVerts; vertexIndex += 3) {
     const GrVertex *triangle = &g_vertexBuffer[vertexIndex];
-    const bool usesDepth = GR_UsesWorldDepth(triangle, depthRequested) != 0;
-    if (runVertices != 0 && runUsesDepth != usesDepth)
+    const bool isWorld = GR_UsesWorldDepth(triangle, 1) != 0;
+    const bool usesDepth = isWorld && depthRequested;
+    const auto orderingSpan = triangle[0].ordering_span;
+    const auto orderingDepth = triangle[0].ordering_depth;
+    const bool hasOrderingDepth =
+        usesDepth && orderingSpan != 0U && orderingDepth < orderingSpan &&
+        triangle[1].ordering_span == orderingSpan &&
+        triangle[2].ordering_span == orderingSpan &&
+        triangle[1].ordering_depth == orderingDepth &&
+        triangle[2].ordering_depth == orderingDepth;
+    if (runVertices != 0 &&
+        (runUsesDepth != usesDepth || runIsWorld != isWorld ||
+         runHasOrderingDepth != hasOrderingDepth ||
+         (hasOrderingDepth && (runOrderingDepth != orderingDepth ||
+                               runOrderingSpan != orderingSpan))))
       flushRun();
     if (runVertices == 0) {
       runStart = vertexIndex;
       runUsesDepth = usesDepth;
+      runIsWorld = isWorld;
+      runHasOrderingDepth = hasOrderingDepth;
+      runOrderingDepth = orderingDepth;
+      runOrderingSpan = orderingSpan;
     }
     runVertices += 3;
   }
@@ -1977,12 +2034,32 @@ static int ProcessPsyXPrims(P_TAG *polyTag) {
   return 0;
 }
 
+void GR_SetPrimitiveLighting(int enable, unsigned char red,
+                             unsigned char green, unsigned char blue) {
+  g_primitiveLighting = {
+      red,
+      green,
+      blue,
+      enable != 0,
+  };
+}
+
+void GR_SetPrimitiveOrderingDepth(int enable, unsigned int depth,
+                                  unsigned int span) {
+  g_primitiveOrderingDepth = {
+      depth,
+      span,
+      enable != 0 && span != 0U && depth < span,
+  };
+}
+
 // Processes primitive
 // returns processed primitive primLength in longs
 int ParsePrimitive(P_TAG *polyTag) {
   const int primType = polyTag->code & 0xF0;
 
   int primLength = 0;
+  const int firstVertex = g_vertexIndex;
 
   switch (primType) {
   case 0x00: {
@@ -2056,6 +2133,24 @@ int ParsePrimitive(P_TAG *polyTag) {
 
   if (primLength == 0) {
     eprinterr("Unhandled zero length %0x primitive\n", primType);
+  }
+
+  const auto lightEnable =
+      static_cast<unsigned char>(g_primitiveLighting.enabled ? 255 : 0);
+  for (int vertexIndex = firstVertex; vertexIndex < g_vertexIndex;
+       ++vertexIndex) {
+    auto &vertex = g_vertexBuffer[vertexIndex];
+    vertex.light_r = g_primitiveLighting.red;
+    vertex.light_g = g_primitiveLighting.green;
+    vertex.light_b = g_primitiveLighting.blue;
+    vertex.light_enable = lightEnable;
+    if (g_primitiveOrderingDepth.enabled) {
+      vertex.ordering_depth = g_primitiveOrderingDepth.depth;
+      vertex.ordering_span = g_primitiveOrderingDepth.span;
+    } else {
+      vertex.ordering_depth = 0U;
+      vertex.ordering_span = 0U;
+    }
   }
 
   return primLength;

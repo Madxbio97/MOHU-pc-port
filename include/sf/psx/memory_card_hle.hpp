@@ -13,6 +13,8 @@ inline constexpr std::size_t memory_card_block_count = 15U;
 inline constexpr std::size_t memory_card_file_count = 15U;
 inline constexpr std::size_t memory_card_descriptor_count = 16U;
 inline constexpr std::uint8_t memory_card_invalid_index = 0xffU;
+inline constexpr std::uint8_t memory_card_slot_count = 2U;
+inline constexpr std::uint8_t memory_card_invalid_slot = 0xffU;
 
 struct MemoryCardFileState {
   std::array<char, 21U> name{};
@@ -87,18 +89,29 @@ struct MemoryCardAsyncCompletion {
 
 class MemoryCardHle final {
 public:
+  [[nodiscard]] static bool
+  installBackupUnitDevice(R3000Runtime &runtime) noexcept;
+
   [[nodiscard]] static bool handlesCall(std::uint32_t vector,
                                         std::uint32_t call) noexcept;
 
+  [[nodiscard]] static std::uint8_t
+  resolveCallSlot(const R3000Runtime &runtime, std::uint32_t vector,
+                  std::uint32_t call, std::uint8_t find_slot) noexcept;
+
   [[nodiscard]] static MemoryCardCallResult
   handleCall(R3000Runtime &runtime, MemoryCardHleState &state,
-             std::uint32_t vector, std::uint32_t call) noexcept;
+             std::uint32_t vector, std::uint32_t call,
+             std::uint8_t slot) noexcept;
 
   [[nodiscard]] static MemoryCardAsyncCompletion
   servicePending(R3000Runtime &runtime, MemoryCardHleState &state) noexcept;
 
   [[nodiscard]] static bool
   validateState(const MemoryCardHleState &state) noexcept;
+
+  [[nodiscard]] static bool validateState(const MemoryCardHleState &state,
+                                          std::uint8_t slot) noexcept;
 };
 
 } // namespace sf::psx

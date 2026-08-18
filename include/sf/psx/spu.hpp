@@ -15,6 +15,39 @@ struct SpuPcmFrame {
   bool operator==(const SpuPcmFrame &) const = default;
 };
 
+enum class SpuDiagnosticType : std::uint8_t {
+  dma_write,
+  dma_read,
+  key_on,
+  key_off,
+};
+
+// Optional host trace, excluded from emulated state.
+struct SpuDiagnosticEvent {
+  SpuDiagnosticType type{SpuDiagnosticType::key_on};
+  std::uint8_t voice{};
+  std::uint8_t adpcm_header{};
+  std::uint8_t adpcm_flags{};
+  std::uint64_t sequence{};
+  std::uint64_t mixed_frame{};
+  std::uint32_t producer_pc{0xffffffffU};
+  std::uint32_t mask{};
+  std::uint32_t ram_address{};
+  std::uint32_t start_address{};
+  std::uint32_t end_address{};
+  std::uint32_t repeat_address{};
+  std::uint32_t word_count{};
+  std::uint32_t expected_word_count{};
+  std::uint32_t fingerprint{};
+  std::uint16_t pitch{};
+  std::uint16_t volume_left{};
+  std::uint16_t volume_right{};
+  std::uint16_t adsr_low{};
+  std::uint16_t adsr_high{};
+
+  bool operator==(const SpuDiagnosticEvent &) const = default;
+};
+
 enum class SpuAdsrPhase : std::uint8_t {
   off,
   attack,
@@ -133,8 +166,9 @@ public:
 
   [[nodiscard]] bool readRegister(std::uint32_t offset,
                                   std::uint16_t &value) noexcept;
-  [[nodiscard]] bool writeRegister(std::uint32_t offset,
-                                   std::uint16_t value) noexcept;
+  [[nodiscard]] bool
+  writeRegister(std::uint32_t offset, std::uint16_t value,
+                std::uint32_t producer_pc = 0xffffffffU) noexcept;
 
   // DMA channel 4 endpoint. A request is asserted for SPUCNT transfer modes
   // 2 (RAM to SPU) and 3 (SPU to RAM).
@@ -143,9 +177,12 @@ public:
   [[nodiscard]] bool writeDmaWord(std::uint32_t value) noexcept;
 
   [[nodiscard]] bool interruptLine() const noexcept;
-  void setDmaTransferBusy(bool busy) noexcept {
-    state_->transfer_busy = busy ? 1U : 0U;
-  }
+  void setDmaTransferBusy(bool busy, std::uint32_t ram_address = 0U,
+                          std::uint64_t expected_words = 0U) noexcept;
+  void setDiagnosticsEnabled(bool enabled);
+  [[nodiscard]] std::size_t
+  takeDiagnostics(std::span<SpuDiagnosticEvent> destination) noexcept;
+  [[nodiscard]] std::uint64_t droppedDiagnostics() const noexcept;
 
   // Both entry points advance the same 44.1 kHz mixer. advanceCpuTicks keeps
   // the fractional CPU-to-SPU clock in the snapshot.
@@ -208,11 +245,13 @@ private:
   void applyPendingKeys() noexcept;
   void writeCaptureBuffer(std::size_t index, std::int16_t value) noexcept;
   void advanceCaptureBuffer() noexcept;
-  [[nodiscard]] bool decodeBlock(std::size_t voice_index) noexcept;
+  [[nodiscard]] bool decodeBlock(std::size_t voice_index,
+                                 bool read_for_irq = false) noexcept;
   void finishBlock(std::size_t voice_index, bool noise_enabled) noexcept;
-  [[nodiscard]] std::int32_t voiceSample(std::size_t voice_index) noexcept;
+  [[nodiscard]] std::int32_t voiceSample(std::size_t voice_index,
+                                         bool read_for_irq = false) noexcept;
   void advanceVoice(std::size_t voice_index, std::uint16_t pitch,
-                    bool noise_enabled) noexcept;
+                    bool noise_enabled, bool read_for_irq = false) noexcept;
   void advanceEnvelope(std::size_t voice_index) noexcept;
   void advanceNoiseFrames(std::uint64_t frames) noexcept;
   [[nodiscard]] std::uint32_t
@@ -226,6 +265,11 @@ private:
   [[nodiscard]] std::uint16_t readRamHalfword() noexcept;
   void writeRamHalfword(std::uint16_t value) noexcept;
   void touchRam(std::uint32_t address) noexcept;
+  void checkLateRamIrq() noexcept;
+  [[nodiscard]] std::uint32_t
+  sampleFingerprint(std::uint32_t address) const noexcept;
+  void pushDiagnostic(SpuDiagnosticEvent event) noexcept;
+  void traceDmaWord(std::uint32_t value) noexcept;
 
   [[nodiscard]] SpuPcmFrame popCdFrame() noexcept;
   void pushPcmFrame(SpuPcmFrame frame) noexcept;
@@ -234,12 +278,34 @@ private:
 
   // Keep the device small enough to coexist with one inline snapshot on the
   // default Windows thread stack. The snapshot itself remains pointer-free.
+  static constexpr std::size_t diagnostic_capacity = 2'048U;
+  struct DmaDiagnosticState {
+    std::uint32_t ram_address{};
+    std::uint32_t start_address{};
+    std::uint32_t end_address{};
+    std::uint32_t fingerprint{2166136261U};
+    std::uint32_t word_count{};
+    std::uint32_t expected_word_count{};
+    std::uint8_t mode{};
+    std::uint8_t active{};
+  };
+
   std::unique_ptr<SpuState> state_;
   std::unique_ptr<std::array<SpuPcmFrame, pcm_queue_capacity>> pcm_queue_;
+  std::unique_ptr<std::array<SpuDiagnosticEvent, diagnostic_capacity>>
+      diagnostics_;
   std::size_t pcm_read_position_{};
   std::size_t pcm_write_position_{};
   std::size_t pcm_frame_count_{};
   std::uint64_t dropped_pcm_frames_{};
+  std::size_t diagnostic_read_position_{};
+  std::size_t diagnostic_write_position_{};
+  std::size_t diagnostic_count_{};
+  std::uint64_t diagnostic_sequence_{};
+  std::uint64_t dropped_diagnostics_{};
+  std::uint32_t pending_key_on_pc_{0xffffffffU};
+  std::uint32_t pending_key_off_pc_{0xffffffffU};
+  DmaDiagnosticState dma_diagnostic_{};
 };
 
 } // namespace sf::psx

@@ -98,18 +98,18 @@ bool validatesTPageExclusiveEdges() {
 
 int main() {
   SDL_SetMainReady();
-  if (PsyX_ResolveSwapInterval(1, 60, 30) != 2 ||
+  if (PsyX_ResolveSwapInterval(1, 60, 30) != 1 ||
       PsyX_ResolveSwapInterval(1, 60, 60) != 1 ||
       PsyX_ResolveSwapInterval(1, 120, 120) != 1 ||
-      PsyX_ResolveSwapInterval(1, 240, 120) != 2 ||
+      PsyX_ResolveSwapInterval(1, 240, 120) != 1 ||
       PsyX_ResolveSwapInterval(1, 240, 240) != 1 ||
-      PsyX_ResolveSwapInterval(1, 60, 120) != 0 ||
-      PsyX_ResolveSwapInterval(1, 144, 60) != 0 ||
+      PsyX_ResolveSwapInterval(1, 60, 120) != 1 ||
+      PsyX_ResolveSwapInterval(1, 144, 60) != 1 ||
       PsyX_ResolveSwapInterval(0, 240, 240) != 0) {
     std::cerr << "Presentation cadence resolution is unstable\n";
     return 202;
   }
-  if (PsyX_ShouldUseSoftwareFrameLimit(1, 60) != 0 ||
+  if (PsyX_ShouldUseSoftwareFrameLimit(1, 60) == 0 ||
       PsyX_ShouldUseSoftwareFrameLimit(0, 60) == 0 ||
       PsyX_ShouldUseSoftwareFrameLimit(0, 0) != 0) {
     std::cerr << "Presentation limiter ownership is unstable\n";
@@ -349,6 +349,62 @@ int main() {
   const auto [affine_sample, affine_error] = render_perspective_sample(false);
   const auto [corrected_sample, corrected_error] =
       render_perspective_sample(true);
+
+  // Host lighting is a separate vertex multiplier. Raw-textured primitives
+  // therefore retain their GP0 colour semantics while still receiving the
+  // level light selected by the native renderer.
+  const auto render_lighting_sample = [&](bool enabled,
+                                          unsigned char multiplier) {
+    static_cast<void>(PsyX_BeginScene());
+    GR_SetOffscreenState(&native_target, 0);
+    GR_SetScissorState(0);
+    GR_EnableDepth(0);
+    GR_EnableSceneFog(0);
+    GR_SetBlendMode(BM_NONE);
+    glClearColor(0.0F, 0.0F, 0.0F, 1.0F);
+    glClear(GL_COLOR_BUFFER_BIT);
+    GR_Ortho2D(-0.5F, 0.5F, 0.5F, -0.5F, -1.0F, 1.0F);
+    GR_SetTexture(g_whiteTexture, TF_32_BIT_RGBA, TEXTURE_FILTER_NEAREST);
+    GR_SetOverrideTextureSize(1, 1);
+
+    auto vertices = make_perspective_quad(false);
+    for (auto &vertex : vertices) {
+      vertex.precise_u = 0.0F;
+      vertex.precise_v = 0.0F;
+      vertex.r = vertex.g = vertex.b = 255U;
+      vertex.a = 255U;
+      vertex.light_r = multiplier;
+      vertex.light_g = multiplier;
+      vertex.light_b = multiplier;
+      vertex.light_enable = enabled ? 255U : 0U;
+    }
+    GR_UpdateVertexBuffer(vertices.data(), static_cast<int>(vertices.size()));
+    GR_DrawTriangles(0, 2);
+    std::array<GLint, 4U> viewport{};
+    glGetIntegerv(GL_VIEWPORT, viewport.data());
+    std::array<unsigned char, 4U> sample{};
+    glReadPixels(viewport[0] + viewport[2] / 2, viewport[1] + viewport[3] / 2,
+                 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sample.data());
+    const auto error = glGetError();
+    PsyX_EndScene();
+    return std::pair{sample, error};
+  };
+  const auto [neutral_light_sample, neutral_light_error] =
+      render_lighting_sample(false, 0U);
+  const auto [half_light_sample, half_light_error] =
+      render_lighting_sample(true, 64U);
+  const auto lighting_channel_valid =
+      neutral_light_error == GL_NO_ERROR && half_light_error == GL_NO_ERROR &&
+      neutral_light_sample[0] > 240U && neutral_light_sample[1] > 240U &&
+      neutral_light_sample[2] > 240U && half_light_sample[0] >= 120U &&
+      half_light_sample[0] <= 136U && half_light_sample[1] >= 120U &&
+      half_light_sample[1] <= 136U && half_light_sample[2] >= 120U &&
+      half_light_sample[2] <= 136U;
+  if (!lighting_channel_valid) {
+    std::cerr << "Primitive lighting did not modulate raw texture colour\n";
+    PsyX_Shutdown();
+    return 228;
+  }
 
   // Reversed depth rejects farther geometry while equal-depth polygons retain
   // GP0 painter order.
@@ -625,6 +681,76 @@ int main() {
     return 93;
   }
 
+  const auto render_ot_ordering_depth = [&] {
+    GR_BeginGuestProjectionEpoch(94, 320, 240, 0, 0);
+    GR_BeginGuestSubmit();
+    static_cast<void>(PsyX_BeginScene());
+    PGXP_ClearCache();
+    GR_SetScissorState(0);
+    GR_EnableDepth(1);
+    glClearColor(0.0F, 0.0F, 0.0F, 1.0F);
+    glClear(GL_COLOR_BUFFER_BIT);
+    GR_ClearDepthBuffer();
+
+    DRAWENV draw{};
+    SetDefDrawEnv(&draw, 0, 0, 320, 240);
+    draw.dtd = 0;
+    draw.dfe = 1;
+    draw.isbg = 0;
+    PutDrawEnv(&draw);
+
+    const auto emit_layer = [&](float depth, unsigned int layer,
+                                const std::array<unsigned char, 3U> &color) {
+      POLY_F3 polygon{};
+      setPolyF3(&polygon);
+      setRGB0(&polygon, color[0U], color[1U], color[2U]);
+      setXY3(&polygon, 80, 40, 240, 40, 160, 200);
+      std::array<PGXPVData, 3U> vertices{};
+      const std::array<short, 6U> positions{80, 40, 240, 40, 160, 200};
+      for (std::size_t vertex{}; vertex < vertices.size(); ++vertex) {
+        auto &precise = vertices[vertex];
+        precise.lookup = PGXP_LOOKUP_VALUE(positions[vertex * 2U],
+                                           positions[vertex * 2U + 1U]);
+        precise.pz = depth;
+        precise.sx = static_cast<float>(positions[vertex * 2U]);
+        precise.sy = static_cast<float>(positions[vertex * 2U + 1U]);
+        precise.scr_h = 320.0F;
+        precise.precise_screen_position = 1U;
+        if (PGXP_EmitCacheData(&precise) == static_cast<u_short>(0xffffU))
+          return false;
+      }
+      const auto cache_end = PGXP_GetIndex(1);
+      if (cache_end == static_cast<u_short>(0xffffU))
+        return false;
+      GR_SetPrimitiveOrderingDepth(1, layer, 2U);
+      DrawPrimPGXP(&polygon, cache_end);
+      GR_SetPrimitiveOrderingDepth(0, 0U, 0U);
+      return true;
+    };
+
+    const auto emitted = emit_layer(1.0F, 0U, {0U, 255U, 0U}) &&
+                         emit_layer(8.0F, 1U, {255U, 0U, 0U});
+    DrawSync(0);
+    std::array<GLint, 4U> viewport{};
+    glGetIntegerv(GL_VIEWPORT, viewport.data());
+    std::array<unsigned char, 4U> sample{};
+    glReadPixels(viewport[0] + viewport[2] / 2, viewport[1] + viewport[3] / 2,
+                 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sample.data());
+    const auto error = glGetError();
+    GR_EnableDepth(0);
+    PsyX_EndScene();
+    return std::tuple{emitted, sample, error};
+  };
+  const auto [ot_depth_emitted, ot_depth_sample, ot_depth_error] =
+      render_ot_ordering_depth();
+  if (!ot_depth_emitted || ot_depth_error != GL_NO_ERROR ||
+      ot_depth_sample[0U] < 200U || ot_depth_sample[1U] > 32U ||
+      ot_depth_sample[2U] > 32U) {
+    std::cerr << "Ordering-table depth layers did not preserve painter order\n";
+    PsyX_Shutdown();
+    return 112;
+  }
+
   constexpr std::array<short, 6U> depth_epoch_positions{
       80, 40, 240, 40, 160, 200,
   };
@@ -828,6 +954,98 @@ int main() {
               << static_cast<unsigned int>(overflow_sample[2U]) << '\n';
     PsyX_Shutdown();
     return 111;
+  }
+
+  // Campaign skyboxes belong only to the root guest page. Leading authored
+  // screen-space background must complete first; the skybox is inserted only
+  // when the first projection-backed world run arrives. A root page without
+  // world geometry and a contained page must never receive a close fallback.
+  std::array<u_char, 4U> skybox_pixel{255U, 255U, 255U, 255U};
+  const auto skybox_texture = GR_CreateRGBATexture(1, 1, skybox_pixel.data());
+  if (skybox_texture == 0U) {
+    std::cerr << "Cannot create the root-only skybox test texture\n";
+    PsyX_Shutdown();
+    return 227;
+  }
+  GR_SetGuestSkybox(skybox_texture, 1, 1, 1);
+  const auto skybox_composites_before = GR_GetGuestSkyboxCompositeCount();
+  struct SkyboxPassResult {
+    bool emitted{};
+    unsigned long long after_background{};
+    unsigned long long after_close{};
+    GLenum error{GL_NO_ERROR};
+  };
+  const auto render_skybox_target =
+      [&](const RECT16 &target, bool begin_root_submit, bool emit_world) {
+        if (begin_root_submit) {
+          GR_SetGuestDisplayGeometry(output_size, output_size);
+          GR_BeginGuestProjectionEpoch(94, output_size, output_size, 0, 0);
+          GR_BeginGuestSubmit();
+        }
+        static_cast<void>(PsyX_BeginScene());
+        PGXP_ClearCache();
+        GR_SetScissorState(0);
+        DRAWENV draw{};
+        SetDefDrawEnv(&draw, target.x, target.y, target.w, target.h);
+        draw.dtd = 0;
+        draw.dfe = 0;
+        draw.isbg = 0;
+        PutDrawEnv(&draw);
+        const std::array<short, 6U> positions{
+            static_cast<short>(target.x + target.w / 8),
+            static_cast<short>(target.y + target.h / 8),
+            static_cast<short>(target.x + target.w * 7 / 8),
+            static_cast<short>(target.y + target.h / 8),
+            static_cast<short>(target.x + target.w / 2),
+            static_cast<short>(target.y + target.h * 7 / 8),
+        };
+        emit_depth_epoch_raw(positions, {8U, 8U, 8U});
+        DrawSync(0);
+        SkyboxPassResult result{};
+        result.after_background = GR_GetGuestSkyboxCompositeCount();
+        result.emitted = !emit_world || emit_depth_epoch_exact(positions, 4.0F,
+                                                               {64U, 64U, 64U});
+        DrawSync(0);
+        result.error = glGetError();
+        finishOffscreenPass();
+        result.after_close = GR_GetGuestSkyboxCompositeCount();
+        PsyX_EndScene();
+        return result;
+      };
+
+  while (glGetError() != GL_NO_ERROR) {
+  }
+  constexpr RECT16 skybox_root{0, 320, output_size, output_size};
+  constexpr RECT16 skybox_nested{128, 320, output_size / 2, output_size / 2};
+  const auto root_skybox = render_skybox_target(skybox_root, true, true);
+  const auto nested_skybox = render_skybox_target(skybox_nested, false, true);
+  const auto screen_only_root = render_skybox_target(skybox_root, true, false);
+  GR_SetGuestSkybox(0U, 0, 0, 0);
+  GR_DestroyTexture(skybox_texture);
+  GR_EndGuestProjectionEpoch();
+  GR_SetGuestDisplayGeometry(320, 240);
+  const auto root_only_skybox =
+      root_skybox.emitted && nested_skybox.emitted &&
+      root_skybox.after_background == skybox_composites_before &&
+      root_skybox.after_close == skybox_composites_before + 1U &&
+      nested_skybox.after_background == root_skybox.after_close &&
+      nested_skybox.after_close == root_skybox.after_close &&
+      screen_only_root.after_background == root_skybox.after_close &&
+      screen_only_root.after_close == root_skybox.after_close &&
+      root_skybox.error == GL_NO_ERROR && nested_skybox.error == GL_NO_ERROR &&
+      screen_only_root.error == GL_NO_ERROR;
+  if (!root_only_skybox) {
+    std::cerr << "Skybox escaped the root world pass; counts="
+              << skybox_composites_before << '/' << root_skybox.after_background
+              << '/' << root_skybox.after_close << '/'
+              << nested_skybox.after_background << '/'
+              << nested_skybox.after_close << '/'
+              << screen_only_root.after_background << '/'
+              << screen_only_root.after_close << " gl=0x" << std::hex
+              << root_skybox.error << '/' << nested_skybox.error << '/'
+              << screen_only_root.error << std::dec << '\n';
+    PsyX_Shutdown();
+    return 227;
   }
 
   // Two triangles share an edge which crosses W=0. Fixed-function clipping
@@ -1862,12 +2080,37 @@ int main() {
   fallback_projections[2] = pgxp_projections[5];
   // Deliberately leave vertex 2 invalid.
   pgxp_gpu.submit(fallback_triangle, fallback_projections);
-  if (pgxp_gpu.precisePrimitives() != 1U || PGXP_GetIndex(0) != 3U) {
-    std::cerr << "Incomplete raw PGXP primitive did not fall back atomically; "
-              << "precise=" << pgxp_gpu.precisePrimitives()
-              << " cache=" << PGXP_GetIndex(0) << '\n';
+  std::array<PGXPVData, 3U> affine_fallback{};
+  auto affine_fallback_valid = true;
+  for (std::size_t vertex{}; vertex < affine_fallback.size(); ++vertex) {
+    affine_fallback_valid =
+        affine_fallback_valid &&
+        PGXP_GetCacheDataExact(&affine_fallback[vertex],
+                               static_cast<u_short>(3U + vertex)) != 0 &&
+        affine_fallback[vertex].precise_screen_position != 0U &&
+        affine_fallback[vertex].scr_h == 0.0F;
+  }
+  if (pgxp_gpu.precisePrimitives() != 1U || PGXP_GetIndex(0) != 6U ||
+      !affine_fallback_valid || affine_fallback[0U].sx != 4.25F ||
+      affine_fallback[1U].sx != 20.5F || affine_fallback[2U].sx != 4.0F ||
+      affine_fallback[2U].sy != 20.0F) {
+    std::cerr
+        << "Incomplete raw PGXP primitive mixed precise and projective W; "
+        << "precise=" << pgxp_gpu.precisePrimitives()
+        << " cache=" << PGXP_GetIndex(0) << '\n';
     PsyX_Shutdown();
     return 11;
+  }
+
+  auto wrapped_fallback = fallback_projections;
+  wrapped_fallback[1U].screen_x = 2052.25F;
+  pgxp_gpu.submit(fallback_triangle, wrapped_fallback);
+  PGXPVData wrapped_vertex{};
+  if (PGXP_GetCacheDataExact(&wrapped_vertex, 6U) == 0 ||
+      wrapped_vertex.sx != 4.25F || PGXP_GetIndex(0) != 9U) {
+    std::cerr << "Precise XY escaped the signed 11-bit GPU domain\n";
+    PsyX_Shutdown();
+    return 217;
   }
   auto non_finite_projections = fallback_projections;
   non_finite_projections[3] = pgxp_projections[6];
@@ -1875,7 +2118,7 @@ int main() {
   pgxp_gpu.submit(fallback_triangle, non_finite_projections);
   if (pgxp_gpu.precisePrimitives() != 1U ||
       pgxp_gpu.nonfiniteProjectionPrimitives() != 1U ||
-      PGXP_GetIndex(0) != 3U) {
+      PGXP_GetIndex(0) != 12U) {
     std::cerr << "Non-finite PGXP tuple escaped raw packet fallback; precise="
               << pgxp_gpu.precisePrimitives() << " cache=" << PGXP_GetIndex(0)
               << '\n';
@@ -1971,11 +2214,30 @@ int main() {
   auto mismatched_packed_vertex = gt4_projections;
   mismatched_packed_vertex[gt4_words[2]].screen_x += 128.0F;
   pgxp_gpu.submit(pgxp_gt4, mismatched_packed_vertex);
+  std::array<PGXPVData, 4U> mismatched_screen_cache{};
+  auto mismatched_screen_affine = true;
+  for (std::size_t vertex{}; vertex < mismatched_screen_cache.size();
+       ++vertex) {
+    mismatched_screen_affine =
+        mismatched_screen_affine &&
+        PGXP_GetCacheDataExact(
+            &mismatched_screen_cache[vertex],
+            static_cast<u_short>(cache_before_bad_sidecars + vertex)) != 0 &&
+        mismatched_screen_cache[vertex].scr_h == 0.0F;
+  }
   if (pgxp_gpu.precisePrimitives() != precise_before_bad_sidecars ||
       pgxp_gpu.reprojectionMismatchPrimitives() !=
           reprojection_before_bad_sidecars + 1U ||
-      PGXP_GetIndex(0) != cache_before_bad_sidecars) {
-    std::cerr << "Screen mismatch escaped primitive-atomic raw fallback\n";
+      PGXP_GetIndex(0) != cache_before_bad_sidecars + 4U ||
+      !mismatched_screen_affine || mismatched_screen_cache[2U].sx != 8.0F) {
+    std::cerr << "Screen mismatch escaped affine-W packet fallback; precise="
+              << pgxp_gpu.precisePrimitives() << '/'
+              << precise_before_bad_sidecars
+              << " mismatch=" << pgxp_gpu.reprojectionMismatchPrimitives()
+              << " cache=" << PGXP_GetIndex(0) << '/'
+              << cache_before_bad_sidecars
+              << " affine=" << mismatched_screen_affine
+              << " x=" << mismatched_screen_cache[2U].sx << '\n';
     PsyX_Shutdown();
     return 41;
   }
@@ -1993,10 +2255,22 @@ int main() {
       (camera_vertex.screen_y - camera_vertex.screen_offset_y) *
       camera_vertex.view_z / camera_vertex.screen_h;
   pgxp_gpu.submit(pgxp_gt4, mismatched_camera_vertex);
+  std::array<PGXPVData, 4U> mismatched_camera_cache{};
+  auto mismatched_camera_affine = true;
+  for (std::size_t vertex{}; vertex < mismatched_camera_cache.size();
+       ++vertex) {
+    mismatched_camera_affine =
+        mismatched_camera_affine &&
+        PGXP_GetCacheDataExact(
+            &mismatched_camera_cache[vertex],
+            static_cast<u_short>(cache_before_bad_camera + vertex)) != 0 &&
+        mismatched_camera_cache[vertex].scr_h == 0.0F;
+  }
   if (pgxp_gpu.precisePrimitives() != precise_before_bad_camera ||
       pgxp_gpu.cameraMismatchPrimitives() != camera_before_bad_camera + 1U ||
-      PGXP_GetIndex(0) != cache_before_bad_camera) {
-    std::cerr << "Camera mismatch escaped primitive-atomic raw fallback\n";
+      PGXP_GetIndex(0) != cache_before_bad_camera + 4U ||
+      !mismatched_camera_affine) {
+    std::cerr << "Camera mismatch escaped affine-W precise-XY fallback\n";
     PsyX_Shutdown();
     return 42;
   }
@@ -2088,6 +2362,87 @@ int main() {
     }
     return projections;
   };
+
+  // Exact and reciprocal-clamped vertices share one W domain.
+  auto continuous_w_projections = make_adjacent_projections();
+  constexpr std::array<std::size_t, 8U> continuous_w_words{
+      1U, 2U, 3U, 4U, 6U, 7U, 8U, 9U,
+  };
+  for (const auto word : continuous_w_words) {
+    auto &projection = continuous_w_projections[word];
+    projection.view_z = 96.0F;
+    projection.projective_depth = projection.screen_h * 0.5F;
+    projection.view_x = (projection.screen_x - projection.screen_offset_x) *
+                        projection.view_z / projection.screen_h;
+    projection.view_y = (projection.screen_y - projection.screen_offset_y) *
+                        projection.view_z / projection.screen_h;
+    projection.exact_transform = word <= 4U;
+  }
+  PGXP_ClearCache();
+  sf::platform::detail::PsyCrossGuestGpu continuous_w_gpu;
+  continuous_w_gpu.setGeometryOptions(true, true, true, false, false, false,
+                                      true);
+  continuous_w_gpu.submit(adjacent_f4_words, continuous_w_projections);
+  PGXPVData exact_shared_top{};
+  PGXPVData legacy_shared_top{};
+  PGXPVData exact_shared_bottom{};
+  PGXPVData legacy_shared_bottom{};
+  const auto continuous_shared_w =
+      PGXP_GetCacheDataExact(&exact_shared_top, 1U) != 0 &&
+      PGXP_GetCacheDataExact(&legacy_shared_top, 4U) != 0 &&
+      PGXP_GetCacheDataExact(&exact_shared_bottom, 3U) != 0 &&
+      PGXP_GetCacheDataExact(&legacy_shared_bottom, 6U) != 0 &&
+      exact_shared_top.pz == legacy_shared_top.pz &&
+      exact_shared_bottom.pz == legacy_shared_bottom.pz &&
+      exact_shared_top.pz == 96.0F / 128.0F &&
+      exact_shared_bottom.pz == 96.0F / 128.0F;
+  if (continuous_w_gpu.polygonPrimitives() != 2U ||
+      continuous_w_gpu.preciseCandidates() != 2U ||
+      continuous_w_gpu.precisePrimitives() != 2U || !continuous_shared_w ||
+      PGXP_GetIndex(0) != 8U) {
+    std::cerr << "Exact/legacy neighbors used discontinuous projective W\n";
+    PsyX_Shutdown();
+    return 213;
+  }
+  DrawSync(0);
+
+  // Reciprocal saturation still yields a coherent perspective vertex.
+  auto reciprocal_clamp_projections = make_adjacent_projections();
+  for (const auto word : continuous_w_words) {
+    auto &projection = reciprocal_clamp_projections[word];
+    projection.view_z = 96.0F;
+    projection.projective_depth = projection.screen_h * 0.5F;
+    projection.view_x = (projection.screen_x - projection.screen_offset_x) *
+                        projection.view_z / projection.screen_h;
+    projection.view_y = (projection.screen_y - projection.screen_offset_y) *
+                        projection.view_z / projection.screen_h;
+    projection.exact_transform = false;
+    projection.divide_overflow = true;
+  }
+  PGXP_ClearCache();
+  sf::platform::detail::PsyCrossGuestGpu reciprocal_clamp_gpu;
+  reciprocal_clamp_gpu.setGeometryOptions(true, true, true, false, false, false,
+                                          true);
+  reciprocal_clamp_gpu.submit(adjacent_f4_words, reciprocal_clamp_projections);
+  PGXPVData reciprocal_top_left{};
+  PGXPVData reciprocal_top_right{};
+  const auto reciprocal_vertices_valid =
+      PGXP_GetCacheDataExact(&reciprocal_top_left, 0U) != 0 &&
+      PGXP_GetCacheDataExact(&reciprocal_top_right, 1U) != 0 &&
+      reciprocal_top_left.pz == 96.0F / 128.0F &&
+      reciprocal_top_right.pz == 96.0F / 128.0F &&
+      reciprocal_top_left.sx == 8.0F && reciprocal_top_right.sx == 24.0F;
+  if (reciprocal_clamp_gpu.polygonPrimitives() != 2U ||
+      reciprocal_clamp_gpu.preciseCandidates() != 2U ||
+      reciprocal_clamp_gpu.precisePrimitives() != 2U ||
+      reciprocal_clamp_gpu.projectionHazardPrimitives() != 0U ||
+      reciprocal_clamp_gpu.divideOverflowPrimitives() != 0U ||
+      !reciprocal_vertices_valid || PGXP_GetIndex(0) != 8U) {
+    std::cerr << "GTE reciprocal clamp fell back to affine geometry\n";
+    PsyX_Shutdown();
+    return 214;
+  }
+  DrawSync(0);
 
   // The compact catalog fallback resolves shared packed vertices to one exact
   // tuple; conflicting tuples make every touching primitive fall back.
@@ -2341,13 +2696,53 @@ int main() {
   clipped_quad_gpu.setCoherenceEdgeSnapping(true);
   clipped_quad_gpu.submit(clipped_quad_words, {}, clipped_quad_handles, 7002U,
                           clipped_quad_catalog);
+  std::array<PGXPVData, 4U> clipped_affine_cache{};
+  auto clipped_affine_valid = true;
+  for (std::size_t vertex{}; vertex < clipped_affine_cache.size(); ++vertex) {
+    clipped_affine_valid =
+        clipped_affine_valid &&
+        PGXP_GetCacheDataExact(&clipped_affine_cache[vertex],
+                               static_cast<u_short>(vertex)) != 0 &&
+        clipped_affine_cache[vertex].scr_h == 0.0F;
+  }
   if (clipped_quad_gpu.precisePrimitives() != 0U ||
       clipped_quad_gpu.projectionCatalogPrimitives() != 0U ||
       clipped_quad_gpu.missingProjectionPrimitives() != 1U ||
-      PGXP_GetIndex(0) != 0U) {
-    std::cerr << "Incomplete clipped quad did not fall back atomically\n";
+      PGXP_GetIndex(0) != 4U || !clipped_affine_valid ||
+      clipped_affine_cache[3U].sx != 24.0F ||
+      clipped_affine_cache[3U].sy != 24.0F) {
+    std::cerr << "Incomplete clipped quad mixed projective W\n";
     PsyX_Shutdown();
     return 88;
+  }
+
+  std::array<sf::psx::GpuDmaWordSource, 5U> missing_quad_dma{};
+  for (std::size_t word{}; word < missing_quad_dma.size(); ++word) {
+    missing_quad_dma[word] = {
+        static_cast<std::uint32_t>(0x00018000U + word * 4U), 0x00017000U,
+        sf::psx::GpuDmaSourceKind::linked_list};
+  }
+  PGXP_ClearCache();
+  sf::platform::detail::PsyCrossGuestGpu missing_dma_gpu;
+  missing_dma_gpu.submit(clipped_quad_words, {}, {}, 7004U, {},
+                         missing_quad_dma);
+  const auto missing_dma_diagnostics =
+      missing_dma_gpu.missingProjectionDmaDiagnostics();
+  const auto &missing_dma = missing_dma_diagnostics.front();
+  if (missing_dma_gpu.missingProjectionPrimitives() != 1U ||
+      missing_dma.primitives != 1U ||
+      missing_dma.fully_missing_primitives != 1U ||
+      missing_dma.missing_vertices != 4U || missing_dma.opcode != 0x28U ||
+      missing_dma.kind != sf::psx::GpuDmaSourceKind::linked_list ||
+      missing_dma.transfer_root != 0x00017000U ||
+      missing_dma.first_word_address != 0x00018004U ||
+      missing_dma.last_word_address != 0x00018010U ||
+      missing_dma_gpu.missingProjectionDmaUnavailablePrimitives() != 0U ||
+      missing_dma_gpu.missingProjectionDmaMixedPrimitives() != 0U ||
+      missing_dma_gpu.missingProjectionDmaOverflowPrimitives() != 0U) {
+    std::cerr << "Missing PGXP DMA provenance was not classified\n";
+    PsyX_Shutdown();
+    return 219;
   }
 
   // Production accepts only transported handles. A missing handle demotes W
@@ -2359,6 +2754,15 @@ int main() {
   sf::platform::detail::PsyCrossGuestGpu strict_handle_gpu;
   strict_handle_gpu.submit(adjacent_f4_words, {}, clipped_handle_words, 7003U,
                            handle_catalog);
+  std::array<PGXPVData, 4U> strict_handle_affine{};
+  auto strict_handle_affine_valid = true;
+  for (std::size_t vertex{}; vertex < strict_handle_affine.size(); ++vertex) {
+    strict_handle_affine_valid =
+        strict_handle_affine_valid &&
+        PGXP_GetCacheDataExact(&strict_handle_affine[vertex],
+                               static_cast<u_short>(4U + vertex)) != 0 &&
+        strict_handle_affine[vertex].scr_h == 0.0F;
+  }
   if (strict_handle_gpu.precisePrimitives() != 1U ||
       strict_handle_gpu.projectionCatalogBuilds() != 0U ||
       strict_handle_gpu.projectionCatalogPrimitives() != 1U ||
@@ -2366,7 +2770,9 @@ int main() {
       strict_handle_gpu.identityRecoveredVertices() != 0U ||
       strict_handle_gpu.identityRecoveredPrimitives() != 0U ||
       strict_handle_gpu.planeRecoveredPrimitives() != 0U ||
-      strict_handle_gpu.coherenceEdgeBuilds() != 0U || PGXP_GetIndex(0) != 4U) {
+      strict_handle_gpu.coherenceEdgeBuilds() != 0U || PGXP_GetIndex(0) != 8U ||
+      !strict_handle_affine_valid || strict_handle_affine[0U].sx != 24.0F ||
+      strict_handle_affine[0U].sy != 8.0F) {
     std::cerr << "Missing compact handle did not fail closed without "
                  "packed-SXY recovery\n";
     PsyX_Shutdown();
@@ -2396,6 +2802,110 @@ int main() {
     PsyX_Shutdown();
     return 85;
   }
+
+  // Recover only through exact coplanar shared-edge provenance.
+  std::array<sf::psx::GteProjectedVertex, 4U> coplanar_catalog{
+      catalog_projections[1U], catalog_projections[2U], catalog_projections[3U],
+      catalog_projections[4U]};
+  constexpr auto close_depth = 96.0F;
+  for (std::size_t index{}; index < coplanar_catalog.size(); ++index) {
+    auto &projection = coplanar_catalog[index];
+    projection.view_x = (projection.screen_x - projection.screen_offset_x) *
+                        close_depth / projection.screen_h;
+    projection.view_y = (projection.screen_y - projection.screen_offset_y) *
+                        close_depth / projection.screen_h;
+    projection.view_z = close_depth;
+    projection.projective_depth = projection.screen_h * 0.5F;
+    projection.source_vertex_id = index + 1U;
+    projection.mesh_vertex_id = 0x5001U + index;
+    projection.exact_transform = true;
+    projection.transform_lineage = 0x7500U;
+    projection.projection_epoch = 0x7501U;
+  }
+  std::array<std::uint64_t, adjacent_f4_words.size()> coplanar_handles{};
+  coplanar_handles[1U] = 1U;
+  coplanar_handles[2U] = 2U;
+  coplanar_handles[3U] = 3U;
+  coplanar_handles[4U] = 4U;
+  coplanar_handles[6U] = 2U;
+  coplanar_handles[8U] = 4U;
+  PGXP_ClearCache();
+  sf::platform::detail::PsyCrossGuestGpu coplanar_clipping_gpu;
+  coplanar_clipping_gpu.setCoplanarClippingRecovery(true);
+  coplanar_clipping_gpu.submit(adjacent_f4_words, {}, coplanar_handles, 7005U,
+                               coplanar_catalog);
+  std::array<PGXPVData, 8U> coplanar_cache{};
+  auto coplanar_cache_valid = true;
+  for (std::size_t vertex{}; vertex < coplanar_cache.size(); ++vertex) {
+    coplanar_cache_valid =
+        coplanar_cache_valid &&
+        PGXP_GetCacheDataExact(&coplanar_cache[vertex],
+                               static_cast<u_short>(vertex)) != 0;
+  }
+  const auto exact_depth_preserved =
+      std::ranges::all_of(coplanar_cache, [](const auto &vertex) {
+        return vertex.exact_projection != 0U && vertex.pz > 0.0F &&
+               vertex.scr_h > 0.0F;
+      });
+  if (!coplanar_cache_valid || !exact_depth_preserved ||
+      coplanar_clipping_gpu.precisePrimitives() != 2U ||
+      coplanar_clipping_gpu.projectionCatalogBuilds() != 0U ||
+      coplanar_clipping_gpu.projectionCatalogPrimitives() != 2U ||
+      coplanar_clipping_gpu.planeRecoveredVertices() != 2U ||
+      coplanar_clipping_gpu.planeRecoveredPrimitives() != 1U ||
+      coplanar_clipping_gpu.planeRecoveryRejectedPrimitives() != 0U ||
+      PGXP_GetIndex(0) != 8U) {
+    std::cerr << "Coplanar clipped vertices did not preserve exact W; "
+              << "precise=" << coplanar_clipping_gpu.precisePrimitives()
+              << " recovered=" << coplanar_clipping_gpu.planeRecoveredVertices()
+              << '/' << coplanar_clipping_gpu.planeRecoveredPrimitives()
+              << " rejected="
+              << coplanar_clipping_gpu.planeRecoveryRejectedPrimitives()
+              << '\n';
+    PsyX_Shutdown();
+    return 213;
+  }
+
+  // Production enables coplanar recovery but disables legacy quad recovery.
+  constexpr std::array<std::uint64_t, 5U> isolated_coplanar_handles{
+      0U, 0U, 2U, 3U, 4U,
+  };
+  PGXP_ClearCache();
+  sf::platform::detail::PsyCrossGuestGpu isolated_coplanar_gpu;
+  isolated_coplanar_gpu.setGeometryOptions(true, true, true, false, false, true,
+                                           true);
+  isolated_coplanar_gpu.setCoplanarClippingRecovery(true);
+  isolated_coplanar_gpu.submit(
+      std::span<const std::uint32_t>{adjacent_f4_words}.first(5U), {},
+      isolated_coplanar_handles, 7006U, coplanar_catalog);
+  std::array<PGXPVData, 4U> isolated_coplanar_cache{};
+  auto isolated_coplanar_valid = true;
+  for (std::size_t vertex{}; vertex < isolated_coplanar_cache.size();
+       ++vertex) {
+    isolated_coplanar_valid =
+        isolated_coplanar_valid &&
+        PGXP_GetCacheDataExact(&isolated_coplanar_cache[vertex],
+                               static_cast<u_short>(vertex)) != 0 &&
+        isolated_coplanar_cache[vertex].exact_projection != 0U &&
+        isolated_coplanar_cache[vertex].pz == close_depth / 128.0F;
+  }
+  if (!isolated_coplanar_valid ||
+      isolated_coplanar_gpu.precisePrimitives() != 1U ||
+      isolated_coplanar_gpu.planeRecoveredVertices() != 1U ||
+      isolated_coplanar_gpu.planeRecoveredPrimitives() != 1U ||
+      isolated_coplanar_gpu.planeRecoveryRejectedPrimitives() != 0U ||
+      PGXP_GetIndex(0) != 4U) {
+    std::cerr << "Production coplanar recovery left one F4 vertex affine; "
+              << "precise=" << isolated_coplanar_gpu.precisePrimitives()
+              << " recovered=" << isolated_coplanar_gpu.planeRecoveredVertices()
+              << '/' << isolated_coplanar_gpu.planeRecoveredPrimitives()
+              << " rejected="
+              << isolated_coplanar_gpu.planeRecoveryRejectedPrimitives()
+              << '\n';
+    PsyX_Shutdown();
+    return 216;
+  }
+  DrawSync(0);
 
   // Default PGXP keeps the coherent exact view tuple. Hardware reciprocal
   // depth remains a legacy fallback and must not flatten close exact vertices
@@ -2454,6 +2964,44 @@ int main() {
     PsyX_Shutdown();
     return 189;
   }
+
+  // Screen saturation retains direct pre-clamp camera coordinates.
+  auto unclamped_screen_words = adjacent_f4_words;
+  auto unclamped_screen_projections = make_adjacent_projections();
+  auto &unclamped_screen = unclamped_screen_projections[1U];
+  unclamped_screen_words[1U] =
+      (unclamped_screen_words[1U] & 0xffff0000U) | 0x03ffU;
+  unclamped_screen.packed_sxy = unclamped_screen_words[1U];
+  unclamped_screen.screen_x = 1023.0F;
+  constexpr auto unclamped_projected_x = 2048.25F;
+  unclamped_screen.view_x =
+      (unclamped_projected_x - unclamped_screen.screen_offset_x) *
+      unclamped_screen.view_z / unclamped_screen.screen_h;
+  unclamped_screen.screen_saturated = true;
+  unclamped_screen.exact_transform = false;
+  unclamped_screen.enhanced_sources =
+      sf::psx::GteProjectedVertex::unclamped_view;
+  PGXP_ClearCache();
+  sf::platform::detail::PsyCrossGuestGpu unclamped_screen_gpu;
+  unclamped_screen_gpu.setGeometryOptions(true, true, true, false, false, false,
+                                          true);
+  unclamped_screen_gpu.submit(unclamped_screen_words,
+                              unclamped_screen_projections);
+  PGXPVData unclamped_screen_vertex{};
+  if (unclamped_screen_gpu.precisePrimitives() != 2U ||
+      unclamped_screen_gpu.screenSaturationPrimitives() != 0U ||
+      unclamped_screen_gpu.reprojectionMismatchPrimitives() != 0U ||
+      PGXP_GetCacheDataExact(&unclamped_screen_vertex, 0U) == 0 ||
+      unclamped_screen_vertex.exact_projection == 0U ||
+      unclamped_screen_vertex.sx != unclamped_projected_x ||
+      unclamped_screen_vertex.pz != unclamped_screen.view_z / 128.0F ||
+      PGXP_GetIndex(0) != 8U) {
+    std::cerr
+        << "Unclamped integer GTE vertex fell back at screen saturation\n";
+    PsyX_Shutdown();
+    return 215;
+  }
+  DrawSync(0);
 
   auto untoleranced_screen_catalog = trusted_screen_catalog;
   for (auto &projection : untoleranced_screen_catalog)
@@ -2771,12 +3319,25 @@ int main() {
         (default_precise_cache[index].sy == 8.25F ||
          default_precise_cache[index].sy == 24.25F);
   }
+  std::array<PGXPVData, 4U> default_affine_cache{};
+  auto default_affine_bounded = true;
+  constexpr std::array<float, 4U> expected_affine_x{24.0F, 40.25F, 24.25F,
+                                                    40.25F};
+  for (std::size_t index{}; index < default_affine_cache.size(); ++index) {
+    default_affine_bounded =
+        default_affine_bounded &&
+        PGXP_GetCacheDataExact(&default_affine_cache[index],
+                               static_cast<u_short>(4U + index)) != 0 &&
+        default_affine_cache[index].sx == expected_affine_x[index] &&
+        default_affine_cache[index].scr_h == 0.0F;
+  }
   if (default_coherence_gpu.coherenceEdgeBuilds() != 0U ||
       default_coherence_gpu.coherenceSnappedPrimitives() != 0U ||
       default_coherence_gpu.coherenceSnappedVertices() != 0U ||
       default_coherence_gpu.sharedMeshBuilds() != 0U ||
       default_coherence_gpu.precisePrimitives() != 1U ||
-      !default_precise_fractional || PGXP_GetIndex(0) != 4U) {
+      !default_precise_fractional || !default_affine_bounded ||
+      PGXP_GetIndex(0) != 8U) {
     std::cerr << "Fallback packet lost bounded affine XY or retained W\n";
     PsyX_Shutdown();
     return 69;
@@ -2813,7 +3374,7 @@ int main() {
       near_default_coherence_gpu.coherenceEdgeBuilds() != 1U ||
       near_default_coherence_gpu.coherenceSnappedPrimitives() != 1U ||
       near_default_coherence_gpu.coherenceSnappedVertices() != 2U ||
-      PGXP_GetIndex(0) != 4U) {
+      PGXP_GetIndex(0) != 8U) {
     std::cerr << "Near exact/fallback edge did not use the demand-only "
                  "homogeneous bridge; candidate="
               << near_default_coherence_gpu.preciseCandidates()
@@ -2828,8 +3389,8 @@ int main() {
   }
   DrawSync(0);
 
-  // W=0 has no finite screen position. Reject the whole primitive to raw GP0
-  // instead of manufacturing a homogeneous bridge from undefined geometry.
+  // W=0 has no finite perspective position. Keep bounded per-vertex XY while
+  // using affine W for both primitives.
   PGXP_ClearCache();
   sf::platform::detail::PsyCrossGuestGpu zero_w_coherence_gpu;
   zero_w_coherence_gpu.setCoherenceEdgeSnapping(true);
@@ -2846,8 +3407,8 @@ int main() {
       zero_w_coherence_gpu.coherenceEdgeBuilds() != 1U ||
       zero_w_coherence_gpu.coherenceSnappedPrimitives() != 0U ||
       zero_w_coherence_gpu.coherenceSnappedVertices() != 0U ||
-      PGXP_GetIndex(0) != 0U) {
-    std::cerr << "Undefined W escaped primitive-atomic raw fallback\n";
+      PGXP_GetIndex(0) != 8U) {
+    std::cerr << "Undefined W escaped primitive-atomic affine fallback\n";
     PsyX_Shutdown();
     return 90;
   }
@@ -2887,7 +3448,7 @@ int main() {
       adjacent_missing_gpu.coherenceEdgeBuilds() != 1U ||
       adjacent_missing_gpu.coherenceSnappedPrimitives() != 1U ||
       adjacent_missing_gpu.coherenceSnappedVertices() != 2U ||
-      !shared_edge_snapped || PGXP_GetIndex(0) != 4U ||
+      !shared_edge_snapped || PGXP_GetIndex(0) != 8U ||
       missing_latch != 0xffffU) {
     std::cerr << "Precise/fallback shared edge was not snapped locally\n";
     PsyX_Shutdown();
@@ -2938,7 +3499,7 @@ int main() {
       clipped_subsegment_gpu.coherenceEdgeBuilds() != 1U ||
       clipped_subsegment_gpu.coherenceSnappedPrimitives() != 0U ||
       clipped_subsegment_gpu.coherenceSnappedVertices() != 0U ||
-      !clipped_edge_stable || PGXP_GetIndex(0) != 3U) {
+      !clipped_edge_stable || PGXP_GetIndex(0) != 6U) {
     std::cerr << "Collinear subsegment was incorrectly coupled to a distinct "
                  "precise edge; polygons="
               << clipped_subsegment_gpu.polygonPrimitives()
@@ -3000,7 +3561,7 @@ int main() {
       offset_isolated_gpu.coherenceEdgeBuilds() != 1U ||
       offset_isolated_gpu.coherenceSnappedPrimitives() != 0U ||
       offset_isolated_gpu.coherenceSnappedVertices() != 0U ||
-      !offset_edge_untouched || PGXP_GetIndex(0) != 3U) {
+      !offset_edge_untouched || PGXP_GetIndex(0) != 6U) {
     std::cerr << "Different GP0 draw offsets coupled identical packed edges\n";
     PsyX_Shutdown();
     return 67;
@@ -3200,7 +3761,7 @@ int main() {
       distinct_identity_gpu.identityRecoveredVertices() != 0U ||
       distinct_identity_gpu.identityRecoveredPrimitives() != 0U ||
       distinct_identity_gpu.identityConflictPrimitives() != 0U ||
-      PGXP_GetIndex(0) != 4U) {
+      PGXP_GetIndex(0) != 8U) {
     std::cerr << "Equal SXY with distinct source identities reused an "
                  "unrelated depth\n";
     PsyX_Shutdown();
@@ -3235,7 +3796,7 @@ int main() {
       conflicting_identity_gpu.identityCanonicalBuilds() != 1U ||
       conflicting_identity_gpu.identityRecoveredVertices() != 0U ||
       conflicting_identity_gpu.identityConflictPrimitives() != 2U ||
-      PGXP_GetIndex(0) != 4U) {
+      PGXP_GetIndex(0) != 8U) {
     std::cerr << "Conflicting source identity did not fail both primitives "
                  "closed; precise="
               << conflicting_identity_gpu.precisePrimitives() << " builds="
@@ -3275,10 +3836,19 @@ int main() {
   fresh_epoch_identities[1] = stale_identity;
   identity_epoch_gpu.submit(fallback_triangle, fresh_epoch_projections,
                             fresh_epoch_identities, 8002U);
+  std::array<PGXPVData, 3U> fresh_epoch_affine{};
+  auto fresh_epoch_affine_valid = true;
+  for (std::size_t vertex{}; vertex < fresh_epoch_affine.size(); ++vertex) {
+    fresh_epoch_affine_valid =
+        fresh_epoch_affine_valid &&
+        PGXP_GetCacheDataExact(&fresh_epoch_affine[vertex],
+                               static_cast<u_short>(vertex)) != 0 &&
+        fresh_epoch_affine[vertex].scr_h == 0.0F;
+  }
   if (identity_epoch_gpu.submittedCommands() != 1U ||
       identity_epoch_gpu.precisePrimitives() != 0U ||
       identity_epoch_gpu.identityRecoveredVertices() != 0U ||
-      PGXP_GetIndex(0) != 0U) {
+      PGXP_GetIndex(0) != 3U || !fresh_epoch_affine_valid) {
     std::cerr << "Projection identity or pending command leaked across an "
                  "epoch boundary\n";
     PsyX_Shutdown();
@@ -4027,6 +4597,19 @@ int main() {
     return 35;
   }
 
+  // MDEC replaces a display page with adjacent upload strips. Once their
+  // union covers the complete page, scanout must retire the old retained
+  // scene and use the authoritative packed image.
+  std::fill(parity_pattern.begin(), parity_pattern.end(), 0x03e0U);
+  LoadImage(&parity_rect, reinterpret_cast<u_long *>(parity_pattern.data()));
+  GR_UpdateVRAM();
+  if (GR_HasHighResolutionVRAM(0, parity_page_y, output_size, output_size) !=
+      0) {
+    std::cerr << "Full VRAM upload retained an obsolete display page\n";
+    PsyX_Shutdown();
+    return 237;
+  }
+
   // This is deliberately a renderer-state test rather than another call to
   // the pure viewport helper. It changes the active guest GP1/DISPENV
   // geometry, re-enters the native renderer and reads the actual GL viewport.
@@ -4086,6 +4669,43 @@ int main() {
       !verify_viewport_invariance(PSYX_ASPECT_ORIGINAL_4_3)) {
     PsyX_Shutdown();
     return 36;
+  }
+
+  // Policy changes rebind even when GP1 dimensions are unchanged.
+  RECT16 completed_before_aspect_transition{};
+  GR_SetOffscreenState(&completed_before_aspect_transition, 0);
+  g_cfg_aspectMode = PSYX_ASPECT_ORIGINAL_4_3;
+  GR_SetGuestDisplayGeometry(64, 64);
+  GR_BeginGuestSubmit();
+  RECT16 aspect_transition_root{0, 0, 64, 64};
+  GR_SetOffscreenState(&aspect_transition_root, 1);
+  std::array<GLint, 4U> original_root_viewport{};
+  glGetIntegerv(GL_VIEWPORT, original_root_viewport.data());
+
+  g_cfg_aspectMode = PSYX_ASPECT_ADAPTIVE;
+  GR_SetGuestDisplayGeometry(64, 64);
+  std::array<GLint, 4U> adaptive_root_viewport{};
+  glGetIntegerv(GL_VIEWPORT, adaptive_root_viewport.data());
+  const auto aspect_transition_error = glGetError();
+  RECT16 completed_aspect_transition{};
+  GR_SetOffscreenState(&completed_aspect_transition, 0);
+
+  constexpr std::array<GLint, 4U> expected_original_root{0, 0, 120, 90};
+  constexpr std::array<GLint, 4U> expected_adaptive_root{0, 0, 160, 90};
+  if (original_root_viewport != expected_original_root ||
+      adaptive_root_viewport != expected_adaptive_root ||
+      aspect_transition_error != GL_NO_ERROR) {
+    std::cerr << "Active guest root did not rebind across 4:3/adaptive "
+                 "transition; original="
+              << original_root_viewport[0] << ',' << original_root_viewport[1]
+              << ',' << original_root_viewport[2] << ','
+              << original_root_viewport[3]
+              << " adaptive=" << adaptive_root_viewport[0] << ','
+              << adaptive_root_viewport[1] << ',' << adaptive_root_viewport[2]
+              << ',' << adaptive_root_viewport[3] << " gl=0x" << std::hex
+              << aspect_transition_error << std::dec << '\n';
+    PsyX_Shutdown();
+    return 47;
   }
 
   // Raw guest SMAA is a final-frame operation: GR_EndScene first closes any
@@ -4867,8 +5487,57 @@ int main() {
                          0x00010000U, sf::psx::GpuDmaSourceKind::linked_list};
   }
   const auto expected_capture_words = capture_words;
+  const auto expected_capture_projections = capture_projections;
+  const auto expected_capture_dma_full = capture_dma;
   const auto expected_capture_dma = std::vector<sf::psx::GpuDmaWordSource>{
       capture_dma.begin() + 6, capture_dma.end()};
+
+  // MOHU clears the next double-buffered page before switching the draw
+  // area. Associate that clear with its own rectangle so the subsequent
+  // world page remains replayable instead of being rejected as a VRAM write.
+  std::vector<std::uint32_t> early_clear_words{
+      0xe3000000U,
+      0xe4000000U | 1023U | (511U << 10U),
+      expected_capture_words[3U],
+      expected_capture_words[4U],
+      expected_capture_words[5U],
+      expected_capture_words[0U],
+      expected_capture_words[1U],
+      expected_capture_words[2U],
+  };
+  early_clear_words.insert(early_clear_words.end(),
+                           expected_capture_words.begin() + 6U,
+                           expected_capture_words.end());
+  std::vector<sf::psx::GpuDmaWordSource> early_clear_dma(
+      early_clear_words.size());
+  for (std::size_t word{}; word < early_clear_dma.size(); ++word) {
+    early_clear_dma[word] = {
+        static_cast<std::uint32_t>(0x00012000U + word * 4U), 0x00012000U,
+        sf::psx::GpuDmaSourceKind::linked_list};
+  }
+  sf::platform::detail::PsyCrossGuestGpu early_clear_gpu;
+  early_clear_gpu.setPresentationInterpolationEnabled(true);
+  early_clear_gpu.submit(early_clear_words, {}, {}, 0U, {}, early_clear_dma);
+  early_clear_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                 capture_size - 1U, true, false, false);
+  const auto &early_clear_frame =
+      early_clear_gpu.currentPresentationReplayFrame();
+  const auto early_clear_page = std::ranges::find(
+      early_clear_frame.pages,
+      sf::platform::detail::PresentationReplayDrawTarget{
+          capture_x, capture_y, capture_size, capture_size},
+      &sf::platform::detail::PresentationReplayDrawPage::target);
+  if (early_clear_page == early_clear_frame.pages.end() ||
+      early_clear_page->events.size() != 2U ||
+      early_clear_page->events.front().kind !=
+          sf::platform::detail::PresentationReplayEventKind::clear ||
+      early_clear_frame.deferred_clears.size() != 1U ||
+      early_clear_frame.contains_vram_commands) {
+    std::cerr << "Early framebuffer clear was not reassociated\n";
+    PsyX_Shutdown();
+    return 220;
+  }
+
   replay_capture_gpu.submit(capture_words, capture_projections, {}, 0U, {},
                             capture_dma);
   capture_words.assign(capture_words.size(), 0U);
@@ -5009,6 +5678,194 @@ int main() {
     return 211;
   }
 
+  constexpr std::array safe_vram_upload{0xa0000000U, 0U, 1U | (1U << 16U),
+                                        0x00007fffU};
+  replay_capture_gpu.submit(safe_vram_upload);
+  replay_capture_gpu.submit(second_capture, second_projections, {}, 0U, {},
+                            second_dma);
+  replay_capture_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                    capture_size, true, false, false);
+  if (!replay_capture_gpu.presentationReplayReady() ||
+      !replay_capture_gpu.currentPresentationReplayFrame()
+           .contains_vram_commands ||
+      !replay_capture_gpu.presentInterpolatedDisplay(0.5F) ||
+      replay_capture_gpu.interpolatedPresentationReplayFrames() != 2U ||
+      replay_capture_gpu.skippedPresentationReplayVramCommands() != 1U) {
+    std::cerr << "Non-overlapping VRAM upload disabled presentation replay\n";
+    PsyX_Shutdown();
+    return 213;
+  }
+
+  // Writes to a framebuffer before its complete clear are dead by exact GP0
+  // order and must not disable replay. The same write after the clear remains
+  // unsafe because it contributes to the published page.
+  constexpr std::array overlapping_vram_upload{
+      0xa0000000U,
+      static_cast<std::uint32_t>(capture_x) |
+          (static_cast<std::uint32_t>(capture_y) << 16U),
+      1U | (1U << 16U), 0x00007fffU};
+  sf::platform::detail::PsyCrossGuestGpu ordered_vram_gpu;
+  ordered_vram_gpu.setPresentationInterpolationEnabled(true);
+  ordered_vram_gpu.submit(overlapping_vram_upload);
+  ordered_vram_gpu.submit(expected_capture_words, expected_capture_projections,
+                          {}, 0U, {}, expected_capture_dma_full);
+  ordered_vram_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                  capture_size, true, false, false);
+  ordered_vram_gpu.submit(overlapping_vram_upload);
+  ordered_vram_gpu.submit(second_capture, second_projections, {}, 0U, {},
+                          second_dma);
+  ordered_vram_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                  capture_size, true, false, false);
+  if (!ordered_vram_gpu.presentationReplayReady() ||
+      !ordered_vram_gpu.presentInterpolatedDisplay(0.5F)) {
+    std::cerr << "Framebuffer write superseded by full clear disabled replay\n";
+    PsyX_Shutdown();
+    return 221;
+  }
+
+  constexpr std::array no_op_framebuffer_copy{
+      0x80000000U,
+      static_cast<std::uint32_t>(capture_x) |
+          (static_cast<std::uint32_t>(capture_y) << 16U),
+      static_cast<std::uint32_t>(capture_x) |
+          (static_cast<std::uint32_t>(capture_y) << 16U),
+      2U | (1U << 16U)};
+  sf::platform::detail::PsyCrossGuestGpu no_op_copy_gpu;
+  no_op_copy_gpu.setPresentationInterpolationEnabled(true);
+  no_op_copy_gpu.submit(expected_capture_words, expected_capture_projections,
+                        {}, 0U, {}, expected_capture_dma_full);
+  no_op_copy_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                capture_size, true, false, false);
+  no_op_copy_gpu.submit(second_capture, second_projections, {}, 0U, {},
+                        second_dma);
+  no_op_copy_gpu.submit(no_op_framebuffer_copy);
+  no_op_copy_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                capture_size, true, false, false);
+  if (!no_op_copy_gpu.presentationReplayReady() ||
+      no_op_copy_gpu.currentPresentationReplayFrame().contains_vram_commands ||
+      no_op_copy_gpu.skippedPresentationReplayVramCommands() != 0U ||
+      !no_op_copy_gpu.presentInterpolatedDisplay(0.5F)) {
+    std::cerr << "No-op framebuffer copy disabled presentation replay\n";
+    PsyX_Shutdown();
+    return 225;
+  }
+
+  sf::platform::detail::PsyCrossGuestGpu late_vram_gpu;
+  late_vram_gpu.setPresentationInterpolationEnabled(true);
+  late_vram_gpu.submit(expected_capture_words, expected_capture_projections, {},
+                       0U, {}, expected_capture_dma_full);
+  late_vram_gpu.presentDisplay(capture_x, capture_y, capture_size, capture_size,
+                               true, false, false);
+  late_vram_gpu.submit(second_capture, second_projections, {}, 0U, {},
+                       second_dma);
+  late_vram_gpu.submit(overlapping_vram_upload);
+  late_vram_gpu.presentDisplay(capture_x, capture_y, capture_size, capture_size,
+                               true, false, false);
+  if (late_vram_gpu.presentationReplayReady() ||
+      late_vram_gpu.lastPresentationReplayRejectReason() != 2U) {
+    std::cerr << "Framebuffer write after full clear entered replay\n";
+    PsyX_Shutdown();
+    return 222;
+  }
+
+  // A captured GP0 fill is replayable even when it clears only a small part
+  // of the displayed page. Preserve its global order instead of treating it
+  // as an opaque VRAM upload hazard.
+  constexpr std::array partial_framebuffer_clear{
+      0x02000000U,
+      static_cast<std::uint32_t>(capture_x) |
+          (static_cast<std::uint32_t>(capture_y) << 16U),
+      1U | (1U << 16U)};
+  sf::platform::detail::PsyCrossGuestGpu partial_clear_gpu;
+  partial_clear_gpu.setPresentationInterpolationEnabled(true);
+  partial_clear_gpu.submit(expected_capture_words, expected_capture_projections,
+                           {}, 0U, {}, expected_capture_dma_full);
+  partial_clear_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                   capture_size, true, false, false);
+  partial_clear_gpu.submit(second_capture, second_projections, {}, 0U, {},
+                           second_dma);
+  partial_clear_gpu.submit(partial_framebuffer_clear);
+  partial_clear_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                   capture_size, true, false, false);
+  if (!partial_clear_gpu.presentationReplayReady() ||
+      partial_clear_gpu.currentPresentationReplayFrame()
+          .contains_vram_commands ||
+      !partial_clear_gpu.presentInterpolatedDisplay(0.5F)) {
+    std::cerr << "Ordered partial framebuffer clear disabled replay\n";
+    PsyX_Shutdown();
+    return 224;
+  }
+
+  // Missing PGXP sidecars fall back per primitive, never per vertex. Stable
+  // DMA topology still supplies smooth subpixel screen positions for the
+  // complete opaque primitive.
+  auto affine_first_projections = expected_capture_projections;
+  auto affine_second_projections = second_projections;
+  for (const auto word : {7U, 8U, 9U}) {
+    affine_first_projections[word] = {};
+    affine_second_projections[word] = {};
+  }
+  sf::platform::detail::PsyCrossGuestGpu affine_replay_gpu;
+  affine_replay_gpu.setPresentationInterpolationEnabled(true);
+  affine_replay_gpu.submit(expected_capture_words, affine_first_projections, {},
+                           0U, {}, expected_capture_dma_full);
+  affine_replay_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                   capture_size, true, false, false);
+  affine_replay_gpu.submit(second_capture, affine_second_projections, {}, 0U,
+                           {}, second_dma);
+  affine_replay_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                   capture_size, true, false, false);
+  if (!affine_replay_gpu.presentationReplayReady() ||
+      !affine_replay_gpu.presentInterpolatedDisplay(0.5F)) {
+    std::cerr << "Primitive-atomic affine interpolation was not available\n";
+    PsyX_Shutdown();
+    return 223;
+  }
+
+  // Retail MOHU alternates two independently laid-out linked lists. The
+  // immediately adjacent frame therefore has no address match, while the
+  // frame two guest ticks back reuses the same packet storage. Interpolate
+  // across that exact two-tick provenance instead of disabling stabilization.
+  auto alternate_dma = second_dma;
+  for (std::size_t word{}; word < alternate_dma.size(); ++word) {
+    alternate_dma[word] = {static_cast<std::uint32_t>(0x00050000U + word * 4U),
+                           0x00050000U, sf::psx::GpuDmaSourceKind::linked_list};
+  }
+  auto third_capture = second_capture;
+  auto third_projections = second_projections;
+  for (const auto word : {7U, 8U, 9U}) {
+    third_capture[word] += 1U;
+    auto &projection = third_projections[word];
+    projection.packed_sxy = third_capture[word];
+    projection.screen_x += 1.0F;
+    projection.screen_y += 1.0F;
+    projection.view_x =
+        projection.screen_x * projection.view_z / projection.screen_h;
+    projection.view_y =
+        projection.screen_y * projection.view_z / projection.screen_h;
+  }
+  sf::platform::detail::PsyCrossGuestGpu double_buffer_replay_gpu;
+  double_buffer_replay_gpu.setPresentationInterpolationEnabled(true);
+  double_buffer_replay_gpu.submit(expected_capture_words,
+                                  expected_capture_projections, {}, 0U, {},
+                                  expected_capture_dma_full);
+  double_buffer_replay_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                          capture_size, true, false, false);
+  double_buffer_replay_gpu.submit(second_capture, second_projections, {}, 0U,
+                                  {}, alternate_dma);
+  double_buffer_replay_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                          capture_size, true, false, false);
+  double_buffer_replay_gpu.submit(third_capture, third_projections, {}, 0U, {},
+                                  second_dma);
+  double_buffer_replay_gpu.presentDisplay(capture_x, capture_y, capture_size,
+                                          capture_size, true, false, false);
+  if (!double_buffer_replay_gpu.presentationReplayReady() ||
+      !double_buffer_replay_gpu.presentInterpolatedDisplay(0.0F)) {
+    std::cerr << "Double-buffer replay provenance was not stabilized\n";
+    PsyX_Shutdown();
+    return 226;
+  }
+
   auto cut_capture = second_capture;
   auto cut_projections = second_projections;
   for (const auto word : {7U, 8U, 9U}) {
@@ -5025,7 +5882,7 @@ int main() {
                                     capture_size, true, false, false);
   if (replay_capture_gpu.presentationReplayReady() ||
       replay_capture_gpu.presentInterpolatedDisplay(0.5F) ||
-      replay_capture_gpu.interpolatedPresentationReplayFrames() != 1U) {
+      replay_capture_gpu.interpolatedPresentationReplayFrames() != 2U) {
     std::cerr << "Global camera-cut guard partially interpolated a frame\n";
     PsyX_Shutdown();
     return 212;
@@ -5042,7 +5899,7 @@ int main() {
   if (replay_capture_gpu.presentationReplayReady() ||
       !replay_capture_gpu.currentPresentationReplayFrame()
            .contains_vram_commands ||
-      replay_capture_gpu.skippedPresentationReplayVramCommands() != 1U) {
+      replay_capture_gpu.skippedPresentationReplayVramCommands() != 2U) {
     std::cerr << "VRAM command entered draw-only replay history\n";
     PsyX_Shutdown();
     return 209;

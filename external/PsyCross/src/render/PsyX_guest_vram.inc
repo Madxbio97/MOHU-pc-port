@@ -10,6 +10,7 @@ constexpr int guest_vram_dirty_word_count =
 struct GrGuestPixelExtent {
   int width{1};
   int height{1};
+  bool root{};
 };
 
 #if defined(RENDERER_OGL)
@@ -66,6 +67,7 @@ static int g_maxGuestTextureSize{1};
 static bool g_guestRenderLogicalFallback{};
 static bool g_guestTextureLimitLogged{};
 static bool g_nextOffscreenIsRoot{true};
+static bool g_activeOffscreenIsRoot{};
 
 static std::uint64_t GR_GuestDirtyMask(int word, int x0, int x1) {
   const int word_x0 = word * guest_vram_dirty_word_bits;
@@ -251,7 +253,7 @@ static GrGuestPixelExtent GR_CalculateOffscreenPixelExtent(const RECT16 &rect) {
       (rect.w >= g_guestDisplayWidth && rect.h >= g_guestDisplayHeight);
   g_nextOffscreenIsRoot = false;
   if (g_guestRenderLogicalFallback)
-    return {std::max<int>(rect.w, 1), std::max<int>(rect.h, 1)};
+    return {std::max<int>(rect.w, 1), std::max<int>(rect.h, 1), root_page};
   if (!root_page) {
     const auto *retained =
         GR_FindHighResolutionVRAMPage(rect.x, rect.y, rect.w, rect.h);
@@ -264,7 +266,7 @@ static GrGuestPixelExtent GR_CalculateOffscreenPixelExtent(const RECT16 &rect) {
       rect.w, rect.h, g_guestDisplayWidth, g_guestDisplayHeight,
       root_page ? 1 : 0);
   if (extent.w <= g_maxGuestTextureSize && extent.h <= g_maxGuestTextureSize) {
-    return {extent.w, extent.h};
+    return {extent.w, extent.h, root_page};
   }
 
   g_guestRenderLogicalFallback = true;
@@ -275,7 +277,7 @@ static GrGuestPixelExtent GR_CalculateOffscreenPixelExtent(const RECT16 &rect) {
                "logical 1x fallback\n",
                extent.w, extent.h, g_maxGuestTextureSize);
   }
-  return {std::max<int>(rect.w, 1), std::max<int>(rect.h, 1)};
+  return {std::max<int>(rect.w, 1), std::max<int>(rect.h, 1), root_page};
 }
 
 static GrGuestConversionState GR_SaveGuestConversionState() {
@@ -770,6 +772,17 @@ GR_SynchronizeHighResolutionVRAMPage(GrHighResolutionVRAMPage &page) {
     return false;
   }
 
+  // A complete packed-VRAM replacement is the new authoritative image, not a
+  // patch to the previous high-resolution scene. Retail MDEC loading screens
+  // (including return-to-base) upload every row in strips before flipping the
+  // display page. Retire that retained page so scanout decodes the completed
+  // upload instead of presenting unrelated pixels from the preceding scene.
+  if (GR_IsVRAMDirtyRectFullyCovered(page.pending_writes, page.rect.x,
+                                     page.rect.y, page.rect.w, page.rect.h)) {
+    page.valid = false;
+    return false;
+  }
+
   if (!GR_IsVRAMDirtyRect(page.pending_writes, page.rect.x, page.rect.y,
                           page.rect.w, page.rect.h)) {
     page.synced_write_sequence = current_sequence;
@@ -1095,6 +1108,7 @@ int GR_PresentComposedGuestScanout(int x, int y, int width, int height) {
   }
   glReadBuffer(GL_COLOR_ATTACHMENT0);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_glNativeFramebuffer);
+  GR_ClearNativePresentationMargins(destination);
   const int blit_x0 = direct_sidecar ? source_x : 0;
   const int blit_y0 = direct_sidecar ? VRAM_HEIGHT - (source_y + height) : 0;
   const int blit_x1 = direct_sidecar ? source_x + width : width;
@@ -1160,15 +1174,26 @@ void GR_SetGuestDisplayGeometry(int width, int height) {
 #if defined(RENDERER_OGL)
   const int next_width = std::min(std::max(width, 1), VRAM_WIDTH);
   const int next_height = std::min(std::max(height, 1), VRAM_HEIGHT);
-  if (next_width == g_pendingGuestDisplayWidth &&
-      next_height == g_pendingGuestDisplayHeight) {
+  const bool geometry_changed = next_width != g_pendingGuestDisplayWidth ||
+                                next_height != g_pendingGuestDisplayHeight;
+  const bool active_aspect_changed =
+      g_PreviousOffscreenState != 0 &&
+      g_guestRenderConfigAspect != g_cfg_aspectMode;
+  if (!geometry_changed && !active_aspect_changed) {
+    return;
+  }
+
+  // Aspect changes the active root-page projection, so rebind it immediately.
+  DrawSync(0);
+  if (active_aspect_changed && !geometry_changed) {
+    const auto active_page = g_PreviousOffscreen;
+    GR_SetOffscreenState(&active_page, 1);
     return;
   }
 
   // Publish a stable geometry transition transactionally. Raw catch-up
   // submits can leave vertices batched without presenting, so flush them while
   // the old canonical domain is still current, then pack/close that old page.
-  DrawSync(0);
   if (g_PreviousOffscreenState != 0) {
     RECT16 completed_page{};
     GR_SetOffscreenState(&completed_page, 0);

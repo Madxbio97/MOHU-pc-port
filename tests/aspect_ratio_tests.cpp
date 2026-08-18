@@ -90,6 +90,16 @@ void testAuthoredContentAlwaysUsesFourThree() {
   }
 }
 
+void testAuthoredScreensFlushIncrementalGpuUpdates() {
+  using sf::platform::PresentationContent;
+  require(sf::platform::requiresIncrementalGpuFlush(
+              PresentationContent::authored_4_3),
+          "Authored loading updates were held for a GP1 publication");
+  require(!sf::platform::requiresIncrementalGpuFlush(
+              PresentationContent::gameplay),
+          "Gameplay lost its atomic display-publication boundary");
+}
+
 void testAdaptivePreservesPixelAspect() {
   const auto widescreen =
       PsyX_CalculatePresentationScale(1920, 1080, PSYX_ASPECT_ADAPTIVE);
@@ -247,6 +257,24 @@ void testGuestDisplayGeometryRejectsSingleFrameChanges() {
   }
 }
 
+void testTransientGuestGeometryKeepsAdaptiveRootStable() {
+  mohu::StableGuestDisplayGeometry geometry;
+  constexpr mohu::GuestDisplayGeometry gameplay{512U, 240U, false, false};
+  constexpr mohu::GuestDisplayGeometry reset{256U, 240U, false, false};
+
+  require(geometry.update(gameplay) == gameplay,
+          "Adaptive gameplay geometry initialization failed");
+  for (const auto observed : {reset, gameplay, reset, gameplay}) {
+    const auto committed = geometry.update(observed);
+    const auto extent = PsyX_CalculateGuestRenderExtent(
+        1920, 1080, PSYX_ASPECT_ADAPTIVE, static_cast<int>(committed.width),
+        static_cast<int>(committed.height), static_cast<int>(committed.width),
+        static_cast<int>(committed.height), 1);
+    require(committed == gameplay && extent.w == 1920 && extent.h == 1080,
+            "Transient GP1 geometry pulsed the adaptive render root");
+  }
+}
+
 void testGuestDisplayGeometryCommitsRealTransitions() {
   mohu::StableGuestDisplayGeometry geometry;
   constexpr mohu::GuestDisplayGeometry gameplay{368U, 240U, false, false};
@@ -258,6 +286,23 @@ void testGuestDisplayGeometryCommitsRealTransitions() {
           "Guest geometry changed before confirmation");
   require(geometry.update(movie) == movie,
           "Stable movie geometry was not committed");
+}
+
+void testAuthoredDisplayGeometryIsFrameExact() {
+  mohu::StableGuestDisplayGeometry geometry;
+  constexpr mohu::GuestDisplayGeometry gameplay{512U, 240U, false, false};
+  constexpr mohu::GuestDisplayGeometry loading{320U, 240U, false, false};
+  constexpr mohu::GuestDisplayGeometry next_gameplay{368U, 240U, false,
+                                                      false};
+
+  require(geometry.update(gameplay, true) == gameplay,
+          "Gameplay geometry initialization failed");
+  require(geometry.update(loading, false) == loading,
+          "Authored loading geometry was delayed");
+  require(!geometry.initialized(),
+          "Authored geometry leaked into the gameplay stabilizer");
+  require(geometry.update(next_gameplay, true) == next_gameplay,
+          "Gameplay geometry was delayed after an authored screen");
 }
 
 void testGuestRenderExtentUsesSelectedResolution() {
@@ -324,6 +369,7 @@ int main() {
     testAdaptiveUsesEntireDrawable();
     testOutputPreservesSelectedResolutionAspect();
     testAuthoredContentAlwaysUsesFourThree();
+    testAuthoredScreensFlushIncrementalGpuUpdates();
     testAdaptivePreservesPixelAspect();
     testAdaptiveWorldFrustumMatchesPresentation();
     testAdaptiveWorldFrustumAcrossWideAspects();
@@ -334,7 +380,9 @@ int main() {
     testEverySelectedResolutionDefinesGuestTarget();
     testGuestRenderExtentMapsContainedPages();
     testGuestDisplayGeometryRejectsSingleFrameChanges();
+    testTransientGuestGeometryKeepsAdaptiveRootStable();
     testGuestDisplayGeometryCommitsRealTransitions();
+    testAuthoredDisplayGeometryIsFrameExact();
     std::cout << "Aspect ratio tests passed\n";
     return 0;
   } catch (const std::exception &error) {
