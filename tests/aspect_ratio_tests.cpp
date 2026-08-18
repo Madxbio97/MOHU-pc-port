@@ -179,6 +179,10 @@ void testAdaptiveWorldFrustumCoversEveryRetailCullPath() {
   require(mohu::adaptiveWorldFrustumHook(0x80010c00U) ==
                   Hook::slus_triangle_outcode &&
               mohu::adaptiveWorldFrustumHook(0x800115c4U) ==
+                  Hook::slus_triangle_outcode &&
+              mohu::adaptiveWorldFrustumHook(0x800129a0U) ==
+                  Hook::slus_triangle_outcode &&
+              mohu::adaptiveWorldFrustumHook(0x80013364U) ==
                   Hook::slus_triangle_outcode,
           "SLUS static-TSP outcode paths are not widened");
   require(mohu::adaptiveWorldFrustumHook(0x80010c04U) == Hook::none &&
@@ -214,6 +218,8 @@ void testRuntimePcDispatchIsExact() {
       Expected{0x8009ce1cU, Action::frustum_object_upper_x},
       Expected{0x80010c00U, Action::frustum_slus_triangle_outcode},
       Expected{0x800115c4U, Action::frustum_slus_triangle_outcode},
+      Expected{0x800129a0U, Action::frustum_slus_triangle_outcode},
+      Expected{0x80013364U, Action::frustum_slus_triangle_outcode},
   };
   for (const auto &entry : expected) {
     require(mohu::runtimePcAction(entry.pc) == entry.action,
@@ -237,6 +243,8 @@ void testRuntimePcDispatchIsExact() {
                   mohu::RuntimePcScope::singleplayer,
           "LEVEL and LEVEL2P hooks lost overlay provenance");
   require(mohu::runtimePcScope(0x80010c00U) ==
+                  mohu::RuntimePcScope::any &&
+              mohu::runtimePcScope(0x800129a0U) ==
                   mohu::RuntimePcScope::any &&
               mohu::runtimePcScope(0x80010c04U) ==
                   mohu::RuntimePcScope::none,

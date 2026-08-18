@@ -93,6 +93,8 @@ inline constexpr auto runtime_pc_actions = [] {
       RuntimePcScope::multiplayer);
   put(0x80010c00U, RuntimePcAction::frustum_slus_triangle_outcode);
   put(0x800115c4U, RuntimePcAction::frustum_slus_triangle_outcode);
+  put(0x800129a0U, RuntimePcAction::frustum_slus_triangle_outcode);
+  put(0x80013364U, RuntimePcAction::frustum_slus_triangle_outcode);
   return result;
 }();
 

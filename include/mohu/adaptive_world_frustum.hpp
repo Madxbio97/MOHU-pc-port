@@ -29,7 +29,7 @@ adaptiveWorldFrustumHook(std::uint32_t guest_pc) noexcept {
     std::uint32_t pc{};
     AdaptiveWorldFrustumHook hook{};
   };
-  // The low four instruction-index bits are unique for all eight verified
+  // The low four instruction-index bits are unique for all ten verified
   // sites. This exact-key table replaces a sparse switch/binary-search in the
   // 33.9-million-instruction-per-second interpreter hot path.
   constexpr std::array<Entry, 16U> hooks{
@@ -41,8 +41,8 @@ adaptiveWorldFrustumHook(std::uint32_t guest_pc) noexcept {
       Entry{},
       Entry{},
       Entry{0x8009ce1cU, AdaptiveWorldFrustumHook::object_upper_x},
-      Entry{},
-      Entry{},
+      Entry{0x800129a0U, AdaptiveWorldFrustumHook::slus_triangle_outcode},
+      Entry{0x80013364U, AdaptiveWorldFrustumHook::slus_triangle_outcode},
       Entry{0x80099a28U, AdaptiveWorldFrustumHook::bsp_upper_x},
       Entry{0x80099dacU, AdaptiveWorldFrustumHook::bsp_lower_x},
       Entry{0x8009a8b0U, AdaptiveWorldFrustumHook::level_triangle_outcode},

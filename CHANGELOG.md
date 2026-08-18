@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2 - 2026-08-19
+
+### Runtime
+
+- Completed multiplayer static-triangle outcode coverage across all four
+  resident TSP render paths.
+- Prevented premature horizontal geometry rejection on split-screen maps in
+  adaptive aspect mode.
+
 ## 0.1.1 - 2026-08-19
 
 ### Runtime

@@ -77,12 +77,15 @@ constexpr std::array multiplayer_overlay_witnesses{
     OpcodeWitness{0x80097084U, 0x0c01a0e1U}, // jal 0x80068384
 };
 
-// SLUS-01270 static-TSP outcode paths. Both read the retail horizontal bound
-// into t6 and perform a second three-vertex rejection after the LEVEL
-// BSP/object tests above.
+// SLUS-01270 static-TSP outcode paths. The resident renderer contains one
+// direct and one transformed path for each split-screen player. All four read
+// the retail horizontal bound into t6 and perform a second three-vertex
+// rejection after the LEVEL BSP/object tests above.
 constexpr std::array adaptive_static_frustum_witnesses{
     OpcodeWitness{0x80010c00U, 0x05000005U}, // bltz t0,0x80010c18
     OpcodeWitness{0x800115c4U, 0x05000005U}, // bltz t0,0x800115dc
+    OpcodeWitness{0x800129a0U, 0x05000005U}, // bltz t0,0x800129b8
+    OpcodeWitness{0x80013364U, 0x05000005U}, // bltz t0,0x8001337c
 };
 
 std::string biosCallDetail(const sf::psx::R3000Runtime &cpu) {

@@ -4,7 +4,7 @@ if(POLICY CMP0174)
     cmake_policy(SET CMP0174 NEW)
 endif()
 
-project(MedalOfHonorUndergroundPC VERSION 0.1.1 LANGUAGES CXX)
+project(MedalOfHonorUndergroundPC VERSION 0.1.2 LANGUAGES CXX)
 
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
