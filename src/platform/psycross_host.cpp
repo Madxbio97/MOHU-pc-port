@@ -530,7 +530,7 @@ private:
   [[nodiscard]] static bool enabled() noexcept {
     static const auto value = [] {
       const auto *setting = SDL_getenv("MOHU_GEOMETRY_TRACE");
-      return setting == nullptr || setting[0] == '\0' ||
+      return setting != nullptr && setting[0] != '\0' &&
              std::strcmp(setting, "0") != 0;
     }();
     return value;
@@ -774,7 +774,7 @@ private:
   [[nodiscard]] static bool enabled() noexcept {
     static const auto value = [] {
       const auto *setting = SDL_getenv("SF_PERF_DIAGNOSTICS");
-      return setting == nullptr || setting[0] == '\0' ||
+      return setting != nullptr && setting[0] != '\0' &&
              std::strcmp(setting, "0") != 0;
     }();
     return value;

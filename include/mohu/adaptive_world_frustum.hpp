@@ -13,6 +13,7 @@ enum class AdaptiveWorldFrustumHook : std::uint8_t {
   none,
   bsp_upper_x,
   bsp_lower_x,
+  multiplayer_bsp_force_visible,
   object_upper_x,
   level_triangle_outcode,
   slus_triangle_outcode,

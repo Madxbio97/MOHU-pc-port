@@ -131,11 +131,6 @@ void testAdaptiveWorldFrustumMatchesPresentation() {
   require(near(left_ndc, -1.0F) && near(right_ndc, 1.0F),
           "World frustum and PresentationScale disagree at 16:9 edges");
 
-  const auto split_margin =
-      mohu::adaptiveWorldXMargin(3840U, 2160U / 2U, true);
-  require(split_margin == 450,
-          "Split-screen frustum ignored the half-height player viewport");
-
   require(mohu::adaptiveWorldXMargin(1280U, 960U, true) == 0,
           "4:3 unexpectedly enabled world widening");
   require(mohu::adaptiveWorldXMargin(1920U, 1080U, false) == 0,
@@ -206,12 +201,11 @@ void testRuntimePcDispatchIsExact() {
       Expected{0x80037b00U, Action::disc_search_return},
       Expected{0x80039064U, Action::directory_scan_entry},
       Expected{0x80097084U, Action::multiplayer_renderer_boundary},
-      Expected{0x800941a8U, Action::frustum_bsp_upper_x},
-      Expected{0x800942f8U, Action::frustum_bsp_lower_x},
-      Expected{0x80094428U, Action::frustum_bsp_lower_x},
+      Expected{0x800945c8U,
+               Action::frustum_multiplayer_bsp_force_visible},
       Expected{0x80094ad0U, Action::frustum_level_triangle_outcode},
       Expected{0x80096cc8U, Action::frustum_bsp_lower_x},
-      Expected{0x80096d68U, Action::frustum_object_upper_x},
+      Expected{0x80096d6cU, Action::frustum_object_upper_x},
       Expected{0x80099a28U, Action::frustum_bsp_upper_x},
       Expected{0x80099dacU, Action::frustum_bsp_lower_x},
       Expected{0x8009a2c8U, Action::frustum_bsp_lower_x},
@@ -237,7 +231,7 @@ void testRuntimePcDispatchIsExact() {
   }
   require(mohu::runtimePcScope(0x80094ad0U) ==
                   mohu::RuntimePcScope::multiplayer &&
-              mohu::runtimePcScope(0x800942f8U) ==
+              mohu::runtimePcScope(0x800945c8U) ==
                   mohu::RuntimePcScope::multiplayer &&
               mohu::runtimePcScope(0x8009a8b0U) ==
                   mohu::RuntimePcScope::singleplayer,

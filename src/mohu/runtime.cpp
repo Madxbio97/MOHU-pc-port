@@ -66,11 +66,14 @@ constexpr std::array singleplayer_overlay_witnesses{
 // multiplayer overlay or menu as a gameplay frame.
 constexpr std::array multiplayer_overlay_witnesses{
     OpcodeWitness{0x800941a8U, 0xafa300ccU}, // sw v1,0xcc(sp)
-    OpcodeWitness{0x800942f8U, 0x044000b3U}, // bltz v0,0x800945c8
+    OpcodeWitness{0x80094390U, 0x0043102aU}, // slt v0,v0,v1
+    OpcodeWitness{0x80094394U, 0x1440008cU}, // bnez v0,0x800945c8
     OpcodeWitness{0x80094428U, 0x04400067U}, // bltz v0,0x800945c8
     OpcodeWitness{0x80094ad0U, 0x04410003U}, // bgez v0,0x80094ae0
     OpcodeWitness{0x80096cc8U, 0x04400088U}, // bltz v0,0x80096eec
     OpcodeWitness{0x80096d68U, 0x0043102aU}, // slt v0,v0,v1
+    OpcodeWitness{0x800945c8U, 0x1080000eU}, // beqz a0,0x80094604
+    OpcodeWitness{0x80096d6cU, 0x1440005fU}, // bnez v0,0x80096eec
     OpcodeWitness{0x80097084U, 0x0c01a0e1U}, // jal 0x80068384
 };
 
@@ -352,12 +355,7 @@ void Runtime::configureAdaptiveWorldFrustum(std::uint32_t output_width,
                                             bool adaptive) noexcept {
   adaptive_world_x_margin_ =
       adaptiveWorldXMargin(output_width, output_height, adaptive);
-  // LEVEL2P renders two 512x120 viewports. Each player therefore sees the
-  // full output width but only half its height, so its culling aspect is twice
-  // the single-player aspect.
-  adaptive_multiplayer_world_x_margin_ = adaptiveWorldXMargin(
-      output_width, std::max(output_height / 2U, 1U), adaptive);
-  adaptive_world_frustum_state_ = adaptive_multiplayer_world_x_margin_ > 0
+  adaptive_world_frustum_state_ = adaptive_world_x_margin_ > 0
                                       ? AdaptiveWorldFrustumState::pending
                                       : AdaptiveWorldFrustumState::disabled;
 }
@@ -435,11 +433,6 @@ Runtime::validateAdaptiveWorldFrustum() const noexcept {
       return AdaptiveWorldFrustumState::rejected;
     }
   }
-  // The exact LEVEL2P marker and five renderer witnesses already prove its
-  // split-screen viewport. Its globals live at a different overlay address.
-  if (multiplayerOverlayLoaded())
-    return AdaptiveWorldFrustumState::active;
-
   std::uint32_t horizontal_bound{};
   std::uint32_t vertical_bound{};
   if (!cpu_.read32(0x800a9340U, horizontal_bound) ||
@@ -469,6 +462,44 @@ void Runtime::applyAdaptiveWorldFrustumHook(
     gameplay_presentation_ready_ = true;
   }
 
+  if (multiplayer) {
+    // LEVEL2P uses the same host-side Hor+ projection as LEVEL. Admit every
+    // coarse BSP sector independently of output resolution, then disable only
+    // horizontal rejection in its object/triangle paths. Per-triangle
+    // vertical, depth and near-plane rejection remain retail-authored.
+    switch (hook) {
+    case AdaptiveWorldFrustumHook::multiplayer_bsp_force_visible:
+      // Admit every coarse BSP sector. Exact triangle/object rejection below
+      // still removes geometry outside the real viewport or behind the camera.
+      cpu_.setRegister(4U, 1U); // a0: sector-visible result
+      break;
+    case AdaptiveWorldFrustumHook::bsp_upper_x:
+    case AdaptiveWorldFrustumHook::bsp_lower_x:
+    case AdaptiveWorldFrustumHook::object_upper_x:
+      // These hooks run on the proven rejecting branch after its comparison.
+      cpu_.setRegister(2U, 0U); // v0: branch condition / signed screen X
+      break;
+    case AdaptiveWorldFrustumHook::level_triangle_outcode:
+      // LEVEL2P has already split SXY into X/Y temporaries. Clearing X makes
+      // every triangle horizontally eligible without changing its packet.
+      cpu_.setRegister(2U, 0U); // v0 = x0
+      cpu_.setRegister(4U, 0U); // a0 = x1
+      cpu_.setRegister(9U, 0U); // t1 = x2
+      break;
+    case AdaptiveWorldFrustumHook::slus_triangle_outcode:
+      // The resident TSP paths still hold vertices 1/2 as packed Y:X words.
+      // Preserve signed Y in the upper half while clearing only screen X.
+      cpu_.setRegister(8U, 0U); // t0 = sign-extended x0; y0 is already t3
+      cpu_.setRegister(9U, cpu_.state().gpr[9U] & 0xffff0000U);
+      cpu_.setRegister(10U, cpu_.state().gpr[10U] & 0xffff0000U);
+      break;
+    case AdaptiveWorldFrustumHook::none:
+    default:
+      break;
+    }
+    return;
+  }
+
   if (adaptive_world_frustum_state_ == AdaptiveWorldFrustumState::disabled ||
       adaptive_world_frustum_state_ == AdaptiveWorldFrustumState::rejected) {
     return;
@@ -481,10 +512,7 @@ void Runtime::applyAdaptiveWorldFrustumHook(
     }
   }
 
-  const auto selected_margin = multiplayer
-                                   ? adaptive_multiplayer_world_x_margin_
-                                   : adaptive_world_x_margin_;
-  const auto margin = static_cast<std::uint32_t>(selected_margin);
+  const auto margin = static_cast<std::uint32_t>(adaptive_world_x_margin_);
   if (margin == 0U)
     return;
   const auto add_to_register = [this](std::uint8_t reg,
@@ -521,6 +549,7 @@ void Runtime::applyAdaptiveWorldFrustumHook(
     add_to_register(14U, margin * 2U); // t6 = local upper X bound
     break;
   case AdaptiveWorldFrustumHook::none:
+  case AdaptiveWorldFrustumHook::multiplayer_bsp_force_visible:
   default:
     break;
   }
@@ -829,6 +858,10 @@ Runtime::runFrame(const RuntimeControllerInputs &controllers) {
       break;
     case RuntimePcAction::frustum_bsp_lower_x:
       applyAdaptiveWorldFrustumHook(AdaptiveWorldFrustumHook::bsp_lower_x);
+      break;
+    case RuntimePcAction::frustum_multiplayer_bsp_force_visible:
+      applyAdaptiveWorldFrustumHook(
+          AdaptiveWorldFrustumHook::multiplayer_bsp_force_visible);
       break;
     case RuntimePcAction::frustum_object_upper_x:
       applyAdaptiveWorldFrustumHook(AdaptiveWorldFrustumHook::object_upper_x);

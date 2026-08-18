@@ -28,6 +28,7 @@ enum class RuntimePcAction : std::uint8_t {
   multiplayer_renderer_boundary,
   frustum_bsp_upper_x,
   frustum_bsp_lower_x,
+  frustum_multiplayer_bsp_force_visible,
   frustum_object_upper_x,
   frustum_level_triangle_outcode,
   frustum_slus_triangle_outcode,
@@ -82,17 +83,13 @@ inline constexpr auto runtime_pc_actions = [] {
       RuntimePcScope::singleplayer);
   put(0x8009ce1cU, RuntimePcAction::frustum_object_upper_x,
       RuntimePcScope::singleplayer);
-  put(0x800941a8U, RuntimePcAction::frustum_bsp_upper_x,
-      RuntimePcScope::multiplayer);
-  put(0x800942f8U, RuntimePcAction::frustum_bsp_lower_x,
-      RuntimePcScope::multiplayer);
-  put(0x80094428U, RuntimePcAction::frustum_bsp_lower_x,
+  put(0x800945c8U, RuntimePcAction::frustum_multiplayer_bsp_force_visible,
       RuntimePcScope::multiplayer);
   put(0x80094ad0U, RuntimePcAction::frustum_level_triangle_outcode,
       RuntimePcScope::multiplayer);
   put(0x80096cc8U, RuntimePcAction::frustum_bsp_lower_x,
       RuntimePcScope::multiplayer);
-  put(0x80096d68U, RuntimePcAction::frustum_object_upper_x,
+  put(0x80096d6cU, RuntimePcAction::frustum_object_upper_x,
       RuntimePcScope::multiplayer);
   put(0x80010c00U, RuntimePcAction::frustum_slus_triangle_outcode);
   put(0x800115c4U, RuntimePcAction::frustum_slus_triangle_outcode);
@@ -333,7 +330,6 @@ private:
   std::uint64_t instruction_debt_{};
   RuntimeStats stats_{};
   std::int32_t adaptive_world_x_margin_{};
-  std::int32_t adaptive_multiplayer_world_x_margin_{};
   AdaptiveWorldFrustumState adaptive_world_frustum_state_{};
   bool gameplay_presentation_ready_{};
   struct LevelExtent {

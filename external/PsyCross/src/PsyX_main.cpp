@@ -90,7 +90,8 @@ static int PsyX_PerfDiagnosticsEnabled()
 	if (enabled < 0)
 	{
 		const char* value = getenv("SF_PERF_DIAGNOSTICS");
-		enabled = value == NULL || value[0] == '\0' || strcmp(value, "0") != 0;
+		enabled = value != NULL && value[0] != '\0' &&
+			strcmp(value, "0") != 0;
 	}
 	return enabled;
 }
